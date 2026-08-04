@@ -63,7 +63,13 @@ public sealed class AudioSinkService : IDisposable
         bool isPackaged = PackageIdentity.IsPackaged;
         if (!AudioSinkPolicy.CanOpenConnection(isPackaged))
         {
-            Log.Warn(AudioSinkPolicy.Explain(isPackaged));
+            // Warn regardless of what AudioSinkPolicy.LevelFor says, unlike the same verdict in
+            // TrayContext.ConnectMusicAsync, because this is not the same event. TrayContext returns
+            // before ever calling here, so reaching this line means a caller went straight to the
+            // service without asking the policy - a defect in the caller, not the expected unpackaged
+            // path. The two can never appear in one run.
+            Log.Warn("Reached AudioSinkService.ConnectAsync with the music gate shut: the caller did "
+                     + "not consult AudioSinkPolicy. " + AudioSinkPolicy.Explain(isPackaged));
             return false;
         }
 

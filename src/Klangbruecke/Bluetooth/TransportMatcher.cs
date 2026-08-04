@@ -1,3 +1,5 @@
+using Klangbruecke.Diagnostics;
+
 namespace Klangbruecke.Bluetooth;
 
 /// <summary>Why a transport was, or was not, chosen. The log level follows from this.</summary>
@@ -40,6 +42,23 @@ public readonly record struct TransportMatchResult(
 /// </summary>
 public static class TransportMatcher
 {
+    /// <summary>
+    /// The log level <see cref="TransportMatchOutcome"/> promises follows from the outcome. Here
+    /// rather than at the call site because the enum makes the claim and had already been
+    /// contradicted: <see cref="TransportMatchOutcome.NoCandidates"/> is documented "Not an error"
+    /// and was logged as a warning.
+    ///
+    /// SoleCandidate warns despite connecting something - it means the address correlation did not
+    /// do its job and a transport was taken blind, which is the wrong-phone bug this matcher exists
+    /// to prevent. Ambiguous warns for the same reason and connects nothing.
+    /// </summary>
+    public static LogLevel LevelFor(TransportMatchOutcome outcome) => outcome switch
+    {
+        TransportMatchOutcome.AddressMatch => LogLevel.Info,
+        TransportMatchOutcome.NoCandidates => LogLevel.Info,
+        _ => LogLevel.Warn,
+    };
+
     public static TransportMatchResult Match(IReadOnlyList<TransportCandidate> candidates, string? phoneDeviceId)
     {
         if (candidates.Count == 0)

@@ -1,3 +1,5 @@
+using Klangbruecke.Diagnostics;
+
 namespace Klangbruecke.Platform;
 
 public enum CallsAvailability
@@ -7,6 +9,14 @@ public enum CallsAvailability
     DisabledNoPackageIdentity,
 }
 
+/// <summary>
+/// Whether the calls half runs, and how far down its path a verdict lets a run go.
+///
+/// Deciding and acting on the decision live together on purpose. They were briefly split across a
+/// separate CallTransportPlan type in another namespace, which put three types across two namespaces
+/// between "is this enabled" and "so what do I do" - twice the surface of the music half's
+/// AudioSinkPolicy for the same job.
+/// </summary>
 public static class CallsPolicy
 {
     /// <summary>
@@ -44,4 +54,47 @@ public static class CallsPolicy
 
         _ => "Calls disabled.",
     };
+
+    /// <summary>
+    /// What a verdict is worth in the log. One rule, shared with the music half's
+    /// <c>AudioSinkPolicy.LevelFor</c>: a half the user switched off is Info, a half that cannot run
+    /// at all is Warn.
+    ///
+    /// The two gates used to disagree - music gated off warned, calls gated off informed - so
+    /// someone grepping [WRN] saw exactly half the story about the same root cause. Splitting on the
+    /// *reason* rather than picking one level for both is what makes the rule mean something: the
+    /// spec's "Disabled is not failed" is true of a setting the user chose, and is not true of a
+    /// capability that cannot apply, which is the user asking for something the app cannot deliver.
+    /// </summary>
+    public static LogLevel LevelFor(CallsAvailability availability) => availability switch
+    {
+        CallsAvailability.Enabled => LogLevel.Info,
+        CallsAvailability.DisabledBySetting => LogLevel.Info,
+
+        // Default arm, so a reason added later is loud rather than quietly filed as ordinary
+        // progress. Same instinct as Explain's default arm and ShouldRegister's.
+        _ => LogLevel.Warn,
+    };
+
+    /// <summary>
+    /// Enumerate unless the user turned calls off, in which case looking is pure noise.
+    ///
+    /// Not the same question as <see cref="ShouldRegister"/>, and that is the point. Discovery -
+    /// GetDeviceSelector, FindAllAsync, FromId, IsRegistered - was exercised against the real phone
+    /// with no package identity and all of it worked; only RegisterApp, claiming the hands-free role,
+    /// needs the restricted phoneLineTransportManagement capability. So an unpackaged run still
+    /// enumerates and logs what it found.
+    ///
+    /// Worth a named rule rather than an inline condition: gating the whole block on
+    /// <see cref="CallsAvailability.Enabled"/> is a one-line change back, it looks like a tidy-up, and
+    /// it costs every "dotnet run" the one calls-side fact it can establish - whether the phone's
+    /// transport is discoverable at all - which the packaged build cannot be trusted to produce for
+    /// the first time under a restricted capability.
+    /// </summary>
+    public static bool ShouldEnumerate(CallsAvailability availability) =>
+        availability != CallsAvailability.DisabledBySetting;
+
+    /// <summary>Register and connect only when nothing structural is in the way.</summary>
+    public static bool ShouldRegister(CallsAvailability availability) =>
+        availability == CallsAvailability.Enabled;
 }

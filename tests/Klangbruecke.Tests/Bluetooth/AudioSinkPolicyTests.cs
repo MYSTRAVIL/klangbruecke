@@ -1,4 +1,5 @@
 using Klangbruecke.Bluetooth;
+using Klangbruecke.Diagnostics;
 using Xunit;
 
 namespace Klangbruecke.Tests.Bluetooth;
@@ -47,5 +48,26 @@ public sealed class AudioSinkPolicyTests
     public void Explain_DoesNotBlamePackagingWhenPackaged()
     {
         Assert.DoesNotContain("MSIX", AudioSinkPolicy.Explain(isPackaged: true));
+    }
+
+    // Explain(true) was dead code for as long as both call sites sat inside "if (!CanOpenConnection)",
+    // which made the assertion above guard nothing - and meant a healthy packaged run announced
+    // "Calls enabled." and said nothing at all about music. TrayContext now logs it on both branches,
+    // so this pins the line Task 9 will look for.
+    [Fact]
+    public void Explain_AnnouncesMusicWhenItCanRun()
+    {
+        Assert.Equal("Music enabled.", AudioSinkPolicy.Explain(isPackaged: true));
+    }
+
+    // Shared with the calls half; CallsPolicyTests asserts the two against each other. Missing package
+    // identity is the same root cause on both sides, and while they disagreed anyone grepping [WRN]
+    // saw only one of them.
+    [Theory]
+    [InlineData(true, LogLevel.Info)]
+    [InlineData(false, LogLevel.Warn)]
+    public void LevelFor_WarnsOnlyWhenTheHalfCannotRun(bool isPackaged, LogLevel expected)
+    {
+        Assert.Equal(expected, AudioSinkPolicy.LevelFor(isPackaged));
     }
 }

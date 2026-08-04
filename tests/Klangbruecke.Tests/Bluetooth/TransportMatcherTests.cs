@@ -1,4 +1,5 @@
 using Klangbruecke.Bluetooth;
+using Klangbruecke.Diagnostics;
 using Xunit;
 
 namespace Klangbruecke.Tests.Bluetooth;
@@ -156,5 +157,27 @@ public sealed class TransportMatcherTests
         {
             Assert.False(string.IsNullOrWhiteSpace(TransportMatcher.Match(candidates, RealPhoneA2dpId).Reason));
         }
+    }
+
+    // TransportMatchOutcome's summary says the log level follows from the outcome, and it had already
+    // been contradicted: NoCandidates is documented "Not an error" and was logged as a warning.
+    // SoleCandidate warns despite connecting something, because it means the correlation did not do
+    // its job and a transport was taken blind - the wrong-phone bug this class exists to prevent.
+    [Theory]
+    [InlineData(TransportMatchOutcome.AddressMatch, LogLevel.Info)]
+    [InlineData(TransportMatchOutcome.NoCandidates, LogLevel.Info)]
+    [InlineData(TransportMatchOutcome.SoleCandidate, LogLevel.Warn)]
+    [InlineData(TransportMatchOutcome.Ambiguous, LogLevel.Warn)]
+    public void LevelFor_FollowsTheOutcome(TransportMatchOutcome outcome, LogLevel expected)
+    {
+        Assert.Equal(expected, TransportMatcher.LevelFor(outcome));
+    }
+
+    // An outcome added later must not default into silence: every one of them feeds a log line that
+    // is the only record of why a transport was or was not connected.
+    [Fact]
+    public void LevelFor_WarnsAboutAnUnrecognisedOutcome()
+    {
+        Assert.Equal(LogLevel.Warn, TransportMatcher.LevelFor((TransportMatchOutcome)99));
     }
 }

@@ -236,10 +236,20 @@ internal sealed class TrayContext : ApplicationContext
     {
         // One read, passed to both, so the reason logged is the reason decided on.
         bool isPackaged = PackageIdentity.IsPackaged;
-        if (!AudioSinkPolicy.CanOpenConnection(isPackaged))
-        {
-            Log.Warn(AudioSinkPolicy.Explain(isPackaged));
+        bool canOpen = AudioSinkPolicy.CanOpenConnection(isPackaged);
 
+        // Logged on both branches, mirroring the calls half below. While this line lived inside the
+        // failure branch, Explain(true) - "Music enabled." - was unreachable, and a healthy packaged
+        // run announced "Calls enabled." and said nothing whatsoever about music. Task 9 reads this
+        // file to find out which halves were even attempted, and silence where music should be is
+        // indistinguishable from music having been skipped.
+        //
+        // The level comes from the policy rather than from an if here, so it cannot drift from the
+        // calls gate's the way it already had once.
+        Log.Write(AudioSinkPolicy.LevelFor(isPackaged), AudioSinkPolicy.Explain(isPackaged));
+
+        if (!canOpen)
+        {
             // Worth the tooltip, unlike the calls explanation: there is no music status for it to
             // overwrite, because unpackaged there is never any music. Without it the tray reads
             // "Idle" forever and the app looks broken rather than incomplete.
@@ -269,9 +279,12 @@ internal sealed class TrayContext : ApplicationContext
         // hundred characters and the tooltip caps at 96, so routing it through the tray would truncate
         // the log copy too - and overwrite "A2DP sink connected" with a permanent condition the user
         // cannot act on from the tray. The music status is the one worth showing there.
-        Log.Info(CallsPolicy.Explain(availability));
+        //
+        // Level from the policy, the same shape as the music gate above: the user's own choice is
+        // ordinary, a capability that cannot apply is not.
+        Log.Write(CallsPolicy.LevelFor(availability), CallsPolicy.Explain(availability));
 
-        if (!CallTransportPlan.ShouldEnumerate(availability))
+        if (!CallsPolicy.ShouldEnumerate(availability))
         {
             return;
         }
@@ -284,16 +297,13 @@ internal sealed class TrayContext : ApplicationContext
                 transports.Select(t => new TransportCandidate(t.Id, t.Name)).ToList(),
                 phoneDeviceId);
 
-            if (result.Outcome == TransportMatchOutcome.AddressMatch)
-            {
-                Log.Info(result.Reason);
-            }
-            else
-            {
-                Log.Warn(result.Reason);
-            }
+            // The level follows the outcome, which is what TransportMatchOutcome's own summary
+            // promises. NoCandidates used to warn while the enum documented it as "Not an error" -
+            // a phone that offers no HFP transport is a fact about the phone, and TrayContext puts
+            // it in the tray below where the user will see it regardless.
+            Log.Write(TransportMatcher.LevelFor(result.Outcome), result.Reason);
 
-            if (!CallTransportPlan.ShouldRegister(availability))
+            if (!CallsPolicy.ShouldRegister(availability))
             {
                 Log.Info("Enumeration only: not registering or connecting the call transport.");
                 return;

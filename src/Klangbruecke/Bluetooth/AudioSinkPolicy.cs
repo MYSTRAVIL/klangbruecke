@@ -1,3 +1,5 @@
+using Klangbruecke.Diagnostics;
+
 namespace Klangbruecke.Bluetooth;
 
 /// <summary>
@@ -26,6 +28,17 @@ public static class AudioSinkPolicy
     /// looking for something they did wrong and there is nothing: the same call crashes a bare test
     /// host with no app code in the frame.
     /// </summary>
+    /// <summary>
+    /// What the verdict is worth in the log. The same rule as the calls half's
+    /// <c>CallsPolicy.LevelFor</c>: a half that cannot run at all is Warn, anything the user chose is
+    /// Info. The music half has no "switched off by the user" state, so it only ever produces the
+    /// two ends.
+    ///
+    /// The two gates used to disagree about the identical root cause - missing package identity -
+    /// which left [WRN] telling half the story.
+    /// </summary>
+    public static LogLevel LevelFor(bool isPackaged) => isPackaged ? LogLevel.Info : LogLevel.Warn;
+
     public static string Explain(bool isPackaged) => isPackaged
         ? "Music enabled."
         : "Music half skipped: no MSIX package identity. AudioPlaybackConnection.TryCreateFromId "
