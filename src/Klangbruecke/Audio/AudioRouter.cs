@@ -61,9 +61,14 @@ public sealed class AudioRouter : IDisposable
 
     public bool IsRunning => _session is { Dead: false };
 
-    public event EventHandler<string>? Status;
+    public event EventHandler<StatusMessage>? Status;
 
-    private void Report(string message) => Status?.Invoke(this, message);
+    /// <summary>
+    /// Info unless said otherwise. The level travels with the message because this class is the only
+    /// thing that knows it - see <see cref="StatusMessage"/>.
+    /// </summary>
+    private void Report(string message, LogLevel level = LogLevel.Info) =>
+        Status?.Invoke(this, new StatusMessage(message, level));
 
     /// <summary>The capture endpoint Windows creates while an A2DP sink connection is open.</summary>
     public static MMDevice? FindSinkCaptureEndpoint()
@@ -166,7 +171,11 @@ public sealed class AudioRouter : IDisposable
             // this ordering makes it one. The format strings above are read before Stop on purpose:
             // Stop nulls _capture.
             Stop();
-            Report($"Could not start routing: {ex.Message}");
+
+            // Error, matching the Log.Error above: at Info this was the second of two entries for one
+            // throw, at two different levels, which is the specific way a severity column stops being
+            // worth reading.
+            Report($"Could not start routing: {ex.Message}", LogLevel.Error);
             return false;
         }
     }
@@ -196,7 +205,7 @@ public sealed class AudioRouter : IDisposable
         if (e.Exception is not null)
         {
             Log.Error("Capture stopped.", e.Exception);
-            Report($"Capture stopped: {e.Exception.Message}");
+            Report($"Capture stopped: {e.Exception.Message}", LogLevel.Error);
         }
 
         RequestTeardown(session, "capture");
@@ -222,7 +231,7 @@ public sealed class AudioRouter : IDisposable
         if (e.Exception is not null)
         {
             Log.Error("Playback stopped.", e.Exception);
-            Report($"Playback stopped: {e.Exception.Message}");
+            Report($"Playback stopped: {e.Exception.Message}", LogLevel.Error);
         }
 
         RequestTeardown(session, "playback");

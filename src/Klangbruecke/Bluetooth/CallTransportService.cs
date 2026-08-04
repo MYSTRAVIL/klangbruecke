@@ -21,9 +21,14 @@ public sealed class CallTransportService : IDisposable
 
     public bool IsConnected { get; private set; }
 
-    public event EventHandler<string>? Status;
+    public event EventHandler<StatusMessage>? Status;
 
-    private void Report(string message) => Status?.Invoke(this, message);
+    /// <summary>
+    /// Info unless said otherwise. The level travels with the message because this class is the only
+    /// thing that knows it - see <see cref="StatusMessage"/>.
+    /// </summary>
+    private void Report(string message, LogLevel level = LogLevel.Info) =>
+        Status?.Invoke(this, new StatusMessage(message, level));
 
     /// <summary>Paired devices offering a phone-line transport (i.e. phones).</summary>
     public static async Task<IReadOnlyList<DeviceInformation>> FindDevicesAsync()
@@ -105,7 +110,9 @@ public sealed class CallTransportService : IDisposable
             // rendering was built for, and until now the two components making the WinRT calls this
             // stage exists to instrument were the only ones never calling it.
             Log.Error("The call transport connect path threw.", ex);
-            Report($"Call transport threw: {ex.Message}");
+
+            // Error, matching the line above, so the throw is not also recorded one level down.
+            Report($"Call transport threw: {ex.Message}", LogLevel.Error);
             return false;
         }
     }

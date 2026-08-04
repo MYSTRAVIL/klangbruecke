@@ -31,6 +31,14 @@ public static class Log
         set => _current = value ?? new NullLog();
     }
 
+    /// <summary>
+    /// For call sites that compute their level from a verdict rather than knowing it literally - a
+    /// policy gate, a match outcome, a status raised by another component. Without it those sites
+    /// grow an if/else whose two arms drift apart, which is how the same condition ends up logged at
+    /// two levels in two places.
+    /// </summary>
+    public static void Write(LogLevel level, string message) => Current.Write(level, message);
+
     public static void Info(string message) => Current.Write(LogLevel.Info, message);
 
     public static void Warn(string message) => Current.Write(LogLevel.Warn, message);

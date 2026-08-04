@@ -37,6 +37,9 @@ internal sealed class TrayContext : ApplicationContext
         // NAudio thread that raised the event; see AudioRouter.RequestTeardown for why that deadlocks.
         _router = new AudioRouter(_ui);
 
+        // The severity comes with the message. Forwarding only the text would have this view decide
+        // how serious an event it did not witness was, which is how every component failure used to
+        // reach the log at Info. See StatusMessage.
         _sink.Status += (_, m) => SetStatus(m);
         _calls.Status += (_, m) => SetStatus(m);
         _router.Status += (_, m) => SetStatus(m);
@@ -72,7 +75,15 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
-    private void SetStatus(string message) => _status.Show(message);
+    /// <summary>
+    /// A component's status, forwarded with the severity it came with. This class did not witness
+    /// the event and must not re-decide how serious it was - which is what forwarding the text alone
+    /// amounted to, since everything then landed at Info. See <see cref="StatusMessage"/>.
+    /// </summary>
+    private void SetStatus(StatusMessage status) => _status.Show(status);
+
+    /// <summary>The tray's own messages, which are progress unless this class says otherwise.</summary>
+    private void SetStatus(string message, LogLevel level = LogLevel.Info) => _status.Show(message, level);
 
     private async Task RebuildMenuAsync()
     {
@@ -198,7 +209,7 @@ internal sealed class TrayContext : ApplicationContext
         catch (Exception ex)
         {
             Log.Error($"Connect failed ({trigger}) for id={deviceId}", ex);
-            SetStatus($"Connect failed: {ex.Message}");
+            SetStatus($"Connect failed: {ex.Message}", LogLevel.Error);
         }
     }
 
@@ -309,7 +320,7 @@ internal sealed class TrayContext : ApplicationContext
         catch (Exception ex)
         {
             Log.Error("Call transport enumeration failed.", ex);
-            SetStatus($"Call transport unavailable: {ex.Message}");
+            SetStatus($"Call transport unavailable: {ex.Message}", LogLevel.Error);
         }
     }
 

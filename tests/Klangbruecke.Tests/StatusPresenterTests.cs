@@ -157,4 +157,56 @@ public sealed class StatusPresenterTests
             Log.Current = original;
         }
     }
+
+    private static (LogLevel Level, string Message) LogOf(Action<StatusPresenter> show)
+    {
+        ILog original = Log.Current;
+        var recording = new RecordingLog();
+        Log.Current = recording;
+
+        try
+        {
+            show(new StatusPresenter(new ImmediateUiDispatcher(), _ => { }));
+
+            return (recording.Entries[0].Level, recording.Entries[0].Message);
+        }
+        finally
+        {
+            Log.Current = original;
+        }
+    }
+
+    // The whole point of StatusMessage. Every component status used to reach the file at Info, so a
+    // route that failed to start logged the throw at Error with a stack and then, one line later, the
+    // same event at Info - and a reader grepping [ERR] got half the story. The presenter cannot infer
+    // this; the component has to carry it.
+    [Theory]
+    [InlineData(LogLevel.Info)]
+    [InlineData(LogLevel.Warn)]
+    [InlineData(LogLevel.Error)]
+    public void Show_LogsAtTheLevelTheComponentSupplied(LogLevel level)
+    {
+        Assert.Equal(
+            (level, "capture stopped"),
+            LogOf(presenter => presenter.Show(new StatusMessage("capture stopped", level))));
+    }
+
+    // A status with no level stated is ordinary progress. Pinned because the alternative - defaulting
+    // to Warn "to be safe" - is what makes a severity column meaningless in the other direction.
+    [Fact]
+    public void Show_DefaultsToInfoWhenNoLevelIsGiven()
+    {
+        Assert.Equal((LogLevel.Info, "connected"), LogOf(presenter => presenter.Show("connected")));
+    }
+
+    // The tooltip is capped at 96 characters; the log is not. Messages are long precisely when they
+    // carry the detail worth keeping - an exception message, a policy explanation - so logging the
+    // composed tooltip would truncate exactly the entries a failure is diagnosed from.
+    [Fact]
+    public void Show_LogsTheWholeMessageEvenThoughTheTooltipIsCut()
+    {
+        string long_ = new('x', 500);
+
+        Assert.Equal((LogLevel.Error, long_), LogOf(presenter => presenter.Show(long_, LogLevel.Error)));
+    }
 }

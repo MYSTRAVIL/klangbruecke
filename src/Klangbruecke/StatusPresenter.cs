@@ -43,13 +43,24 @@ public sealed class StatusPresenter
     /// </summary>
     public string Last => _last;
 
-    public void Show(string message)
+    /// <summary>Raised by a component, which brought its own severity.</summary>
+    public void Show(StatusMessage status) => Show(status.Text, status.Level);
+
+    /// <summary>
+    /// Ordinary progress unless told otherwise. The level is a parameter rather than something
+    /// inferred here: this class sees a string, and a presenter that guessed would be guessing about
+    /// events it did not witness. See <see cref="StatusMessage"/>.
+    /// </summary>
+    public void Show(string message, LogLevel level = LogLevel.Info)
     {
         // Logged where the status arrives rather than inside the post: the log is a record of what
         // happened, not of what the tooltip ended up saying. A post issued during shutdown is dropped
         // outright - NAudio's RecordingStopped fires while the router is being disposed - so this
         // line is the only surviving trace of those.
-        Log.Info(message);
+        //
+        // The full message, not the composed tooltip: Compose truncates at 96 characters and the
+        // reason a status is long is almost always that it carries the detail worth keeping.
+        Log.Write(level, message);
 
         // Reached from the WinRT threadpool and from NAudio callbacks; touching the tray icon off the
         // UI thread throws intermittently rather than failing cleanly.

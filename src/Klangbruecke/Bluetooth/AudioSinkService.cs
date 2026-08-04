@@ -24,9 +24,14 @@ public sealed class AudioSinkService : IDisposable
     public string? ConnectedDeviceId { get; private set; }
     public bool IsConnected => _connection is not null && ConnectedDeviceId is not null;
 
-    public event EventHandler<string>? Status;
+    public event EventHandler<StatusMessage>? Status;
 
-    private void Report(string message) => Status?.Invoke(this, message);
+    /// <summary>
+    /// Info unless said otherwise. The level travels with the message because this class is the only
+    /// thing that knows it - see <see cref="StatusMessage"/>.
+    /// </summary>
+    private void Report(string message, LogLevel level = LogLevel.Info) =>
+        Status?.Invoke(this, new StatusMessage(message, level));
 
     /// <summary>Paired devices that can act as an audio source for this PC.</summary>
     public static async Task<IReadOnlyList<DeviceInformation>> FindDevicesAsync()
@@ -112,7 +117,11 @@ public sealed class AudioSinkService : IDisposable
             // exception and the stack - precisely the case FileLog's full ToString() rendering
             // exists for, and had never once received.
             Log.Error("Opening the A2DP sink connection threw.", ex);
-            Report($"Connection threw: {ex.Message}");
+
+            // Error, matching the line above. Raised at Info it reached the file as a second entry
+            // describing the same throw one level down, so a reader scanning [INF] met "Connection
+            // threw" among the ordinary progress and a reader scanning [ERR] saw only half of it.
+            Report($"Connection threw: {ex.Message}", LogLevel.Error);
             Disconnect();
             return false;
         }
