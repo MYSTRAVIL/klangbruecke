@@ -1,3 +1,4 @@
+using System.Globalization;
 using Klangbruecke.Diagnostics;
 using Xunit;
 
@@ -63,6 +64,82 @@ public sealed class FileLogTests : IDisposable
 
         Assert.Contains("InvalidOperationException", line);
         Assert.Contains("no endpoint", line);
+    }
+
+    [Fact]
+    public void Format_IncludesInnerExceptionAndStackTrace()
+    {
+        string line = FileLog.Format(At(2026, 8, 4), LogLevel.Error, "boom", ThrownWrappedException());
+
+        // The outer AggregateException says only "One or more errors occurred." The cause is the
+        // inner exception, and where it happened is only in the stack.
+        Assert.Contains("no endpoint", line);
+        Assert.Contains("InvalidOperationException", line);
+        Assert.Contains(nameof(ThrownWrappedException), line);
+    }
+
+    [Fact]
+    public void Format_IndentsExceptionDetailBelowTheMessageLine()
+    {
+        string line = FileLog.Format(At(2026, 8, 4), LogLevel.Error, "boom", ThrownWrappedException());
+
+        string[] lines = line.ReplaceLineEndings("\n").Split('\n');
+        Assert.StartsWith("2026-08-04 12:00:00.000 [ERR] boom", lines[0]);
+        Assert.True(lines.Length > 1, "the exception detail should occupy its own lines");
+        Assert.All(lines.Skip(1), detail => Assert.StartsWith("    ", detail));
+    }
+
+    [Fact]
+    public void Format_UsesInvariantCulture_NotTheCurrentCultureTimeSeparator()
+    {
+        var hostile = (CultureInfo)CultureInfo.InvariantCulture.Clone();
+        hostile.DateTimeFormat.TimeSeparator = "#";
+
+        string line = WithCulture(hostile, () => FileLog.Format(At(2026, 8, 4, hour: 9), LogLevel.Info, "message", null));
+
+        Assert.StartsWith("2026-08-04 09:00:00.000", line);
+    }
+
+    [Fact]
+    public void FileNameFor_UsesInvariantCulture_NotTheCurrentCultureCalendar()
+    {
+        // th-TH defaults to the Buddhist calendar, which renders 2026 as 2569.
+        string name = WithCulture(new CultureInfo("th-TH"), () => FileLog.FileNameFor(At(2026, 8, 4)));
+
+        Assert.Equal("klangbruecke-20260804.log", name);
+    }
+
+    private static T WithCulture<T>(CultureInfo culture, Func<T> action)
+    {
+        CultureInfo original = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = culture;
+            return action();
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
+    }
+
+    private static Exception ThrownWrappedException()
+    {
+        try
+        {
+            try
+            {
+                throw new InvalidOperationException("no endpoint");
+            }
+            catch (Exception inner)
+            {
+                throw new AggregateException("One or more errors occurred.", inner);
+            }
+        }
+        catch (Exception thrown)
+        {
+            return thrown;
+        }
     }
 
     [Fact]

@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 
 namespace Klangbruecke.Diagnostics;
@@ -11,6 +13,8 @@ namespace Klangbruecke.Diagnostics;
 /// </summary>
 public sealed class FileLog : ILog
 {
+    private const string DetailIndent = "    ";
+
     private readonly string _directory;
     private readonly int _retentionDays;
     private readonly Func<DateTimeOffset> _clock;
@@ -28,25 +32,35 @@ public sealed class FileLog : ILog
         "Klangbruecke",
         "logs");
 
-    public static string FileNameFor(DateTimeOffset day) => $"klangbruecke-{day:yyyyMMdd}.log";
+    // Invariant culture: the file name is a machine-readable contract that the retention sweep
+    // globs and parses. Under a non-Gregorian calendar 'yyyy' renders as some other year.
+    public static string FileNameFor(DateTimeOffset day) =>
+        string.Create(CultureInfo.InvariantCulture, $"klangbruecke-{day:yyyyMMdd}.log");
 
     public void Write(LogLevel level, string message, Exception? exception = null)
     {
         try
         {
-            DateTimeOffset now = _clock();
-            string line = Format(now, level, message, exception);
-
             // Status arrives from the WinRT threadpool and from NAudio callbacks, so writes race.
+            // The stamp is taken inside the lock because Monitor is not FIFO: stamped outside, a
+            // later line can win the lock first and land above an earlier one, misordering the
+            // connect/disconnect sequence a reader is trying to reconstruct top-to-bottom.
             lock (_gate)
             {
+                DateTimeOffset now = _clock();
+                string line = Format(now, level, message, exception);
+
                 Directory.CreateDirectory(_directory);
                 File.AppendAllText(Path.Combine(_directory, FileNameFor(now)), line + Environment.NewLine, Encoding.UTF8);
             }
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             // Deliberate. Logging must never be the reason the app fails.
+            // If the directory is permanently unwritable, nothing is ever written and there is no
+            // other signal that anything was attempted. Debug.WriteLine cannot throw with the
+            // default listener and costs nothing in a release run.
+            Debug.WriteLine(ex);
         }
     }
 
@@ -59,10 +73,21 @@ public sealed class FileLog : ILog
             _ => "ERR",
         };
 
-        string line = $"{now:yyyy-MM-dd HH:mm:ss.fff} [{tag}] {message}";
+        // Invariant culture: in a custom format string ':' is a placeholder substituted from
+        // DateTimeFormatInfo.TimeSeparator, so CurrentCulture can silently break the sortable stamp.
+        string line = string.Create(CultureInfo.InvariantCulture, $"{now:yyyy-MM-dd HH:mm:ss.fff} [{tag}] {message}");
 
-        return exception is null
-            ? line
-            : $"{line}{Environment.NewLine}    {exception.GetType().Name}: {exception.Message}";
+        if (exception is null)
+        {
+            return line;
+        }
+
+        // ToString() rather than type-plus-message: a failed WinRT async op renders as
+        // "AggregateException: One or more errors occurred." and the cause lives entirely in the
+        // inner exception and the stack. Indented so the detail stays one visually distinct block
+        // hanging off its message line.
+        string detail = DetailIndent + exception.ToString().ReplaceLineEndings(Environment.NewLine + DetailIndent);
+
+        return line + Environment.NewLine + detail;
     }
 }
