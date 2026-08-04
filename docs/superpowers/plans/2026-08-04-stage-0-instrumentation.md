@@ -1696,7 +1696,7 @@ Then enable sideloading: Settings → Update & Security → For developers → S
 Launch Klangbruecke from the Start menu, then:
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" |
+Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" -Tail 300 |
   Select-String "Base directory|Calls|Music"
 ```
 
@@ -1705,6 +1705,12 @@ That path is correct for the installed build — the manifest disables Desktop B
 Expected, in this order:
 
 - `Base directory: C:\Program Files\WindowsApps\Klangbruecke_...` — **check this first.** If it names `src\Klangbruecke\bin\...` you are reading a development run and everything below it is about the wrong process.
+
+**One file, many runs.** Packaged and unpackaged builds now append to the same log, and Task 8's
+development runs are already in today's file. Every check in this task is therefore scoped with
+`-Tail 300`. If a check still shows something confusing, find the **last** `Base directory:` line
+and read only below it — anything above belongs to an earlier process. This matters most in Steps 6
+and 7, where a stale hit from an earlier run reads exactly like a fresh failure.
 - `Music enabled.`
 - `Calls enabled.`
 
@@ -1745,7 +1751,7 @@ Note that outgoing-call ringback is a known gap (`docs/FINDINGS.md` §6) and is 
 With music routing and playing, **disconnect Bluetooth on the phone** (not from the tray — the point is that the far side goes away without warning). Then:
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" |
+Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" -Tail 300 |
   Select-String "Tearing the route down|stopped"
 ```
 
@@ -1760,7 +1766,7 @@ Record which half reported first. Stage 1 needs it — it says which of `Recordi
 With the call still connected, disconnect Bluetooth on the phone, then:
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" |
+Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" -Tail 300 |
   Select-String "InvalidOperationException|Unhandled"
 ```
 
@@ -1769,11 +1775,19 @@ Expected: no matches. This is the hand-verification of Task 4's cross-thread pat
 Also worth one look at the severity column:
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" |
+Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" -Tail 300 |
   Select-String "\[ERR\]" -Context 0,6
 ```
 
-Every `[ERR]` should be followed by an indented exception block. An `[ERR]` with no stack under it means a component logged a failure without the exception, which is the defect this stage's logging was rebuilt to prevent.
+**Errors come in pairs, and that is correct, not a defect.** A failure logs twice by design: the
+component writes `Log.Error(message, exception)` — which renders the full indented stack — and then
+raises a status the tray shows, which reaches the log as a second, shorter `[ERR]` line with no
+stack. So the shape to expect is a stack-bearing `[ERR]` immediately followed by a stackless one
+restating it.
+
+What would be wrong is a stackless `[ERR]` with **no** stack-bearing partner anywhere above it.
+That means a component reported a failure without the exception — the defect this stage's logging
+was rebuilt to prevent.
 
 - [ ] **Step 8: Record the outcome**
 
