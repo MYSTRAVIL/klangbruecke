@@ -25,6 +25,13 @@ public sealed class ControlUiDispatcher : IUiDispatcher, IDisposable
     {
         _marshaller = new Control();
 
+        // Control defaults to visible. In practice WinForms parks a parentless handle-created
+        // control on its hidden tool window, so this never reaches the screen either way - but
+        // this app must never show a window, and that is too load-bearing a guarantee to rest on
+        // an implementation detail of where WinForms happens to park things. Cleared before the
+        // handle exists, so WS_VISIBLE is never in the created window's style at all.
+        _marshaller.Visible = false;
+
         // Forces handle creation. Without a handle there is nothing to marshal to.
         _ = _marshaller.Handle;
     }

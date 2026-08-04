@@ -70,8 +70,16 @@ internal sealed class TrayContext : ApplicationContext
             // two cannot disagree.
             _lastStatus = message;
 
-            // Tray tooltips are capped at 63 characters.
-            _icon.Text = message.Length > 60 ? $"Klangbruecke: {message[..57]}..." : $"Klangbruecke: {message}";
+            // Status text interpolates exception messages, so its length is unbounded, while
+            // NotifyIcon.Text throws ArgumentOutOfRangeException past 127 characters - measured, not
+            // assumed. An unguarded assignment would therefore throw from inside this callback, on
+            // the UI thread, which is the failure the dispatcher above exists to prevent. The cap is
+            // set well below 127 because a tooltip that long is unreadable anyway; the composed
+            // string is what gets measured, so the prefix cannot be forgotten in the arithmetic.
+            const int maxTooltip = 96;
+
+            string tooltip = $"Klangbruecke: {message}";
+            _icon.Text = tooltip.Length > maxTooltip ? $"{tooltip[..(maxTooltip - 3)]}..." : tooltip;
         });
     }
 

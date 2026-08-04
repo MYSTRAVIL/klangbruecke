@@ -62,7 +62,14 @@ public sealed class UiDispatcherTests
     /// <summary>
     /// Posts from a worker thread and returns once the post has definitely been queued. The join
     /// matters: BeginInvoke has posted its window message by the time it returns, so a later pump
-    /// on the owning thread is guaranteed to see it and the assertions below cannot race.
+    /// on the owning thread is guaranteed to see it and the callers below cannot race.
+    ///
+    /// The join is also the one hazard here. Joining from an STA thread waits via
+    /// CoWaitForMultipleHandles without COWAIT_DISPATCH_WINDOW_MESSAGES, so it does not pump - which
+    /// is what makes the callers deterministic, but it also means that if Post were ever changed to
+    /// a synchronous Invoke, the worker would block on a pump that is not running and this would
+    /// deadlock rather than fail. A hung suite is worse than a red one: if these tests ever stop
+    /// terminating, suspect Post, not the tests.
     /// </summary>
     private static void PostFromAnotherThread(IUiDispatcher dispatcher, Action action)
     {
@@ -81,13 +88,11 @@ public sealed class UiDispatcherTests
             int ranOn = 0;
 
             PostFromAnotherThread(dispatcher, () => ranOn = Environment.CurrentManagedThreadId);
-
-            // Nothing has pumped yet, so an action that has already run went inline on the worker -
-            // the whole defect this class exists to remove.
-            Assert.Equal(0, ranOn);
-
             Application.DoEvents();
 
+            // Covers both halves on its own: an action that ran inline on the worker records the
+            // worker's id, not the owning thread's, so this fails either way and a pre-pump assert
+            // would add nothing.
             Assert.Equal(owningThread, ranOn);
         });
     }
