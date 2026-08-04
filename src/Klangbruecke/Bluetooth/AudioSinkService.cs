@@ -117,16 +117,17 @@ public sealed class AudioSinkService : IDisposable
         }
         catch (Exception ex)
         {
-            // Log.Error before Report, and both. Report reaches the file through StatusPresenter
-            // carrying ex.Message alone, and OpenAsync is the awaited WinRT call whose failure
-            // renders as "One or more errors occurred." with the cause entirely in the inner
-            // exception and the stack - precisely the case FileLog's full ToString() rendering
-            // exists for, and had never once received.
+            // Both, and in this order. Report carries ex.Message; only this call carries the
+            // exception, and OpenAsync is the awaited WinRT call whose failure renders as "One or
+            // more errors occurred." with the cause entirely in the inner exception and the stack -
+            // precisely the case FileLog's ToString() rendering exists for, and had never once
+            // received. Unconditional rather than folded into Report, which reaches the log only
+            // while something is subscribed to Status.
             Log.Error("Opening the A2DP sink connection threw.", ex);
 
-            // Error, matching the line above. Raised at Info it reached the file as a second entry
-            // describing the same throw one level down, so a reader scanning [INF] met "Connection
-            // threw" among the ordinary progress and a reader scanning [ERR] saw only half of it.
+            // Error, matching the line above. At Info this was a second entry describing the same
+            // throw one level down, so a reader scanning [INF] met "Connection threw" among the
+            // ordinary progress while a reader grepping [ERR] saw only half of it.
             Report($"Connection threw: {ex.Message}", LogLevel.Error);
             Disconnect();
             return false;

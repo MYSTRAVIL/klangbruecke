@@ -268,8 +268,8 @@ internal sealed class TrayContext : ApplicationContext
 
     /// <summary>
     /// The calls half. Independent of the music half - one failing must not take out the other - and
-    /// deliberately not gated as a whole on the availability verdict: see <see cref="CallTransportPlan"/>
-    /// for why an unpackaged run still enumerates.
+    /// deliberately not gated as a whole on the availability verdict: see
+    /// <see cref="CallsPolicy.ShouldEnumerate"/> for why an unpackaged run still enumerates.
     /// </summary>
     private async Task ConnectCallsAsync(string phoneDeviceId)
     {

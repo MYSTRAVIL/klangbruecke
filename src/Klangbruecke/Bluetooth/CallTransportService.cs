@@ -103,15 +103,19 @@ public sealed class CallTransportService : IDisposable
         }
         catch (Exception ex)
         {
-            // Log.Error before Report, and both, because they are not the same record. Report reaches
-            // the file through StatusPresenter as an Info line carrying ex.Message alone; a faulted
-            // WinRT async op renders that as "One or more errors occurred." with the entire cause in
-            // the inner exception and the stack. This is the overload FileLog's full ToString()
-            // rendering was built for, and until now the two components making the WinRT calls this
-            // stage exists to instrument were the only ones never calling it.
+            // Both, and in this order, because they are not the same record. Report carries
+            // ex.Message; only this call carries the exception, and FileLog renders it with
+            // ToString() - a faulted WinRT async op's message is "One or more errors occurred." and
+            // the entire cause lives in the inner exception and the stack. This is the overload that
+            // rendering was built for, and the two components making the WinRT calls this stage
+            // exists to instrument were the only ones never calling it.
+            //
+            // Unconditional, rather than folded into Report: Report reaches the log only if
+            // something is subscribed to Status, and a throw during startup or teardown is exactly
+            // when nothing may be.
             Log.Error("The call transport connect path threw.", ex);
 
-            // Error, matching the line above, so the throw is not also recorded one level down.
+            // Error, matching the line above, so one throw is not described at two levels.
             Report($"Call transport threw: {ex.Message}", LogLevel.Error);
             return false;
         }
