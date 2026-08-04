@@ -32,12 +32,14 @@ public sealed class AudioRouter : IDisposable
 
     private readonly IUiDispatcher _ui;
 
-    // Volatile: both are read from NAudio's capture and play threads by the sender guards below, and
-    // written on the thread that runs Start and Stop.
+    // All three are volatile for the same reason: they are read on NAudio's capture and play threads -
+    // _capture and _output by the sender guards below, _buffer by OnDataAvailable - and written on the
+    // thread that runs Start and Stop. _buffer's stale read is the mildest of the three (samples added
+    // to a dead but still-referenced buffer, which is then collected), but leaving one of three
+    // unmarked would read as a considered decision that the other two were special.
     private volatile WasapiCapture? _capture;
     private volatile WasapiOut? _output;
-
-    private BufferedWaveProvider? _buffer;
+    private volatile BufferedWaveProvider? _buffer;
 
     /// <summary>
     /// The current session, or null between Stop and the next Start. Also the authority on whether a
@@ -138,8 +140,8 @@ public sealed class AudioRouter : IDisposable
 
             // Before either worker thread exists, so no stopped event can be raised against a session
             // that has not been published yet and be discarded as stale. This is also what makes
-            // IsRunning true, a few statements earlier than the old flag did; the difference is not
-            // observable, because any failure below reaches Stop and nulls it again.
+            // IsRunning true, a few statements earlier than the old flag did; the catch below nulls it
+            // before anything can observe the difference.
             _session = new Session();
 
             _capture.StartRecording();
@@ -157,8 +159,14 @@ public sealed class AudioRouter : IDisposable
 
             Log.Error($"Routing failed. Capture={capture} Render={render}", ex);
 
-            Report($"Could not start routing: {ex.Message}");
+            // Stop before Report, not after. A throw from StartRecording or Play lands here with the
+            // session already published, so reporting first would raise Status synchronously while
+            // IsRunning still reads true for a route that never started. Nothing in today's subscriber
+            // chain reads it - but that is a fact about the current subscribers, not an invariant, and
+            // this ordering makes it one. The format strings above are read before Stop on purpose:
+            // Stop nulls _capture.
             Stop();
+            Report($"Could not start routing: {ex.Message}");
             return false;
         }
     }
@@ -180,13 +188,18 @@ public sealed class AudioRouter : IDisposable
             return;
         }
 
+        // Before the Report below, for the reason Start's catch gives: Status is raised
+        // synchronously, and no subscriber should be told the capture died by a router that still
+        // answers IsRunning with true.
+        Session? session = EndSession();
+
         if (e.Exception is not null)
         {
             Log.Error("Capture stopped.", e.Exception);
             Report($"Capture stopped: {e.Exception.Message}");
         }
 
-        RequestTeardown("capture");
+        RequestTeardown(session, "capture");
     }
 
     /// <summary>
@@ -203,13 +216,35 @@ public sealed class AudioRouter : IDisposable
             return;
         }
 
+        // Before the Report below; see the capture handler above.
+        Session? session = EndSession();
+
         if (e.Exception is not null)
         {
             Log.Error("Playback stopped.", e.Exception);
             Report($"Playback stopped: {e.Exception.Message}");
         }
 
-        RequestTeardown("playback");
+        RequestTeardown(session, "playback");
+    }
+
+    /// <summary>
+    /// Marks the current session dead and hands it back, or returns null if Stop already ran.
+    ///
+    /// Split from the posting below so that the two handlers can mark the route dead before they
+    /// raise Status. The write is scoped to the session that was read, never to a field of the
+    /// router: a worker preempted here can otherwise land its write on a healthy session that a
+    /// Stop/Start pair created in the meantime.
+    /// </summary>
+    private Session? EndSession()
+    {
+        Session? session = _session;
+        if (session is not null)
+        {
+            session.Dead = true;
+        }
+
+        return session;
     }
 
     /// <summary>
@@ -231,13 +266,20 @@ public sealed class AudioRouter : IDisposable
     /// handler would therefore have introduced the deadlock the old do-nothing handlers avoided by
     /// accident.
     ///
-    /// Do not narrow that to "only when it threw". PlayThread has exactly one assignment of Stopped,
-    /// on the single fall-through at the end of its try, so every abnormal exit reaches the finally
-    /// still marked Playing. That includes an early return when FillBuffer reports end-of-stream, and
-    /// it includes a throw from anywhere in the body - which is wide: the DMO resampler construction,
-    /// audioClient.BufferSize, Start, CurrentPadding, every GetBuffer/ReleaseBuffer COM call, and
-    /// audioClient.Stop() itself, which runs one line *before* the Stopped assignment. An endpoint
-    /// that vanishes mid-stream, which is what a phone walking out of range looks like, lands there.
+    /// Do not narrow that to "only when it threw". PlayThread contains exactly one assignment of
+    /// Stopped, near the end of its try, and only audioClient.Reset() follows it there. So a failure
+    /// with no consumer Stop behind it - the spontaneous kind - reaches the finally still marked
+    /// Playing whatever caused it: an early return when FillBuffer reports end-of-stream, or a throw
+    /// from the DMO resampler construction, audioClient.BufferSize, Start, CurrentPadding, any
+    /// GetBuffer/ReleaseBuffer COM call, or audioClient.Stop() itself, which runs immediately before
+    /// that assignment. An endpoint that vanishes mid-stream, which is what a phone walking out of
+    /// range looks like, lands there.
+    ///
+    /// What the field cannot do is tell you which statement faulted. Stop() and Pause() write it from
+    /// other threads - Stop() sets Stopped before joining, which is how the render loop is broken at
+    /// all - so after a consumer-initiated stop the same throw from audioClient.Stop() arrives marked
+    /// Stopped instead. That case is not the hazard, because a consumer stop has already joined the
+    /// play thread; it is only a reason not to read playbackState as a fault locator.
     /// The end-of-stream return happens to be dormant for us - BufferedWaveProvider.ReadFully
     /// defaults to true, so its Read pads with zeroes and never returns 0 - but that is a default on
     /// a different class, not a property of this one, and it is not what makes this safe.
@@ -255,21 +297,14 @@ public sealed class AudioRouter : IDisposable
     /// raising, so Dispose finds nothing to join - but it is routed the same way rather than relying
     /// on that asymmetry holding.
     /// </summary>
-    private void RequestTeardown(string half)
+    private void RequestTeardown(Session? session, string half)
     {
-        Session? session = _session;
         if (session is null)
         {
             // Stop already ran. Nothing to tear down, and posting would only risk killing whatever
             // starts next.
             return;
         }
-
-        // Eagerly, because the teardown below is deferred and until it lands the tray must not go on
-        // claiming the route is live. Written through the token rather than to a field of the router,
-        // so that a Stop/Start pair completing between the read above and this write cannot mark the
-        // new session dead; see Session.
-        session.Dead = true;
 
         _ui.Post(() =>
         {
