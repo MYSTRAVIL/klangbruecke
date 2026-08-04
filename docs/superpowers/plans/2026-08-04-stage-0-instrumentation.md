@@ -1683,11 +1683,24 @@ Expected: an `.msix` under `artifacts/`. If `Build-Msix.ps1` warns about a missi
 
 - [ ] **Step 2: Kill any development instance, then install**
 
-**Kill any running `dotnet run` / `Klangbruecke.exe` from `bin\` first.** This is not tidiness. The single-instance mutex lives in the `Local\` namespace, which is **not** virtualized for MSIX, so a live unpackaged instance makes the packaged one log `Another instance already holds the single-instance mutex. Exiting.` and quit. Nothing appears in the tray and nothing else is written — from the outside it is indistinguishable from a crash.
+**No development instance may be running.** This is not tidiness. The single-instance mutex lives in the `Local\` namespace, which is **not** virtualized for MSIX, so a live unpackaged instance makes the packaged one log `Another instance already holds the single-instance mutex. Exiting.` and quit. Nothing appears in the tray and nothing else is written — from the outside it is indistinguishable from a crash.
+
+Ask the mutex rather than guessing at process names. It is the actual gate, and it answers whether one exists at all:
 
 ```powershell
-Get-Process Klangbruecke -ErrorAction SilentlyContinue | Stop-Process
+try { [System.Threading.Mutex]::OpenExisting('Local\Klangbruecke.SingleInstance').Dispose(); 'HELD' }
+catch { 'FREE' }
 ```
+
+`FREE` — proceed. `HELD` — find the owner. It is one of two shapes, and a `dotnet run` instance is **not** called `Klangbruecke`; it runs inside `dotnet.exe`, so a `Get-Process Klangbruecke` alone will miss it:
+
+```powershell
+Get-Process Klangbruecke -ErrorAction SilentlyContinue          # tray app: packaged, or from bin\
+Get-CimInstance Win32_Process -Filter "Name='dotnet.exe'" |     # dotnet run
+  Where-Object CommandLine -match 'Klangbruecke'
+```
+
+Stop whichever turns up, then re-check the mutex before installing.
 
 Then enable sideloading: Settings → Update & Security → For developers → Sideload apps. Then double-click the `.msix` and install.
 
