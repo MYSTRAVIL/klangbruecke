@@ -458,6 +458,20 @@ a Store-signed identity in practice.
 as enumeration, `FromId` and `IsRegistered()` — all of which work unpackaged. The capability was
 never actually exercised.
 
+### Ruled out: a registration conflict
+
+The scaffold's own comment in `CallTransportService.cs` anticipated this — *"Registering claims the
+hands-free role for this app. If another app already holds it, this is where things fail"* — and
+Thy Phone (`InTheHandLtd.PearYourPhone`, the Store app §1 used to prove calls work) was still
+installed when the failure was first seen.
+
+**It was uninstalled and `RegisterApp()` still throws, identically.** Verified 2026-08-04 20:41 on a
+clean relaunch. So the role is not held by another app, and the mundane explanation is gone.
+
+Also ruled out: a deployment-time capability refusal. `Microsoft-Windows-AppModel-Runtime/Admin`
+logs the app launching into its Desktop AppX container normally, with no denial of any kind. Windows
+accepts the package and its declared capabilities; the API rejects the call at runtime.
+
 ### What has NOT been ruled out
 
 - A missing companion capability or manifest element beyond `phoneLineTransportManagement`.
