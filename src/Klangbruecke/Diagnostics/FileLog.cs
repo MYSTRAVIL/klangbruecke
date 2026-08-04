@@ -105,9 +105,12 @@ public sealed class FileLog : ILog
         // Dates compared to dates, never to an instant. A name carries a day and no time, so
         // measuring it against a wall-clock 'now' would hand the boundary file's fate to the hour
         // the day's first write happened to land on and to the machine's UTC offset - retaining a
-        // day less than promised on a westward offset. A file exactly _retentionDays old is not
-        // older than _retentionDays, so the boundary day is kept.
-        DateOnly cutoff = DateOnly.FromDateTime(now.Date).AddDays(-_retentionDays);
+        // day less than promised on a westward offset.
+        //
+        // The window is a file count, not a comparison: _retentionDays files survive, today and the
+        // days before it, so that 'retentionDays: 7' leaves the seven files it reads as. Stated in
+        // files because that is the durable contract - the comparison below is just how it is met.
+        DateOnly oldestKept = DateOnly.FromDateTime(now.Date).AddDays(1 - _retentionDays);
 
         foreach (string path in Directory.EnumerateFiles(_directory, FileNamePrefix + "*" + FileNameExtension))
         {
@@ -117,7 +120,7 @@ public sealed class FileLog : ILog
             // this app writes on any non-Gregorian calendar, and retention would silently stop.
             if (!DateOnly.TryParseExact(stamp, "yyyyMMdd", CultureInfo.InvariantCulture,
                     DateTimeStyles.None, out DateOnly day)
-                || day >= cutoff)
+                || day >= oldestKept)
             {
                 continue;
             }

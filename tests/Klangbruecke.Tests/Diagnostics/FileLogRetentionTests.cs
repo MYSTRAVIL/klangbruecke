@@ -53,26 +53,51 @@ public sealed class FileLogRetentionTests : IDisposable
     }
 
     [Fact]
-    public void Write_KeepsAFileExactlyOnTheRetentionBoundary()
+    public void Write_RetainsExactlyRetentionDaysFiles()
     {
-        SeedLogFor(At(2026, 7, 28));   // exactly 7 days before "now"
         var now = At(2026, 8, 4);
+        for (int daysBack = 1; daysBack <= 12; daysBack++)
+        {
+            SeedLogFor(now.AddDays(-daysBack));
+        }
 
         new FileLog(_dir, retentionDays: 7, clock: () => now).Write(LogLevel.Info, "today");
 
-        // Deliberate: "older than seven days" excludes the file that is seven days old.
-        Assert.True(File.Exists(Path.Combine(_dir, "klangbruecke-20260728.log")));
+        // The contract the constant states: seven dated files, today and the six before it.
+        Assert.Equal(
+            new[]
+            {
+                "klangbruecke-20260729.log",
+                "klangbruecke-20260730.log",
+                "klangbruecke-20260731.log",
+                "klangbruecke-20260801.log",
+                "klangbruecke-20260802.log",
+                "klangbruecke-20260803.log",
+                "klangbruecke-20260804.log",
+            },
+            Directory.EnumerateFiles(_dir).Select(path => Path.GetFileName(path)!).Order().ToArray());
     }
 
     [Fact]
-    public void Write_DeletesTheFirstFilePastTheRetentionBoundary()
+    public void Write_KeepsTheOldestFileInsideTheWindow()
     {
-        SeedLogFor(At(2026, 7, 27));   // 8 days before "now"
+        SeedLogFor(At(2026, 7, 29));   // 6 days before "now" - the seventh file
         var now = At(2026, 8, 4);
 
         new FileLog(_dir, retentionDays: 7, clock: () => now).Write(LogLevel.Info, "today");
 
-        Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260727.log")));
+        Assert.True(File.Exists(Path.Combine(_dir, "klangbruecke-20260729.log")));
+    }
+
+    [Fact]
+    public void Write_DeletesTheFirstFileOutsideTheWindow()
+    {
+        SeedLogFor(At(2026, 7, 28));   // 7 days before "now" - the eighth file, one too many
+        var now = At(2026, 8, 4);
+
+        new FileLog(_dir, retentionDays: 7, clock: () => now).Write(LogLevel.Info, "today");
+
+        Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260728.log")));
     }
 
     [Theory]
@@ -82,15 +107,15 @@ public sealed class FileLogRetentionTests : IDisposable
     [InlineData(9, 0, 13)]     // a morning in New Zealand
     public void Write_DrawsTheBoundaryByDate_NotByTimeOfDayOrOffset(int hour, int minute, int offsetHours)
     {
-        SeedLogFor(At(2026, 7, 28));   // the boundary day
-        SeedLogFor(At(2026, 7, 27));   // one day past it
+        SeedLogFor(At(2026, 7, 29));   // the oldest day inside the window
+        SeedLogFor(At(2026, 7, 28));   // the first day outside it
         var now = new DateTimeOffset(2026, 8, 4, hour, minute, 0, TimeSpan.FromHours(offsetHours));
 
         new FileLog(_dir, retentionDays: 7, clock: () => now).Write(LogLevel.Info, "today");
 
         // Whatever the clock reads and wherever the machine sits, the same seven days survive.
-        Assert.True(File.Exists(Path.Combine(_dir, "klangbruecke-20260728.log")));
-        Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260727.log")));
+        Assert.True(File.Exists(Path.Combine(_dir, "klangbruecke-20260729.log")));
+        Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260728.log")));
     }
 
     [Fact]
