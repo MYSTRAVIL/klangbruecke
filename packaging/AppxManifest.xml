@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap desktop rescap">
+
+  <!-- Publisher must match the subject of the signing certificate exactly.
+       packaging/New-DevCert.ps1 creates a cert with this subject. -->
+  <Identity
+    Name="Klangbruecke"
+    Publisher="CN=Klangbruecke Development"
+    Version="0.1.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Klangbruecke</DisplayName>
+    <PublisherDisplayName>Klangbruecke Development</PublisherDisplayName>
+    <Description>Bridges phone audio and calls to this PC over Bluetooth.</Description>
+    <Logo>Images\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!-- 19041 is the floor for AudioPlaybackConnection and PhoneLineTransportDevice. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.19045.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="Klangbruecke"
+                 Executable="Klangbruecke.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Klangbruecke"
+        Description="Bridges phone audio and calls to this PC over Bluetooth."
+        BackgroundColor="transparent"
+        Square150x150Logo="Images\Square150x150Logo.png"
+        Square44x44Logo="Images\Square44x44Logo.png"
+        AppListEntry="default" />
+
+      <Extensions>
+        <!-- Tray app: start with Windows, minimised, no window. -->
+        <desktop:Extension Category="windows.startupTask"
+                           Executable="Klangbruecke.exe"
+                           EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="KlangbrueckeStartup" Enabled="true" DisplayName="Klangbruecke" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- runFullTrust: required for a packaged Win32/WinForms app.
+         phoneLineTransportManagement: required for PhoneLineTransportDevice (call routing).
+           This is a RESTRICTED capability - it gates Store submission only.
+           Sideloading needs no Microsoft approval. See docs/FINDINGS.md §2.
+         bluetooth: required for AudioPlaybackConnection (music). No restricted cap needed. -->
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="phoneLineTransportManagement" />
+    <DeviceCapability Name="bluetooth" />
+  </Capabilities>
+
+</Package>
