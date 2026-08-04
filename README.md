@@ -9,9 +9,30 @@ No Phone Link. No dongle. Runs on the machine's built-in Bluetooth radio.
 
 ## Status
 
-Scaffold. The approach is **proven working on the target machine** — see [docs/FINDINGS.md](docs/FINDINGS.md).
-Both halves were verified 2026-08-04 using two separate third-party apps; this project replaces
-them with a single tray app, which is the one thing neither existing app provides.
+**Working.** Both halves run from this one app, verified 2026-08-04 on the target machine with the
+packaged build: music routes over A2DP, and a real cellular call routes to the PC with audio in
+both directions. That is the thing neither existing app provided — see
+[docs/FINDINGS.md](docs/FINDINGS.md) §10.
+
+What is done: the connect path, transport-to-phone correlation, and a rolling log at
+`%LOCALAPPDATA%\Klangbruecke\logs\` that is the app's only diagnostic surface and the reason the
+first packaged run was debuggable at all.
+
+What is not done:
+
+- **Reconnect.** There is no state machine yet — no `DeviceWatcher`, no retry, no sleep/resume
+  handling. The app connects when told to and stays connected until something stops it. Reconnect
+  after reboot and phone-initiated reconnect are the predecessor app's defining bug and remain
+  unaddressed. Designed in
+  [the connection lifecycle spec](docs/superpowers/specs/2026-08-04-connection-lifecycle-design.md).
+- **Outgoing call audio quality.** Intelligible but degraded relative to holding the phone
+  directly. Ruled out: VoiceMeeter, the microphone, and the cellular network. The Bluetooth SCO
+  link is the remaining suspect, likely a narrowband codec forced by a 2021 radio driver.
+  FINDINGS §11.
+
+**Requires the packaged build.** `dotnet run` is not a development loop for the music half:
+`AudioPlaybackConnection.TryCreateFromId` terminates an unpackaged process with an access
+violation no managed handler can catch. FINDINGS §8.
 
 ## Why this exists
 
