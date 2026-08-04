@@ -9,17 +9,15 @@ No Phone Link. No dongle. Runs on the machine's built-in Bluetooth radio.
 
 ## Status
 
-**Music works. Calls do not.** Verified 2026-08-04 on the target machine with the packaged build.
+**Both halves work.** Verified 2026-08-04 on the target machine with the packaged build.
 
-The A2DP half is real and is this app's doing: it connects, correlates the transport to the right
-phone, routes audio to a chosen output, and tears the route down cleanly when the phone takes the
-radio back.
+- **Music** — connects the A2DP sink, correlates the transport to the right phone by Bluetooth
+  address, routes to a chosen output, and tears the route down cleanly when the phone reclaims the
+  radio for a call.
+- **Calls** — claims the HFP hands-free role, so the phone offers the PC as a call audio device,
+  and a real cellular call routes to the PC with audio in both directions.
 
-The calls half has never worked. `PhoneLineTransportDevice.RegisterApp()` throws
-`UnauthorizedAccessException` on every attempt, so the app never claims the hands-free role. Call
-routing on this machine was being done throughout by Thy Phone, a Store-signed app, and stopped
-when it was uninstalled — Windows does not offer the role on its own. See
-[docs/FINDINGS.md](docs/FINDINGS.md) §12.
+One app, both halves, on the built-in radio. That is what this project existed to do.
 
 What is done: the connect path, transport-to-phone correlation, and a rolling log at
 `%LOCALAPPDATA%\Klangbruecke\logs\` that is the app's only diagnostic surface and the reason the
@@ -32,13 +30,14 @@ What is not done:
   after reboot and phone-initiated reconnect are the predecessor app's defining bug and remain
   unaddressed. Designed in
   [the connection lifecycle spec](docs/superpowers/specs/2026-08-04-connection-lifecycle-design.md).
-- **The calls half.** Blocked on `RegisterApp()`. Every explanation not requiring a Store-signed
-  package has been eliminated by direct test. FINDINGS §12.
-- **Outgoing call audio quality.** Degraded relative to holding the phone directly. Ruled out:
-  VoiceMeeter, the microphone, and the cellular network. The Bluetooth SCO link is the remaining
-  suspect, likely a narrowband codec forced by a 2021 radio driver. Measured with
-  `packaging/Measure-CallBandwidth.ps1`. Note this is a property of the Bluetooth link, not of this
-  app, which is not in the call path at all. FINDINGS §11.
+- **Outgoing call audio quality.** Degraded relative to holding the phone directly, and identical
+  under Thy Phone — so it is a property of the Bluetooth SCO link, not of any app. Ruled out by
+  direct test: VoiceMeeter, the microphone, and the cellular network. The leading suspect is a
+  narrowband codec forced by a 2021 MediaTek radio driver. Measure with
+  `packaging/Measure-CallBandwidth.ps1` over a **wideband** call — a cellular call reads as
+  narrowband whatever Bluetooth negotiated. FINDINGS §11.
+- **`ConnectAsync` returns False** after a successful registration. Calls work regardless; the
+  reason is unexplained. FINDINGS §12.
 
 **Requires the packaged build.** `dotnet run` is not a development loop for the music half:
 `AudioPlaybackConnection.TryCreateFromId` terminates an unpackaged process with an access
