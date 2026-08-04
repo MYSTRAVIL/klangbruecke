@@ -3,8 +3,9 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap desktop rescap">
+  IgnorableNamespaces="uap desktop desktop6 rescap">
 
   <!-- Publisher must match the subject of the signing certificate exactly.
        packaging/New-DevCert.ps1 creates a cert with this subject. -->
@@ -19,6 +20,21 @@
     <PublisherDisplayName>Klangbruecke Development</PublisherDisplayName>
     <Description>Bridges phone audio and calls to this PC over Bluetooth.</Description>
     <Logo>Images\StoreLogo.png</Logo>
+
+    <!-- EntryPoint="Windows.FullTrustApplication" below makes this a Desktop Bridge package, and
+         those get AppData write virtualization on by default: writes to %LOCALAPPDATA% land under
+         %LOCALAPPDATA%\Packages\<PFN>\LocalCache\Local\ while
+         Environment.GetFolderPath(LocalApplicationData) - what FileLog.DefaultDirectory and
+         Settings.Directory both call - keeps returning the unredirected path. Probed and confirmed
+         on this machine. The app could therefore not say where its own log went, and every
+         documented path would name a file the installed build never writes. That is worse than a
+         missing file: unpackaged runs leave a real log at exactly that path whose last lines read
+         "Music half skipped: no MSIX package identity", so the operator following Task 9 would read
+         a stale wrong answer and believe it.
+
+         Needs the unvirtualizedResources capability below - makeappx rejects the package without it
+         (error 80080204), which the XSD does not encode. See docs/FINDINGS.md section 9. -->
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
   </Properties>
 
   <Dependencies>
@@ -58,9 +74,13 @@
          phoneLineTransportManagement: required for PhoneLineTransportDevice (call routing).
            This is a RESTRICTED capability - it gates Store submission only.
            Sideloading needs no Microsoft approval. See docs/FINDINGS.md §2.
+         unvirtualizedResources: required by desktop6:FileSystemWriteVirtualization above, which is
+           what puts the log and settings at the path every document names. Also restricted, and
+           free for the same reason - this package is sideloaded, and it already ships one.
          bluetooth: required for AudioPlaybackConnection (music). No restricted cap needed. -->
     <rescap:Capability Name="runFullTrust" />
     <rescap:Capability Name="phoneLineTransportManagement" />
+    <rescap:Capability Name="unvirtualizedResources" />
     <DeviceCapability Name="bluetooth" />
   </Capabilities>
 
