@@ -26,8 +26,12 @@ public sealed class FileLog : ILog
     public FileLog(string directory, int retentionDays = 7, Func<DateTimeOffset>? clock = null)
     {
         _directory = directory;
-        // Floored at one day: a zero window puts the cutoff on today, so the sweep would delete the
-        // very file the write is about to append to, discarding the day's earlier lines with it.
+        // Floored at one day, and load-bearing rather than defensive. Prune keeps files whose day is
+        // at or after oldestKept, which it works out as today minus (_retentionDays - 1). A zero
+        // window puts oldestKept on tomorrow, so today's file fails that test and the sweep deletes
+        // the very file this write is about to append to - taking the day's earlier lines with it.
+        // Anything negative fails the same way, harder. (The comment here used to name a "cutoff"
+        // variable; the boundary was reworked into oldestKept and the name went with it.)
         _retentionDays = Math.Max(1, retentionDays);
         _clock = clock ?? (() => DateTimeOffset.Now);
     }

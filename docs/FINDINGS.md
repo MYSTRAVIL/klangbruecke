@@ -226,7 +226,8 @@ music implementation observed working on this machine was a packaged Store app. 
 `PhoneDeviceId` *before* connecting, so once a phone had been picked, every later unpackaged launch
 auto-connected at startup, died here, and did it again — an app bricked by one menu click, with a log
 reading `starting.` and nothing else, recoverable only by deleting
-`%LOCALAPPDATA%\Klangbruecke\settings.json` by hand.
+`%LOCALAPPDATA%\Klangbruecke\settings.json` by hand. (That path is correct as written for both
+builds, but only because the manifest now opts out of write virtualization — see §9.)
 
 **`AudioSinkPolicy.CanOpenConnection` is what stops that**, and it is load-bearing rather than
 defensive tidiness. Unpackaged it returns false and the connect call is never reached: checked in
@@ -240,3 +241,67 @@ zero `Application Error` events.
 Saving `PhoneDeviceId` before connecting is therefore deliberate and safe. It records the user's
 answer to "which phone", not what managed to connect, and the packaged build needs it on the next
 start.
+
+## 9. The packaged build redirects `%LOCALAPPDATA%` unless you tell it not to
+
+`EntryPoint="Windows.FullTrustApplication"` plus `runFullTrust` makes this a **Desktop Bridge**
+package, and those get **AppData write virtualization on by default**.
+
+Probed and confirmed on this machine: `Environment.GetFolderPath(LocalApplicationData)` returns the
+**un**redirected path — `C:\Users\<user>\AppData\Local` — while the bytes actually land in:
+
+```
+%LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\Local\Klangbruecke\
+```
+
+`FileLog.DefaultDirectory` and `Settings.Directory` both call that API, so the installed build wrote
+its log and settings somewhere it could not name. **This is more dangerous than a missing file.**
+Unpackaged development runs leave a real log at the documented path whose last lines read
+`Music half skipped: no MSIX package identity` — so an operator following the Stage 0 validation
+checklist would open exactly that file, find a stale wrong answer, and have no way to tell.
+
+**The fix**, in `packaging/AppxManifest.xml`:
+
+```xml
+<Properties>
+  ...
+  <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+</Properties>
+```
+
+with `xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"`.
+
+### Two traps in doing it
+
+1. **It needs a second restricted capability.** `<rescap:Capability Name="unvirtualizedResources" />`
+   — without it `makeappx` fails with `error 80080204: App manifest validation error: ... The
+   element specified requires "unvirtualizedResources" capability.` **The XSD does not encode this
+   rule**; only the packager enforces it, so schema validation alone will pass a manifest that
+   cannot be packed. Restricted capabilities gate Store submission only and this package already
+   ships one, so sideloading is unaffected (§2).
+
+2. **It is a child of `<Properties>`, not `<Application>`.** Declared in
+   `FoundationManifestSchema.xsd` as part of `CT_Properties`, which is an `xs:all` — so ordering
+   within `Properties` is free. Putting it under `<Application>` fails with
+   `Element ... is unexpected according to content model of parent element ... Application`.
+   Element floor is 1903 (18362); this package's `MinVersion` is 19041, so it always applies.
+
+**Verified, not assumed** — `makeappx pack` run against this project's actual manifest, 2026-08-04:
+
+| Manifest | Result |
+|---|---|
+| Baseline, before the change | `Package creation succeeded.` exit 0 |
+| With `desktop6` element, **without** `unvirtualizedResources` | `error 80080204` exit 1 |
+| With both | `Package creation succeeded.` exit 0 |
+
+### The consequence to remember
+
+Packaged and unpackaged runs now **append to the same log file**. That is the point — one path, the
+one every document names — but it means a single day's file interleaves runs of both builds. The
+startup banner logs `AppContext.BaseDirectory` for exactly this reason: it is the only value
+in-process that separates `C:\Program Files\WindowsApps\Klangbruecke_...` from
+`src\Klangbruecke\bin\...`. **Read it before drawing a conclusion from any other line.**
+
+Uninstalling no longer removes the log or `settings.json`, since they are no longer package-private.
+That is deliberate: an install-fix-reinstall loop that wiped its own evidence at each step would be
+useless.

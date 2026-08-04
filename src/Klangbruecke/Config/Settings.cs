@@ -6,6 +6,12 @@ namespace Klangbruecke.Config;
 
 /// <summary>
 /// Persisted to %LOCALAPPDATA%\Klangbruecke\settings.json.
+///
+/// Literally that path in the installed build too, but only because the manifest disables Desktop
+/// Bridge write virtualization. Without that opt-out this file would land in
+/// %LOCALAPPDATA%\Packages\&lt;PFN&gt;\LocalCache\Local\ while GetFolderPath kept returning the path
+/// above - which matters because deleting this file by hand is the documented recovery from a
+/// bricked auto-connect. See docs/FINDINGS.md §9.
 /// </summary>
 public sealed class Settings
 {

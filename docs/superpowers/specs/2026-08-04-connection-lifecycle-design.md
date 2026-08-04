@@ -52,9 +52,18 @@ single owner.
 ConnectionManager  (state machine + reconcile timer)
 ├── AudioSinkService      A2DP  — exists; gains DeviceWatcher + real state reporting
 ├── CallTransportService  HFP   — exists; gains device correlation
-├── AudioRouter           WASAPI bridge — exists; gains resampler
+├── AudioRouter           WASAPI bridge — exists; gains format logging + PlaybackStopped
 └── Log                   new; rolling file under %LOCALAPPDATA%\Klangbruecke\logs\
 ```
+
+`AudioRouter` does **not** gain a resampler. That item was reverted during execution — WASAPI's
+shared mode already converts, and `MediaFoundationResampler` in this topology destroys half the
+audio. See item 3 under Stage 0 below for the full reasoning.
+
+The `Log` path is literal for both the packaged and the unpackaged build, but only because
+`packaging/AppxManifest.xml` disables Desktop Bridge write virtualization. Without that opt-out the
+installed build writes to `%LOCALAPPDATA%\Packages\<PFN>\LocalCache\Local\` instead, while still
+reporting the path above. See `FINDINGS.md` §9.
 
 The services stop deciding anything. Each reports facts upward via events and exposes
 `ConnectAsync` / `Disconnect`; `ConnectionManager` decides what to do about them. That boundary is
@@ -179,7 +188,10 @@ Smallest diff that makes a first-run failure diagnosable.
 
 1. **`Log`** — hand-rolled rolling file at `%LOCALAPPDATA%\Klangbruecke\logs\`, one file per day,
    7-day retention. No NuGet dependency. Logs every state transition, every WinRT call and its
-   result, and every device enumeration.
+   result, and every device enumeration. That path is correct as written for the installed build as
+   well as `dotnet run`, because the manifest opts out of Desktop Bridge write virtualization —
+   which also means both builds append to the *same* file, so read the startup
+   `Base directory:` line before attributing anything in it. See `FINDINGS.md` §9.
 2. **UI thread marshalling** — capture the `SynchronizationContext` in the `TrayContext`
    constructor and post through it. Today `SetStatus` writes `_icon.Text` directly while being
    invoked from the WinRT threadpool (`AudioPlaybackConnection.StateChanged`) and from NAudio's
@@ -317,8 +329,9 @@ tests/Klangbruecke.Tests/                          (Stage 0)
 ```
 
 Modified: `TrayContext.cs` (orchestration out, view only), `AudioSinkService.cs` (DeviceWatcher,
-real state), `CallTransportService.cs` (correlation), `AudioRouter.cs` (resampler),
-`Settings.cs` (log swallowed exceptions).
+real state), `CallTransportService.cs` (correlation), `AudioRouter.cs` (format logging and
+`PlaybackStopped` — **not** a resampler; see item 3 above), `Settings.cs` (log swallowed
+exceptions).
 
 `TrayContext.cs` is 228 lines and is currently the only orchestrator; moving connection logic out
 is what keeps it reviewable, not incidental cleanup.
