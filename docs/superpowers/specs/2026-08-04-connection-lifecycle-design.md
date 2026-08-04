@@ -185,11 +185,34 @@ Smallest diff that makes a first-run failure diagnosable.
    invoked from the WinRT threadpool (`AudioPlaybackConnection.StateChanged`) and from NAudio's
    `RecordingStopped`. This surfaces as an intermittent `InvalidOperationException`, not a clean
    failure.
-3. **Resampler** — `AudioRouter.cs:69-80` builds a `BufferedWaveProvider` from the capture
-   `WaveFormat` and hands it straight to `WasapiOut` in shared mode. Insert a
-   `MediaFoundationResampler` when it does not match the output's mix format. With VoiceMeeter and
-   VB-Cable in the chain (`FINDINGS.md` §7) a mismatch is likely rather than hypothetical, and it
-   presents as silence rather than an error.
+3. **Format logging — NOT a resampler.** This item originally called for inserting a
+   `MediaFoundationResampler` when the capture format does not match the output's mix format, on
+   the premise that `WasapiOut.Init` throws on a shared-mode mismatch and the failure presents as
+   silence. **That premise is false and the resampler is actively harmful.** Verified against
+   decompiled NAudio 2.2.1:
+
+   - `WasapiOut.Init`'s entire `IsFormatSupported` / `ResamplerDmoStream` / `GetFallbackFormat`
+     block is inside `if (shareMode == AudioClientShareMode.Exclusive)`. `AudioRouter` uses
+     `Shared`, so none of it runs.
+   - In shared mode `Init` passes `AudioClientStreamFlags.SrcDefaultQuality | AutoConvertPcm` to
+     `AudioClient.Initialize`. **WASAPI's own sample-rate converter already handles the mismatch.**
+   - `MediaFoundationTransform` allocates `sourceBuffer = new byte[AverageBytesPerSecond]` and
+     always requests that full second, ignoring the caller's `count`. Against a
+     `BufferedWaveProvider` capped at 500 ms, `ReadFully` zero-fills the shortfall while
+     `DiscardOnBufferOverflow` destroys the overflow — a permanent 1 Hz cycle of 500 ms audio and
+     500 ms silence, with half the source discarded. Both sizes are fixed at construction; no
+     steady state resolves it.
+
+   What this item delivers instead: log the capture and render format pair unconditionally at
+   `Start`, and subscribe to `WasapiOut.PlaybackStopped` — nothing did, so play-thread failures
+   were invisible while the tray still read "Routing X -> Y". The format pair is the first thing
+   anyone needs when diagnosing Stage 0's validation run. The live pair on this machine is
+   44100 Hz / 32-bit / 2 ch capture against 48000 Hz render endpoints.
+
+   If explicit resampling is ever genuinely needed in this topology,
+   `WdlResamplingSampleProvider` (NAudio.Core, no new package) reads caller-sized chunks and is
+   the real-time-safe choice. `MediaFoundationResampler` is a file-transcoding component and
+   would require `BufferDuration` above ~2 s, which is fatal latency for the calls half.
 4. **Transport correlation** — `TrayContext.cs:175` takes `transports.FirstOrDefault()` and never
    correlates the transport to the phone the user selected. With one phone paired this works by
    accident. Correlate on the Bluetooth address embedded in the device ID.
@@ -268,8 +291,11 @@ Each row verified by hand, with the log as evidence:
   at info and feed the backoff; they do not surface a dialog.
 - **`Settings` load/save** already swallows IO and JSON exceptions deliberately. Keep that, but log
   the swallowed exception instead of discarding it.
-- **`AudioRouter.Init` failure** on format mismatch is what the resampler addresses. If it still
-  fails, the state is `Degraded` with the format pair logged, not silence.
+- **`AudioRouter` failures** are logged with the capture and render format pair, which is the
+  diagnosis when audio is wrong. A shared-mode format mismatch does not fail — WASAPI converts it
+  — so the pair is logged unconditionally rather than only on error. Play-thread failures arrive
+  via `PlaybackStopped` and clear `IsRunning`; without that subscription they are silent and the
+  tray keeps claiming it is routing.
 - **Missing capability or package identity** logs a clear single line naming what is disabled and
   why, rather than failing opaquely.
 
