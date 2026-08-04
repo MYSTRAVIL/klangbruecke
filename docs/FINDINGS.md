@@ -312,14 +312,16 @@ Verified 2026-08-04 with the packaged build (`0.1.0.1`, MSIX, sideloaded), phone
 (Pixel 9, `C01C6A90E174`):
 
 - **Music** — A2DP sink connects, `Line (MYSTRAPIX9 A2DP SNK)` appears, audio routes.
-- **Calls** — a real cellular call routes to the PC with audio both directions, **but not because
-  of this app.** See the correction below.
+- **Calls** — the app claims the hands-free role, Android offers the PC as a call audio device, and
+  a real cellular call routes to the PC with audio in both directions.
 
-**Correction, same day.** The first sentence of this section originally claimed both halves ran
-from one application. That is wrong. `PhoneLineTransportDevice.RegisterApp()` throws
-`UnauthorizedAccessException`, so the calls half never registers — the call audio is Windows' own
-built-in HFP hands-free support, which needs no app at all once the phone is paired. Music works
-through this app; calls do not. See §12.
+**Both halves now run from one application**, which is what this project existed to do — §1
+established the approach using AudioPlaybackConnector and Thy Phone, two separate third-party apps.
+
+**Recorded because it was nearly concluded otherwise:** for several hours this section claimed the
+calls half did not work, on the strength of `RegisterApp()` throwing. It threw because of a missing
+`RequestAccessAsync()` call, not because of anything about capabilities, signing, or Windows. See
+§12, which carries the four wrong diagnoses that preceded the right one.
 
 Confirmed at the same time, from the app's own log rather than by inference:
 
@@ -414,12 +416,45 @@ not the WinUSB rebinding §5 rejects — and it is reversible via Device Manager
 Worth a restore point regardless: that radio also carries the Xbox and Switch Pro controllers, and
 §5 exists because regressing them is expensive.
 
-## 12. `RegisterApp()` throws `UnauthorizedAccessException` — the calls half does not work
+## 12. RESOLVED: `RegisterApp()` needs `RequestAccessAsync()` first
 
-**This is the open blocker for the calls half.** Observed 2026-08-04, packaged build `0.1.0.1`,
-sideloaded, during a live cellular call — the first time this call has ever executed in this
-project's history. §2 named it as the untested step and predicted it was where the capability
-would bite. It was right.
+**Fixed 2026-08-04 in build `0.1.0.2`. The cause was a missing API call, and nothing else.**
+
+`PhoneLineTransportDevice.RegisterApp()` threw `UnauthorizedAccessException` on every attempt
+because the app called it without calling `RequestAccessAsync()` first. Both working reference
+implementations (Sefirah, MyPhone) call it; this app went straight to `RegisterApp`. Adding it:
+
+```
+[INF] LimitedAccessFeatures status for phonelinetransportdevice_v1: Unavailable.
+[INF] PhoneLineTransportDevice.RequestAccessAsync returned Allowed.
+[INF] Registering this app for the hands-free role (RegisterApp).
+[INF] RegisterApp returned; IsRegistered=True.
+```
+
+**Confirmed end to end:** with the role claimed, Android offers the PC as a call audio device
+again. The calls half works, and both halves now run from this one app.
+
+### Four wrong diagnoses, recorded because each cost a test
+
+Every one of these was stated with more confidence than the evidence supported, and each was
+eliminated only by a direct test rather than by reasoning:
+
+1. **"Another app holds the role."** The scaffold's own comment said so and Thy Phone was
+   installed. Uninstalling it changed nothing.
+2. **"The uninstall did not release it."** True in general — uninstall is not unregister — but
+   re-pairing the phone removes the transport, which does unregister, and that changed nothing
+   either.
+3. **"Windows routes calls natively, so the app is not needed."** False. Before either app existed,
+   and again after Thy Phone was removed, Android would not offer the PC at all. The role must be
+   claimed by an application.
+4. **"A self-signed sideloaded package cannot hold a restricted capability; it needs Store
+   signing."** False, and the most expensive one — it implied the project's whole approach was
+   unworkable. MyPhone has no Store listing at all and `RegisterApp` works for it. Microsoft's
+   capability documentation states plainly that sideloading restricted capabilities needs no
+   approval.
+
+The actual cause was one missing line, present in both reference implementations, in a code path
+that had never been executed until the first packaged run.
 
 ```
 [INF] Phone-line transport resolved; IsRegistered=False.
@@ -433,14 +468,19 @@ would bite. It was right.
 Everything up to that point succeeded: the selector matched, `FromId` resolved the transport, and
 `IsRegistered()` returned `False` cleanly. Only `RegisterApp()` fails.
 
-### What this means, and what it does not
+### The LAF gate is live, and does not gate this
 
-Calls still route to the PC. **That is Windows, not this app.** Once the phone is paired, Windows
-acts as a Hands-Free device natively — no application involvement. So a working call proves nothing
-about this app's calls half, and §10 originally drew exactly that wrong conclusion.
+The probe reports `Unavailable` for
+`com.microsoft.windows.applicationmodel.phonelinetransportdevice_v1` — so the Limited Access
+Feature gate exists and is unmet on this build, contradicting §2's "removed from the LAF list".
 
-It also means the outgoing-audio degradation in §11 is a property of **Windows' native HFP path**,
-independent of Klangbruecke. Nothing this app does today can affect it.
+**But `RegisterApp()` succeeds regardless.** So §2's operative instruction — do not implement token
+generation — holds for registration, for a different reason than §2 gives. The gate may still apply
+to other calls on this API surface; `ConnectAsync` is the open candidate.
+
+`CallTransportService.ProbeLimitedAccessFeature` logs this status on every connect, so the answer
+comes from the machine rather than from a forum thread. It passes a deliberately invalid token and
+cannot unlock anything.
 
 ### The assumption this threatens
 
@@ -480,24 +520,22 @@ could not be selected as a call audio device from Android; after Thy Phone was r
 disappeared again. The role must be claimed by an application for the phone to offer the PC at all.
 An earlier revision of this file claimed Windows did this natively. It does not.
 
-### Where that leaves the calls half
+### Still open: `ConnectAsync` returns False
 
-Unimplemented in practice. The capability is declared, the package installs, identity is confirmed,
-the transport is found and correlated to the right phone — and the one call that would claim the
-role is refused. Every explanation that does not require Store signing has now been eliminated by
-direct test.
+`PhoneLineTransportDevice.ConnectAsync()` returns `False` immediately after a successful
+registration. This does not appear to matter — the phone offers the PC as a call audio device on
+the strength of the *registration*, and calls route — but it is unexplained.
 
-The remaining candidates, none yet tested:
+Plausible and untested: it may legitimately return false with no call in progress, or it may be the
+call the LAF gate actually covers. Do not assume the first without testing.
 
-- The restricted capability is not honoured at runtime for a **self-signed** sideloaded package,
-  only for a Store-signed one. §1's proof that calls work on this machine used Thy Phone, a
-  Store-signed app — exactly the variable under suspicion.
-- `RegisterApp()` requires a manifest declaration beyond the capability (a call-provider extension
-  or similar) that this package does not have.
-- The API is not usable by a full-trust Desktop Bridge app, only by a pure UWP one.
+### The manifest is not the problem
 
-Until one of those is resolved, **this app does music only**, and anyone wanting call routing on
-this machine needs Thy Phone.
+Recorded so nobody adds declarations chasing this: MyPhone's manifest is `runFullTrust` +
+`phoneLineTransportManagement` + `internetClient` — **not even `DeviceCapability bluetooth`** — and
+`RegisterApp` works for it. No call-provider extension, no `Windows.ApplicationModel.Calls.Background`,
+no `windows.appService` is required. Full-trust Desktop Bridge packaging is not a differentiator
+either; both reference implementations are full-trust packaged apps.
 
 Also ruled out: a deployment-time capability refusal. `Microsoft-Windows-AppModel-Runtime/Admin`
 logs the app launching into its Desktop AppX container normally, with no denial of any kind. Windows
