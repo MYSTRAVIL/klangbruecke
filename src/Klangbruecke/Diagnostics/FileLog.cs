@@ -14,11 +14,14 @@ namespace Klangbruecke.Diagnostics;
 public sealed class FileLog : ILog
 {
     private const string DetailIndent = "    ";
+    private const string FileNamePrefix = "klangbruecke-";
+    private const string FileNameExtension = ".log";
 
     private readonly string _directory;
     private readonly int _retentionDays;
     private readonly Func<DateTimeOffset> _clock;
     private readonly object _gate = new();
+    private string? _prunedForFile;
 
     public FileLog(string directory, int retentionDays = 7, Func<DateTimeOffset>? clock = null)
     {
@@ -35,7 +38,7 @@ public sealed class FileLog : ILog
     // Invariant culture: the file name is a machine-readable contract that the retention sweep
     // globs and parses. Under a non-Gregorian calendar 'yyyy' renders as some other year.
     public static string FileNameFor(DateTimeOffset day) =>
-        string.Create(CultureInfo.InvariantCulture, $"klangbruecke-{day:yyyyMMdd}.log");
+        string.Create(CultureInfo.InvariantCulture, $"{FileNamePrefix}{day:yyyyMMdd}{FileNameExtension}");
 
     public void Write(LogLevel level, string message, Exception? exception = null)
     {
@@ -51,7 +54,18 @@ public sealed class FileLog : ILog
                 string line = Format(now, level, message, exception);
 
                 Directory.CreateDirectory(_directory);
-                File.AppendAllText(Path.Combine(_directory, FileNameFor(now)), line + Environment.NewLine, Encoding.UTF8);
+
+                string fileName = FileNameFor(now);
+                File.AppendAllText(Path.Combine(_directory, fileName), line + Environment.NewLine, Encoding.UTF8);
+
+                if (_prunedForFile != fileName)
+                {
+                    // Swept after the line is on disk, and the day claimed before the sweep runs:
+                    // retention is best-effort, so a sweep that throws costs at most one day's
+                    // pruning rather than the caller's line and every line after it.
+                    _prunedForFile = fileName;
+                    Prune(now);
+                }
             }
         }
         catch (Exception ex)
@@ -66,6 +80,40 @@ public sealed class FileLog : ILog
             // pathological Exception.ToString() override could, which is why this is the last
             // statement of a catch that is already the never-throw boundary.
             Trace.WriteLine(ex);
+        }
+    }
+
+    /// <summary>
+    /// Runs once per day rather than per write. Dates come from the file name, not the
+    /// filesystem timestamp, so a file touched by a backup tool is not given a reprieve.
+    /// </summary>
+    private void Prune(DateTimeOffset now)
+    {
+        DateTimeOffset cutoff = now.AddDays(-_retentionDays);
+
+        foreach (string path in Directory.EnumerateFiles(_directory, FileNamePrefix + "*" + FileNameExtension))
+        {
+            string stamp = Path.GetFileNameWithoutExtension(path)[FileNamePrefix.Length..];
+
+            // Invariant, pairing FileNameFor: parsing under CurrentCulture would reject the names
+            // this app writes on any non-Gregorian calendar, and retention would silently stop.
+            if (!DateTimeOffset.TryParseExact(stamp, "yyyyMMdd", CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal, out DateTimeOffset day)
+                || day >= cutoff)
+            {
+                continue;
+            }
+
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Held open by a backup tool or another instance. Skipping it must not abandon the
+                // rest of the sweep, or one stuck file shelters every older one behind it forever.
+                Trace.WriteLine(ex);
+            }
         }
     }
 
