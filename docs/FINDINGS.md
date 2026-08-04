@@ -312,11 +312,14 @@ Verified 2026-08-04 with the packaged build (`0.1.0.1`, MSIX, sideloaded), phone
 (Pixel 9, `C01C6A90E174`):
 
 - **Music** — A2DP sink connects, `Line (MYSTRAPIX9 A2DP SNK)` appears, audio routes.
-- **Calls** — a real cellular call routes to the PC. **Audio works in both directions.**
+- **Calls** — a real cellular call routes to the PC with audio both directions, **but not because
+  of this app.** See the correction below.
 
-This is the first time both halves have run from one application. §1 established that the approach
-works; it did so using AudioPlaybackConnector and Thy Phone, two separate third-party apps. That is
-the thing this project existed to replace, and it is now done.
+**Correction, same day.** The first sentence of this section originally claimed both halves ran
+from one application. That is wrong. `PhoneLineTransportDevice.RegisterApp()` throws
+`UnauthorizedAccessException`, so the calls half never registers — the call audio is Windows' own
+built-in HFP hands-free support, which needs no app at all once the phone is paired. Music works
+through this app; calls do not. See §12.
 
 Confirmed at the same time, from the app's own log rather than by inference:
 
@@ -410,3 +413,79 @@ The lever is the driver, from the OEM support page or MediaTek. This is a normal
 not the WinUSB rebinding §5 rejects — and it is reversible via Device Manager → Roll Back Driver.
 Worth a restore point regardless: that radio also carries the Xbox and Switch Pro controllers, and
 §5 exists because regressing them is expensive.
+
+## 12. `RegisterApp()` throws `UnauthorizedAccessException` — the calls half does not work
+
+**This is the open blocker for the calls half.** Observed 2026-08-04, packaged build `0.1.0.1`,
+sideloaded, during a live cellular call — the first time this call has ever executed in this
+project's history. §2 named it as the untested step and predicted it was where the capability
+would bite. It was right.
+
+```
+[INF] Phone-line transport resolved; IsRegistered=False.
+[INF] Registering this app for the hands-free role (PhoneLineTransportDevice.RegisterApp).
+[ERR] The call transport connect path threw.
+    System.UnauthorizedAccessException: Attempted to perform an unauthorized operation.
+       at ABI.Windows.ApplicationModel.Calls.IPhoneLineTransportDeviceMethods.RegisterApp(...)
+       at Klangbruecke.Bluetooth.CallTransportService.ConnectAsync(...)
+```
+
+Everything up to that point succeeded: the selector matched, `FromId` resolved the transport, and
+`IsRegistered()` returned `False` cleanly. Only `RegisterApp()` fails.
+
+### What this means, and what it does not
+
+Calls still route to the PC. **That is Windows, not this app.** Once the phone is paired, Windows
+acts as a Hands-Free device natively — no application involvement. So a working call proves nothing
+about this app's calls half, and §10 originally drew exactly that wrong conclusion.
+
+It also means the outgoing-audio degradation in §11 is a property of **Windows' native HFP path**,
+independent of Klangbruecke. Nothing this app does today can affect it.
+
+### The assumption this threatens
+
+§2 concluded that the restricted capability `phoneLineTransportManagement` "gates *Microsoft Store
+submission* only" and that "**sideloading requires no approval**". That is the premise the whole
+MSIX approach rests on. `UnauthorizedAccessException` from the one call that actually exercises the
+capability is evidence against it.
+
+The manifest declares the capability and the package is signed and installed, so declaration alone
+is demonstrably not sufficient. Unresolved: whether restricted capabilities need explicit grant
+even when sideloaded, whether something else in the manifest is missing, or whether this API needs
+a Store-signed identity in practice.
+
+**Do not treat §2 as settled until this is resolved.** Note also that §2 was verified only as far
+as enumeration, `FromId` and `IsRegistered()` — all of which work unpackaged. The capability was
+never actually exercised.
+
+### What has NOT been ruled out
+
+- A missing companion capability or manifest element beyond `phoneLineTransportManagement`.
+- Whether `RegisterApp()` requires the app to be the registered call provider, or requires
+  additional declarations (e.g. a `windows.protocol` or call-provider extension).
+- Whether a Store-signed package behaves differently from a self-signed sideloaded one.
+- Whether Windows 10 19045 supports this path at all for third-party apps. §1 established that
+  calls work on this machine — but via Thy Phone, a **Store-signed** app, which is precisely the
+  difference this failure points at.
+
+## 13. A live call tears down the A2DP route, and nothing brings it back
+
+Expected Bluetooth behaviour, recorded because it looks like a bug in the log and is not:
+
+```
+[ERR] Capture stopped. COMException (0x88890004)      <- AUDCLNT_E_DEVICE_INVALIDATED
+[WRN] Tearing the route down: the capture half stopped.
+```
+
+When a call starts, the phone tears down A2DP to give SCO the radio, so the
+`Line (… A2DP SNK)` capture endpoint is invalidated under the running `WasapiCapture`.
+
+The teardown is correct and is the fix from Stage 0 Task 5 working in production — without it,
+`WasapiCapture` would spin against a dead endpoint indefinitely, discarding every buffer while
+holding the endpoint open. That defect was found by a live hardware probe after surviving three
+review rounds, and this log line is it doing its job.
+
+**But nothing restarts the route after the call ends.** The user must re-pick the phone from the
+tray. That is the reconnect gap, and it belongs to the `ConnectionManager` state machine in
+`docs/superpowers/specs/2026-08-04-connection-lifecycle-design.md`. It is arguably the single most
+valuable thing Stage 1 adds: without it, one phone call silently costs you the music bridge.
