@@ -1,3 +1,6 @@
+using System.Reflection;
+using Klangbruecke.Diagnostics;
+
 namespace Klangbruecke;
 
 internal static class Program
@@ -14,8 +17,21 @@ internal static class Program
             return;
         }
 
-        ApplicationConfiguration.Initialize();
-        Application.Run(new TrayContext());
+        Log.Current = new FileLog(FileLog.DefaultDirectory);
+        Log.Info($"Klangbruecke {Assembly.GetExecutingAssembly().GetName().Version} starting.");
+
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            Log.Error("Unhandled exception.", e.ExceptionObject as Exception);
+
+        try
+        {
+            ApplicationConfiguration.Initialize();
+            Application.Run(new TrayContext());
+        }
+        finally
+        {
+            Log.Info("Klangbruecke exiting.");
+        }
 
         GC.KeepAlive(_singleInstance);
     }
