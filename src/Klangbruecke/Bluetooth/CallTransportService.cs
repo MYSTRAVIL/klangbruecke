@@ -1,4 +1,5 @@
 using Klangbruecke.Diagnostics;
+using Windows.ApplicationModel;
 using Windows.ApplicationModel.Calls;
 using Windows.Devices.Enumeration;
 
@@ -11,8 +12,13 @@ namespace Klangbruecke.Bluetooth;
 /// Requires the restricted capability <c>phoneLineTransportManagement</c>, which only works
 /// with MSIX package identity. Sideloading needs no Microsoft approval.
 ///
-/// It does NOT require a Limited Access Feature token - Microsoft removed this API from the
-/// LAF list. Do not add token generation here. See docs/FINDINGS.md §2.
+/// Whether it also needs a Limited Access Feature token is **open**, and the claim that it does
+/// not is under investigation. That claim traces to one Microsoft support reply relayed in MyPhone
+/// issue #26, which the same commenter contradicted ten days later; the LAF feature id is present
+/// in this machine's registry; and Sefirah performs the unlock precisely when the build is below
+/// 22000, i.e. on Windows 10, which this is. <see cref="ProbeLimitedAccessFeature"/> logs the gate
+/// status on every connect so the answer comes from the machine rather than from a forum thread.
+/// See docs/FINDINGS.md §2 and §12.
 /// </summary>
 public sealed class CallTransportService : IDisposable
 {
@@ -67,6 +73,15 @@ public sealed class CallTransportService : IDisposable
             bool alreadyRegistered = _device.IsRegistered();
             Log.Info($"Phone-line transport resolved; IsRegistered={alreadyRegistered}.");
 
+            ProbeLimitedAccessFeature();
+
+            // Both reference implementations that get RegisterApp to work (Sefirah, MyPhone) call
+            // this first; this app went straight to RegisterApp and got E_ACCESSDENIED every time.
+            // Its own status is worth more than its bool: Allowed here with RegisterApp still
+            // refused is the shape MyPhone #26 reports, and points past permission at the LAF gate.
+            var access = await _device.RequestAccessAsync();
+            Log.Info($"PhoneLineTransportDevice.RequestAccessAsync returned {access}.");
+
             if (!alreadyRegistered)
             {
                 // Bracketed by log lines the way AudioSinkService brackets TryCreateFromId, and for
@@ -79,7 +94,18 @@ public sealed class CallTransportService : IDisposable
                 // line under it means the process died inside RegisterApp.
                 Log.Info("Registering this app for the hands-free role (PhoneLineTransportDevice.RegisterApp).");
                 _device.RegisterApp();
-                Log.Info("RegisterApp returned; the hands-free role is claimed.");
+
+                // Sefirah re-checks rather than trusting the return, because RegisterApp can come
+                // back having done nothing. Treating a silent no-op as success is how this reads as
+                // working while the phone never offers the PC.
+                bool nowRegistered = _device.IsRegistered();
+                Log.Info($"RegisterApp returned; IsRegistered={nowRegistered}.");
+
+                if (!nowRegistered)
+                {
+                    Report("RegisterApp did not throw but the role was not claimed.", LogLevel.Error);
+                    return false;
+                }
             }
 
             // Bracketed for the same reason, one call further on. This one is awaited, so a failure
@@ -118,6 +144,43 @@ public sealed class CallTransportService : IDisposable
             // Error, matching the line above, so one throw is not described at two levels.
             Report($"Call transport threw: {ex.Message}", LogLevel.Error);
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Asks Windows whether this API is still behind a Limited Access Feature gate, and logs the
+    /// answer. Diagnostic only - it deliberately passes an invalid token, so it cannot unlock
+    /// anything, and generating a real one is a decision for a human (see CLAUDE.md).
+    ///
+    /// The status is the whole point:
+    ///   AvailableWithoutToken - the gate is gone, and FINDINGS §2 is right that no token is needed
+    ///   Available             - unlocked, i.e. a valid token WOULD be required
+    ///   Unavailable           - the gate is live and unmet, which is the likely cause of
+    ///                           RegisterApp's E_ACCESSDENIED on this build
+    ///
+    /// Worth measuring rather than assuming: the feature id below is present in this machine's
+    /// registry under HKLM\...\AppModel\LimitedAccessFeatures, which is not what an OS looks like
+    /// when it has dropped a feature from the list, and Sefirah performs this unlock precisely when
+    /// the build is below 22000 - i.e. on Windows 10, which is this machine.
+    /// </summary>
+    private static void ProbeLimitedAccessFeature()
+    {
+        const string featureId = "com.microsoft.windows.applicationmodel.phonelinetransportdevice_v1";
+
+        try
+        {
+            LimitedAccessFeatureRequestResult result = LimitedAccessFeatures.TryUnlockFeature(
+                featureId,
+                "KLANGBRUECKE-DIAGNOSTIC-PROBE-NOT-A-TOKEN",
+                "Klangbruecke diagnostic probe");
+
+            Log.Info($"LimitedAccessFeatures status for phonelinetransportdevice_v1: {result.Status}.");
+        }
+        catch (Exception ex)
+        {
+            // Never fatal: this is instrumentation, and the connect path must fail on its own
+            // terms rather than on the failure of something asking why it failed.
+            Log.Warn($"Could not probe the limited-access feature gate: {ex.Message}");
         }
     }
 
