@@ -1,0 +1,36 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{950826E0-2CD1-4702-84B4-30297A9F3373}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klangbruecke", "src\Klangbruecke\Klangbruecke.csproj", "{476F5799-4E6F-47CB-AAC9-0CAC28538A60}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{10221EFE-0E84-43E6-B2D6-3B4521994E70}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klangbruecke.Tests", "tests\Klangbruecke.Tests\Klangbruecke.Tests.csproj", "{55091D1C-9331-4E05-A55E-6D0DFD3851F9}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{476F5799-4E6F-47CB-AAC9-0CAC28538A60}.Debug|Any CPU.ActiveCfg = Debug|x64
+		{476F5799-4E6F-47CB-AAC9-0CAC28538A60}.Debug|Any CPU.Build.0 = Debug|x64
+		{476F5799-4E6F-47CB-AAC9-0CAC28538A60}.Release|Any CPU.ActiveCfg = Release|x64
+		{476F5799-4E6F-47CB-AAC9-0CAC28538A60}.Release|Any CPU.Build.0 = Release|x64
+		{55091D1C-9331-4E05-A55E-6D0DFD3851F9}.Debug|Any CPU.ActiveCfg = Debug|x64
+		{55091D1C-9331-4E05-A55E-6D0DFD3851F9}.Debug|Any CPU.Build.0 = Debug|x64
+		{55091D1C-9331-4E05-A55E-6D0DFD3851F9}.Release|Any CPU.ActiveCfg = Release|x64
+		{55091D1C-9331-4E05-A55E-6D0DFD3851F9}.Release|Any CPU.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{476F5799-4E6F-47CB-AAC9-0CAC28538A60} = {950826E0-2CD1-4702-84B4-30297A9F3373}
+		{55091D1C-9331-4E05-A55E-6D0DFD3851F9} = {10221EFE-0E84-43E6-B2D6-3B4521994E70}
+	EndGlobalSection
+EndGlobal
