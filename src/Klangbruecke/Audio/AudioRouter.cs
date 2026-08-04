@@ -1,4 +1,6 @@
+using Klangbruecke.Diagnostics;
 using NAudio.CoreAudioApi;
+using NAudio.MediaFoundation;
 using NAudio.Wave;
 
 namespace Klangbruecke.Audio;
@@ -14,6 +16,7 @@ public sealed class AudioRouter : IDisposable
     private WasapiCapture? _capture;
     private WasapiOut? _output;
     private BufferedWaveProvider? _buffer;
+    private MediaFoundationResampler? _resampler;
     private bool _disposed;
 
     public bool IsRunning { get; private set; }
@@ -63,6 +66,10 @@ public sealed class AudioRouter : IDisposable
     {
         Stop();
 
+        // Declared outside the try so the failure path can name both formats. Reading it is
+        // itself a plausible failure point, hence the null until it is known.
+        WaveFormat? outputFormat = null;
+
         try
         {
             _capture = new WasapiCapture(source);
@@ -76,8 +83,25 @@ public sealed class AudioRouter : IDisposable
             _capture.DataAvailable += OnDataAvailable;
             _capture.RecordingStopped += OnRecordingStopped;
 
+            outputFormat = sink.AudioClient.MixFormat;
+            IWaveProvider playbackSource = _buffer;
+
+            if (AudioFormatBridge.RequiresResampling(_capture.WaveFormat, outputFormat))
+            {
+                // Idempotent: NAudio guards it with a static flag. There is deliberately no
+                // matching Shutdown - it is process-global and not reference counted, so calling
+                // it in Stop would tear Media Foundation out from under any resampler that
+                // outlived this router. Reconnects call Start repeatedly; MF lives for the process.
+                MediaFoundationApi.Startup();
+                _resampler = new MediaFoundationResampler(_buffer, outputFormat) { ResamplerQuality = 60 };
+                playbackSource = _resampler;
+
+                Log.Info($"Resampling {AudioFormatBridge.Describe(_capture.WaveFormat)} -> " +
+                         $"{AudioFormatBridge.Describe(outputFormat)}.");
+            }
+
             _output = new WasapiOut(sink, AudioClientShareMode.Shared, useEventSync: true, latency: 50);
-            _output.Init(_buffer);
+            _output.Init(playbackSource);
 
             _capture.StartRecording();
             _output.Play();
@@ -88,6 +112,13 @@ public sealed class AudioRouter : IDisposable
         }
         catch (Exception ex)
         {
+            // Log both formats: a format mismatch that survives the resampler is the likeliest
+            // cause and is invisible from the message alone.
+            string capture = _capture is null ? "unknown" : AudioFormatBridge.Describe(_capture.WaveFormat);
+            string output = outputFormat is null ? "unknown" : AudioFormatBridge.Describe(outputFormat);
+
+            Log.Error($"Routing failed. Capture={capture} Output={output}", ex);
+
             Report($"Could not start routing: {ex.Message}");
             Stop();
             return false;
@@ -129,8 +160,14 @@ public sealed class AudioRouter : IDisposable
             _capture = null;
         }
 
+        // Order matters: WasapiOut.Dispose joins its render thread, and that thread is what pulls
+        // from the resampler. Releasing the resampler first would free it mid-read.
         _output?.Dispose();
         _output = null;
+
+        _resampler?.Dispose();
+        _resampler = null;
+
         _buffer = null;
         IsRunning = false;
     }
