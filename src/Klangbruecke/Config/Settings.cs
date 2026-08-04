@@ -1,10 +1,17 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Klangbruecke.Diagnostics;
 
 namespace Klangbruecke.Config;
 
 /// <summary>
 /// Persisted to %LOCALAPPDATA%\Klangbruecke\settings.json.
+///
+/// Literally that path in the installed build too, but only because the manifest disables Desktop
+/// Bridge write virtualization. Without that opt-out this file would land in
+/// %LOCALAPPDATA%\Packages\&lt;PFN&gt;\LocalCache\Local\ while GetFolderPath kept returning the path
+/// above - which matters because deleting this file by hand is the documented recovery from a
+/// bricked auto-connect. See docs/FINDINGS.md §9.
 /// </summary>
 public sealed class Settings
 {
@@ -40,7 +47,9 @@ public sealed class Settings
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
-            // Corrupt or unreadable settings must not stop the app starting.
+            // Corrupt or unreadable settings must not stop the app starting - but silently starting
+            // from defaults presents as "it forgot my phone", which reads like a Bluetooth fault.
+            Log.Warn($"Could not read settings, starting from defaults: {ex.Message}");
         }
 
         return new Settings();
@@ -55,7 +64,9 @@ public sealed class Settings
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Best effort.
+            // Best effort - the run continues on the in-memory copy. The cost lands at the next start,
+            // as a selection that did not stick, so the record of it has to be made here.
+            Log.Warn($"Could not save settings: {ex.Message}");
         }
     }
 }

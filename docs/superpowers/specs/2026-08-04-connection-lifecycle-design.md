@@ -52,9 +52,18 @@ single owner.
 ConnectionManager  (state machine + reconcile timer)
 ├── AudioSinkService      A2DP  — exists; gains DeviceWatcher + real state reporting
 ├── CallTransportService  HFP   — exists; gains device correlation
-├── AudioRouter           WASAPI bridge — exists; gains resampler
+├── AudioRouter           WASAPI bridge — exists; gains format logging + PlaybackStopped
 └── Log                   new; rolling file under %LOCALAPPDATA%\Klangbruecke\logs\
 ```
+
+`AudioRouter` does **not** gain a resampler. That item was reverted during execution — WASAPI's
+shared mode already converts, and `MediaFoundationResampler` in this topology destroys half the
+audio. See item 3 under Stage 0 below for the full reasoning.
+
+The `Log` path is literal for both the packaged and the unpackaged build, but only because
+`packaging/AppxManifest.xml` disables Desktop Bridge write virtualization. Without that opt-out the
+installed build writes to `%LOCALAPPDATA%\Packages\<PFN>\LocalCache\Local\` instead, while still
+reporting the path above. See `FINDINGS.md` §9.
 
 The services stop deciding anything. Each reports facts upward via events and exposes
 `ConnectAsync` / `Disconnect`; `ConnectionManager` decides what to do about them. That boundary is
@@ -179,17 +188,43 @@ Smallest diff that makes a first-run failure diagnosable.
 
 1. **`Log`** — hand-rolled rolling file at `%LOCALAPPDATA%\Klangbruecke\logs\`, one file per day,
    7-day retention. No NuGet dependency. Logs every state transition, every WinRT call and its
-   result, and every device enumeration.
+   result, and every device enumeration. That path is correct as written for the installed build as
+   well as `dotnet run`, because the manifest opts out of Desktop Bridge write virtualization —
+   which also means both builds append to the *same* file, so read the startup
+   `Base directory:` line before attributing anything in it. See `FINDINGS.md` §9.
 2. **UI thread marshalling** — capture the `SynchronizationContext` in the `TrayContext`
    constructor and post through it. Today `SetStatus` writes `_icon.Text` directly while being
    invoked from the WinRT threadpool (`AudioPlaybackConnection.StateChanged`) and from NAudio's
    `RecordingStopped`. This surfaces as an intermittent `InvalidOperationException`, not a clean
    failure.
-3. **Resampler** — `AudioRouter.cs:69-80` builds a `BufferedWaveProvider` from the capture
-   `WaveFormat` and hands it straight to `WasapiOut` in shared mode. Insert a
-   `MediaFoundationResampler` when it does not match the output's mix format. With VoiceMeeter and
-   VB-Cable in the chain (`FINDINGS.md` §7) a mismatch is likely rather than hypothetical, and it
-   presents as silence rather than an error.
+3. **Format logging — NOT a resampler.** This item originally called for inserting a
+   `MediaFoundationResampler` when the capture format does not match the output's mix format, on
+   the premise that `WasapiOut.Init` throws on a shared-mode mismatch and the failure presents as
+   silence. **That premise is false and the resampler is actively harmful.** Verified against
+   decompiled NAudio 2.2.1:
+
+   - `WasapiOut.Init`'s entire `IsFormatSupported` / `ResamplerDmoStream` / `GetFallbackFormat`
+     block is inside `if (shareMode == AudioClientShareMode.Exclusive)`. `AudioRouter` uses
+     `Shared`, so none of it runs.
+   - In shared mode `Init` passes `AudioClientStreamFlags.SrcDefaultQuality | AutoConvertPcm` to
+     `AudioClient.Initialize`. **WASAPI's own sample-rate converter already handles the mismatch.**
+   - `MediaFoundationTransform` allocates `sourceBuffer = new byte[AverageBytesPerSecond]` and
+     always requests that full second, ignoring the caller's `count`. Against a
+     `BufferedWaveProvider` capped at 500 ms, `ReadFully` zero-fills the shortfall while
+     `DiscardOnBufferOverflow` destroys the overflow — a permanent 1 Hz cycle of 500 ms audio and
+     500 ms silence, with half the source discarded. Both sizes are fixed at construction; no
+     steady state resolves it.
+
+   What this item delivers instead: log the capture and render format pair unconditionally at
+   `Start`, and subscribe to `WasapiOut.PlaybackStopped` — nothing did, so play-thread failures
+   were invisible while the tray still read "Routing X -> Y". The format pair is the first thing
+   anyone needs when diagnosing Stage 0's validation run. The live pair on this machine is
+   44100 Hz / 32-bit / 2 ch capture against 48000 Hz render endpoints.
+
+   If explicit resampling is ever genuinely needed in this topology,
+   `WdlResamplingSampleProvider` (NAudio.Core, no new package) reads caller-sized chunks and is
+   the real-time-safe choice. `MediaFoundationResampler` is a file-transcoding component and
+   would require `BufferDuration` above ~2 s, which is fatal latency for the calls half.
 4. **Transport correlation** — `TrayContext.cs:175` takes `transports.FirstOrDefault()` and never
    correlates the transport to the phone the user selected. With one phone paired this works by
    accident. Correlate on the Bluetooth address embedded in the device ID.
@@ -268,8 +303,11 @@ Each row verified by hand, with the log as evidence:
   at info and feed the backoff; they do not surface a dialog.
 - **`Settings` load/save** already swallows IO and JSON exceptions deliberately. Keep that, but log
   the swallowed exception instead of discarding it.
-- **`AudioRouter.Init` failure** on format mismatch is what the resampler addresses. If it still
-  fails, the state is `Degraded` with the format pair logged, not silence.
+- **`AudioRouter` failures** are logged with the capture and render format pair, which is the
+  diagnosis when audio is wrong. A shared-mode format mismatch does not fail — WASAPI converts it
+  — so the pair is logged unconditionally rather than only on error. Play-thread failures arrive
+  via `PlaybackStopped` and clear `IsRunning`; without that subscription they are silent and the
+  tray keeps claiming it is routing.
 - **Missing capability or package identity** logs a clear single line naming what is disabled and
   why, rather than failing opaquely.
 
@@ -291,8 +329,91 @@ tests/Klangbruecke.Tests/                          (Stage 0)
 ```
 
 Modified: `TrayContext.cs` (orchestration out, view only), `AudioSinkService.cs` (DeviceWatcher,
-real state), `CallTransportService.cs` (correlation), `AudioRouter.cs` (resampler),
-`Settings.cs` (log swallowed exceptions).
+real state), `CallTransportService.cs` (correlation), `AudioRouter.cs` (format logging and
+`PlaybackStopped` — **not** a resampler; see item 3 above), `Settings.cs` (log swallowed
+exceptions).
 
 `TrayContext.cs` is 228 lines and is currently the only orchestrator; moving connection logic out
 is what keeps it reviewable, not incidental cleanup.
+
+---
+
+## What Stage 0 learned that Stage 1 must honour
+
+Stage 0 shipped (153 tests, branch `stage-0-instrumentation`). These are the constraints it
+discovered empirically. They are not in the git history in this form, and several contradict what
+this document originally assumed.
+
+### Hard facts, verified on this machine
+
+- **`AudioPlaybackConnection.TryCreateFromId` terminates an unpackaged process** with an
+  `AccessViolationException` inside the CsWinRT ABI shim — a corrupted-state exception no managed
+  handler can catch or log. `docs/FINDINGS.md` §8. `AudioSinkPolicy` gates it in two places; **do
+  not remove either "to let it try"**. There is no unpackaged dev loop for the music half.
+- **Discovery works unpackaged**: `GetDeviceSelector()`, `FindAllAsync`, `PhoneLineTransportDevice.FromId`
+  and `IsRegistered()` all succeed without identity. Only registration is expected to need it.
+- **Correlation works on real hardware.** Both selectors return `BTHENUM` interfaces carrying the
+  same address; the app's log shows `AddressMatch`, not the single-candidate fallback. The
+  phone-line selector filters on `DeviceInstanceId` containing the HFP-AG service UUID, which
+  structurally guarantees the address is present.
+- Both devices also share a `System.Devices.ContainerId`, which links them to the MMDEVAPI
+  endpoints too — a stronger correlation key than the address, **but it is regenerated on
+  unpair/re-pair**, so never persist it as the phone's identity.
+- `DeviceInformation.Pairing.IsPaired` reads `false` unless `System.Devices.Aep.IsPaired` was
+  requested in `extraProps`. Any bare `FindAllAsync` result gives a false negative.
+- The MSIX disables Desktop Bridge write virtualization, which needs the `unvirtualizedResources`
+  restricted capability — **not encoded in the XSD**, so schema validation gives a false pass
+  (`FINDINGS.md` §9). Consequence: packaged and unpackaged runs share one log file, and uninstall
+  no longer removes logs or settings.
+
+### The largest risk Stage 1 inherits
+
+`AudioRouter` constructs `WasapiCapture`/`WasapiOut` inline with no seam, so **none of its
+behaviour is testable**. Five properties there are load-bearing and defended by comments alone —
+reverting any one leaves all 153 tests green:
+
+1. `_session` published before `StartRecording`/`Play`
+2. `EndSession()` called before `Report()` in both stopped handlers
+3. `_session = null` before the unsubscribes in `Stop()`
+4. the stale-session check inside the posted teardown lambda
+5. the `ReferenceEquals(sender, …)` guards
+
+**Two real defects were found there by live hardware probes after surviving three review rounds
+each.** Treat "reviewed repeatedly" as weak evidence for anything behind that seam. Introducing the
+`IAudioSinkService`/`ICallTransportService`/`IAudioRouter` interfaces this document already
+specifies is what makes it guardable — that is the point of them, not tidiness.
+
+Related: `NAudio`'s `WasapiOut` raises `PlaybackStopped` **on the play thread** when no
+`SynchronizationContext` was captured, and `PlayThread` assigns `Stopped` only on its one clean
+fall-through. So a handler that calls `Stop()`/`Dispose()` self-joins and deadlocks, and every
+abnormal exit — including `audioClient.Stop()` throwing when the phone leaves range — lands in that
+window. Teardown is posted through `IUiDispatcher` for this reason. **Any Stage 1 auto-reconnect
+that calls `Start()` from a threadpool thread would have hit this**; production avoided it only by
+field-initializer ordering.
+
+### Smaller carry-forwards
+
+- **Nothing restarts the route after teardown.** Audio stays down until the user re-picks. This is
+  the retry gap `ConnectionManager` exists to close.
+- `AudioRouter.Start()` returns `true` for a source that cannot capture — the capture thread dies
+  asynchronously. Retry logic that trusts the return value will loop.
+- `FileLog.Write` does synchronous file I/O under a lock. Harmless today because nothing logs from
+  the audio hot path. **If the reconcile loop or a capture callback ever logs, it needs a queue and
+  a single writer thread first**, or it becomes an audio dropout.
+- `Application.ThreadException`'s add accessor **overwrites** rather than combines. A second
+  subscriber silently drops the first.
+- `StatusPresenter.Last` is written on the UI thread inside the post. Even `volatile` does not stop
+  a cross-thread reader observing it a few instructions before the tooltip write.
+- `Settings.EnableCalls` toggled off skips `_calls.Disconnect()`, so an existing registration
+  survives the setting change until the next connect.
+- "Route calls to PC" shows checked while calls do nothing unpackaged. Wants a UI answer, not
+  another status line.
+- `TrayContext` subscribes the three `Status` handlers before `_status` is assigned; safe only by
+  current call ordering.
+
+### Process note
+
+Stage 0's plan embedded complete code for each task. Eight defects were found, **all eight in the
+plan text, none in the implementations** — the plan got one self-review while the code got a
+dedicated adversarial reviewer per task. Stage 1's plan should specify interfaces, test cases and
+constraints, and let implementers write the bodies.

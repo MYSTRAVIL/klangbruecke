@@ -16,5 +16,8 @@ artifacts/
 *.cer
 *.pvk
 *.snk
+# New-DevCert.ps1 writes the pfx password beside the pfx. "*.pfx" does not match it - the pattern
+# needs the name to end in .pfx - so without this line it is untracked but not ignored.
+*.pfx.password
 
 .env

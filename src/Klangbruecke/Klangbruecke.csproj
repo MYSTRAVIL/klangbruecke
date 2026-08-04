@@ -12,6 +12,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Klangbruecke</RootNamespace>
     <AssemblyName>Klangbruecke</AssemblyName>
+    <!-- Must match Identity Version in packaging/AppxManifest.xml - the startup banner logs this one
+         and Task 9 reads that log to tell one installed build from another. Unset, the SDK defaults
+         to 1.0.0.0 and the banner reports a version the package has never carried. Two files, no
+         enforcement: bump both. -->
+    <Version>0.1.0.2</Version>
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <ApplicationIcon></ApplicationIcon>

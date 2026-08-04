@@ -4,7 +4,9 @@
 
 **Goal:** Make a first-run failure diagnosable, fix the three known landmines, and find out whether this app can actually connect to the phone.
 
-**Architecture:** Add a rolling file log as the app's only durable diagnostic surface, then fix four specific defects in the existing scaffold: unmarshalled UI updates, a missing resampler, transport selection that ignores which phone was chosen, and no graceful degradation when running without MSIX package identity. Logic worth testing is extracted into pure static helpers that need no Bluetooth hardware; the WinRT and WASAPI layers are verified by hand against the OS.
+**Architecture:** Add a rolling file log as the app's only durable diagnostic surface, then fix four specific defects in the existing scaffold: unmarshalled UI updates, silent play-thread failures with no record of the capture/render format pair, transport selection that ignores which phone was chosen, and no graceful degradation when running without MSIX package identity. Logic worth testing is extracted into pure static helpers that need no Bluetooth hardware; the WinRT and WASAPI layers are verified by hand against the OS.
+
+> The second item originally read "a missing resampler". **There is no resampler and there must not be one** — the item was reverted during execution and the reasoning is in the warning at the head of Task 5. Anything below that inserts a `MediaFoundationResampler` is kept only as a record of what was tried.
 
 **Tech Stack:** .NET 8, WinForms (tray only), NAudio 2.2.1, WinRT (`Windows.Media.Audio`, `Windows.ApplicationModel.Calls`), xunit.
 
@@ -165,7 +167,7 @@ public sealed class FileLogTests : IDisposable
         // A path containing a NUL character cannot be created on any Windows volume.
         var log = new FileLog("\0invalid\0", clock: () => At(2026, 8, 4));
 
-        log.Write(LogLevel.Error, "should not throw");
+        Assert.Null(Record.Exception(() => log.Write(LogLevel.Error, "should not throw")));
     }
 
     public void Dispose()
@@ -298,7 +300,7 @@ git commit -m "Add test project and rolling file log"
 
 **Interfaces:**
 - Consumes: `FileLog(string directory, int retentionDays = 7, Func<DateTimeOffset>? clock = null)`, `FileLog.FileNameFor(DateTimeOffset)` from Task 1.
-- Produces: no new public API. `FileLog` prunes files older than `retentionDays` on the first write of each day.
+- Produces: no new public API. On the first write of each day, `FileLog` prunes so that exactly `retentionDays` dated files remain (today through today minus `retentionDays` - 1). `retentionDays` is a **file count**, not an age threshold — the ambiguity between those two readings cost a fix round.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -524,7 +526,7 @@ public sealed class LogTests : IDisposable
     [Fact]
     public void NullLog_AcceptsWritesWithoutThrowing()
     {
-        new NullLog().Write(LogLevel.Error, "nowhere", new Exception("x"));
+        Assert.Null(Record.Exception(() => new NullLog().Write(LogLevel.Error, "nowhere", new Exception("x"))));
     }
 
     public void Dispose() => Log.Current = _original;
@@ -724,13 +726,16 @@ public sealed class UiDispatcherTests
             var dispatcher = new ControlUiDispatcher();
             dispatcher.Dispose();
 
-            dispatcher.Post(() => throw new InvalidOperationException("must not run"));
+            // The action must be dropped, not run: a disposed dispatcher has no UI thread left
+            // to marshal onto.
+            Assert.Null(Record.Exception(
+                () => dispatcher.Post(() => throw new InvalidOperationException("must not run"))));
         });
     }
 }
 ```
 
-**Note on scope:** the cross-thread `BeginInvoke` path is not unit tested — asserting it requires a running message pump, which xunit does not provide. It is verified by hand in Task 9 Step 6: connect, disconnect the phone, and confirm the log records the state change with no `InvalidOperationException`.
+**Note on scope:** the cross-thread `BeginInvoke` path is not unit tested — asserting it requires a running message pump, which xunit does not provide. It is verified by hand in Task 9 Step 7: connect, disconnect the phone, and confirm the log records the state change with no `InvalidOperationException`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -862,7 +867,23 @@ git commit -m "Marshal tray status updates onto the UI thread"
 
 ---
 
-### Task 5: Resample when capture and render formats differ
+### Task 5: Log the capture/render format pair, and stop failing silently
+
+> **WARNING — this task as originally written was wrong and was reverted during execution.**
+> Everything below that inserts a `MediaFoundationResampler` is **harmful**; do not re-execute it.
+> Verified against decompiled NAudio 2.2.1: `WasapiOut.Init`'s DMO-fallback block is inside
+> `if (shareMode == Exclusive)` and never runs here, shared mode already passes
+> `SrcDefaultQuality | AutoConvertPcm` to `AudioClient.Initialize`, and
+> `MediaFoundationTransform` pulls a fixed one second from a 500 ms buffer — a structural 1 Hz
+> chop that destroys half the audio. `RequiresResampling` was additionally a tautology, comparing
+> a normalized `IeeeFloat` against a raw `Extensible`.
+>
+> What shipped instead: `AudioFormatBridge.Differ` (both sides normalized, diagnostic only),
+> the capture/render format pair logged **unconditionally** at `Start`, a `PlaybackStopped`
+> subscription (nothing had one, so play-thread failures were invisible), and an exception-safe
+> `Stop()`. See the corrected spec section and commit `d16f423`.
+
+#### Original text, superseded — kept for the record
 
 **Files:**
 - Create: `src/Klangbruecke/Audio/AudioFormatBridge.cs`
@@ -1625,7 +1646,9 @@ Right-click the tray icon (this triggers enumeration), pick your phone, wait a f
 Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log"
 ```
 
-Expected: the log contains `A2DP selector matched N device(s).` with at least one `A2DP candidate` line showing a real device id, and `Calls unavailable: no MSIX package identity`.
+This is the right path for an unpackaged run, and — because the manifest disables Desktop Bridge write virtualization (`docs/FINDINGS.md` §9) — for the installed build too. Both append here, so once Task 9 has run at least once, check the `Base directory:` line of the run you are reading before believing anything in it.
+
+Expected: the log contains `A2DP selector matched N device(s).` with at least one `A2DP candidate` line showing a real device id, and the no-package-identity explanation for both halves.
 
 **Record the real device id shape** — it is the input Task 6's regex was written against without evidence. If `TryExtractAddress` returns null for it, that shows up as the fallback warning in the log.
 
@@ -1658,19 +1681,53 @@ This task is hands-on and cannot be completed by an agent. It requires the phone
 
 Expected: an `.msix` under `artifacts/`. If `Build-Msix.ps1` warns about a missing `.pfx`, `New-DevCert.ps1` has not been run or did not complete.
 
-- [ ] **Step 2: Install**
+- [ ] **Step 2: Kill any development instance, then install**
 
-Enable sideloading first: Settings → Update & Security → For developers → Sideload apps. Then double-click the `.msix` and install.
+**No development instance may be running.** This is not tidiness. The single-instance mutex lives in the `Local\` namespace, which is **not** virtualized for MSIX, so a live unpackaged instance makes the packaged one log `Another instance already holds the single-instance mutex. Exiting.` and quit. Nothing appears in the tray and nothing else is written — from the outside it is indistinguishable from a crash.
 
-- [ ] **Step 3: Confirm package identity is now detected**
+Ask the mutex rather than guessing at process names. It is the actual gate, and it answers whether one exists at all:
+
+```powershell
+try { [System.Threading.Mutex]::OpenExisting('Local\Klangbruecke.SingleInstance').Dispose(); 'HELD' }
+catch { 'FREE' }
+```
+
+`FREE` — proceed. `HELD` — find the owner. It is one of two shapes, and a `dotnet run` instance is **not** called `Klangbruecke`; it runs inside `dotnet.exe`, so a `Get-Process Klangbruecke` alone will miss it:
+
+```powershell
+Get-Process Klangbruecke -ErrorAction SilentlyContinue          # tray app: packaged, or from bin\
+Get-CimInstance Win32_Process -Filter "Name='dotnet.exe'" |     # dotnet run
+  Where-Object CommandLine -match 'Klangbruecke'
+```
+
+Stop whichever turns up, then re-check the mutex before installing.
+
+Then enable sideloading: Settings → Update & Security → For developers → Sideload apps. Then double-click the `.msix` and install.
+
+- [ ] **Step 3: Confirm which build wrote the log, and that identity is detected**
 
 Launch Klangbruecke from the Start menu, then:
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" | Select-String "Calls"
+Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" -Tail 300 |
+  Select-String "Base directory|Calls|Music"
 ```
 
-Expected: `Calls enabled.` — **not** the no-package-identity line. If it still says unpackaged, the app was launched from `bin/` rather than the installed package.
+That path is correct for the installed build — the manifest disables Desktop Bridge write virtualization (`docs/FINDINGS.md` §9). It is correct for `dotnet run` too, which is the catch: **both builds append to the same file**, so a day's log interleaves them.
+
+Expected, in this order:
+
+- `Base directory: C:\Program Files\WindowsApps\Klangbruecke_...` — **check this first.** If it names `src\Klangbruecke\bin\...` you are reading a development run and everything below it is about the wrong process.
+
+**One file, many runs.** Packaged and unpackaged builds now append to the same log, and Task 8's
+development runs are already in today's file. Every check in this task is therefore scoped with
+`-Tail 300`. If a check still shows something confusing, find the **last** `Base directory:` line
+and read only below it — anything above belongs to an earlier process. This matters most in Steps 6
+and 7, where a stale hit from an earlier run reads exactly like a fresh failure.
+- `Music enabled.`
+- `Calls enabled.`
+
+**Not** either no-package-identity line. If the log still says unpackaged while `Base directory` names `WindowsApps`, the identity probe itself is wrong — re-run `packaging/Test-PackageIdentity.ps1` (`FINDINGS.md` §2) rather than suspecting the packaging.
 
 - [ ] **Step 4: Validate the music half**
 
@@ -1700,28 +1757,65 @@ Place a real cellular call. Verify audio in **both** directions — the mic half
 
 Note that outgoing-call ringback is a known gap (`docs/FINDINGS.md` §6) and is not a failure of this stage.
 
-- [ ] **Step 6: Check the log for cross-thread damage**
+- [ ] **Step 6: Kill the route from the far side, and watch it tear down**
+
+`AudioRouter` has **zero automated coverage** — it cannot be constructed without real WASAPI endpoints — and five of its behaviours are defended by comments alone. Reverting any one of them leaves the whole unit suite green. This step is the only thing that exercises them, so do not skip it.
+
+With music routing and playing, **disconnect Bluetooth on the phone** (not from the tray — the point is that the far side goes away without warning). Then:
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" -Tail 300 |
+  Select-String "Tearing the route down|stopped"
+```
+
+Expected: `Tearing the route down: the capture half stopped.` **or** `... the playback half stopped.` — exactly one of them, not both. One action here exercises the session token, the deferred teardown marshalling (`RequestTeardown`, which deadlocks if it ever runs on the thread that raised the event), and endpoint release.
+
+Then **re-pick the phone from the tray menu and confirm it connects again.** A teardown that released nothing shows up here and nowhere else: the second attempt fails because the first route is still holding the A2DP capture endpoint open.
+
+Record which half reported first. Stage 1 needs it — it says which of `RecordingStopped` and `PlaybackStopped` Windows raises first when an endpoint vanishes mid-stream.
+
+- [ ] **Step 7: Check the log for cross-thread damage**
 
 With the call still connected, disconnect Bluetooth on the phone, then:
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" |
+Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" -Tail 300 |
   Select-String "InvalidOperationException|Unhandled"
 ```
 
 Expected: no matches. This is the hand-verification of Task 4's cross-thread path, which could not be unit tested.
 
-- [ ] **Step 7: Record the outcome**
+Also worth one look at the severity column:
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\Klangbruecke\logs\klangbruecke-$(Get-Date -Format yyyyMMdd).log" -Tail 300 |
+  Select-String "\[ERR\]" -Context 0,6
+```
+
+**Errors come in pairs, and that is correct, not a defect.** A failure logs twice by design: the
+component writes `Log.Error(message, exception)` — which renders the full indented stack — and then
+raises a status the tray shows, which reaches the log as a second, shorter `[ERR]` line with no
+stack. So the shape to expect is a stack-bearing `[ERR]` immediately followed by a stackless one
+restating it.
+
+What would be wrong is a stackless `[ERR]` with **no** stack-bearing partner anywhere above it.
+That means a component reported a failure without the exception — the defect this stage's logging
+was rebuilt to prevent.
+
+- [ ] **Step 8: Record the outcome**
 
 Update the Status section of `README.md` (lines 10-15) to say what actually happened — which halves worked, and what did not. Append anything surprising to `docs/FINDINGS.md` rather than to the README.
 
 Specifically record, for Stage 1's benefit:
 - The real device id shapes from both selectors, and whether address matching worked or fell back.
-- Whether `AudioPlaybackConnection` also worked unpackaged in Task 8 Step 6, or needed identity.
-- Whether the resampler engaged, and between which formats.
+- The capture/render format pair from the `Capture=... Render=...` line, and whether it said `differ` or `matched`. There is **no resampler** — WASAPI shared mode converts, and the earlier plan to add a `MediaFoundationResampler` was reverted as actively harmful (see the warning at the head of Task 5). The pair is logged unconditionally as a diagnostic, so record what it said; there is nothing to record about a resampler "engaging".
+- What `RegisterApp()` did. This is the **first time it has ever run** (`FINDINGS.md` §2 records it as untested and names it as where the restricted capability probably bites), so whatever happened is new information: it returned, it threw, or the process vanished between the `Registering this app...` and `RegisterApp returned` lines.
 - What `AudioPlaybackConnection.State` reports on a phone-initiated disconnect versus walking out of range. **This is the observation Stage 1's grace-window logic depends on.**
+- Which half — capture or playback — reported first in Step 6.
 
-- [ ] **Step 8: Commit**
+**Do not re-open whether `AudioPlaybackConnection` works unpackaged.** It does not: `TryCreateFromId` terminates the process with an uncatchable `AccessViolationException`, reproduced on every attempt against a live device id, garbage ids, STA and MTA, two SDK projections, and a bare test host. That is settled and written up in `FINDINGS.md` §8. Re-running it to check only kills the process again and teaches nothing.
+
+- [ ] **Step 9: Commit**
 
 ```powershell
 git add README.md docs/FINDINGS.md
@@ -1732,4 +1826,4 @@ git commit -m "Record Stage 0 validation results"
 
 ## After this plan
 
-Stage 1 (the `ConnectionManager` state machine) gets its own plan, written once Step 7's observations exist. The spec's design for it stands; what the validation run supplies is the evidence for the grace-window behaviour and the device id handling that the state machine is built on.
+Stage 1 (the `ConnectionManager` state machine) gets its own plan, written once Task 9 Step 8's observations exist. The spec's design for it stands; what the validation run supplies is the evidence for the grace-window behaviour and the device id handling that the state machine is built on.
