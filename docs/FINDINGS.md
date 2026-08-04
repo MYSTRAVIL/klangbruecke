@@ -458,28 +458,46 @@ a Store-signed identity in practice.
 as enumeration, `FromId` and `IsRegistered()` — all of which work unpackaged. The capability was
 never actually exercised.
 
-### NOT ruled out: a registration conflict (an earlier revision of this section said otherwise)
+### Ruled out, conclusively this time: a registration conflict
 
 The scaffold's own comment in `CallTransportService.cs` anticipated this — *"Registering claims the
 hands-free role for this app. If another app already holds it, this is where things fail"* — and
 Thy Phone (`InTheHandLtd.PearYourPhone`, the Store app §1 used to prove calls work) was still
 installed when the failure was first seen.
 
-It was uninstalled and `RegisterApp()` still throws, identically (2026-08-04 20:41, clean relaunch).
-**That does not clear the conflict hypothesis, and an earlier revision of this file wrongly said it
-did.** `RegisterApp()` registers a *package*, not a process, and an uninstall plausibly does not
-release an HFP registration until the Bluetooth stack restarts or the device is re-paired. The
-retry was immediate. The test is inconclusive, not negative.
+It was uninstalled, and `RegisterApp()` still throws identically (2026-08-04 20:41, clean relaunch).
 
-**Decisive counter-evidence against "Windows does this natively":** before either Thy Phone or
-Klangbruecke was installed, the PC could not be selected as a call audio device from Android at all.
-So the hands-free role must be claimed by *some* application for the phone to offer the PC — Windows
-does not provide it on its own. Any explanation that assumes otherwise is wrong, including one this
-file previously carried.
+The uninstall genuinely released the role, and that is observable rather than assumed: **with Thy
+Phone gone, Android no longer offers the PC as a call audio device at all.** Nothing holds the
+hands-free registration, and Klangbruecke still cannot claim it. The conflict hypothesis is dead.
 
-The remaining clean test is to restart the Bluetooth stack (or reboot, or remove and re-pair the
-phone) with Thy Phone gone, then retry — and to check whether the phone still offers the PC as a
-call audio device in the meantime, which reveals directly whether anything still holds the role.
+This also establishes what was actually happening all along: **Thy Phone was routing every call,
+from before this project began until it was uninstalled.** Klangbruecke's calls half has never
+worked, in any run, on any attempt. A working call was never evidence about this app.
+
+**Windows does not provide the hands-free role on its own.** Before either app was installed, the PC
+could not be selected as a call audio device from Android; after Thy Phone was removed, the option
+disappeared again. The role must be claimed by an application for the phone to offer the PC at all.
+An earlier revision of this file claimed Windows did this natively. It does not.
+
+### Where that leaves the calls half
+
+Unimplemented in practice. The capability is declared, the package installs, identity is confirmed,
+the transport is found and correlated to the right phone — and the one call that would claim the
+role is refused. Every explanation that does not require Store signing has now been eliminated by
+direct test.
+
+The remaining candidates, none yet tested:
+
+- The restricted capability is not honoured at runtime for a **self-signed** sideloaded package,
+  only for a Store-signed one. §1's proof that calls work on this machine used Thy Phone, a
+  Store-signed app — exactly the variable under suspicion.
+- `RegisterApp()` requires a manifest declaration beyond the capability (a call-provider extension
+  or similar) that this package does not have.
+- The API is not usable by a full-trust Desktop Bridge app, only by a pure UWP one.
+
+Until one of those is resolved, **this app does music only**, and anyone wanting call routing on
+this machine needs Thy Phone.
 
 Also ruled out: a deployment-time capability refusal. `Microsoft-Windows-AppModel-Runtime/Admin`
 logs the app launching into its Desktop AppX container normally, with no denial of any kind. Windows
