@@ -25,6 +25,17 @@ if (-not $isAdmin) {
     throw 'Run this elevated - it installs a certificate into LocalMachine\TrustedPeople.'
 }
 
+# Re-running is normal (the script has failed part-way before, and certs expire). Without this,
+# every run leaves another cert with the same subject behind and signing picks one at random.
+$stale = @(Get-ChildItem 'Cert:\CurrentUser\My' | Where-Object { $_.Subject -eq $Subject })
+if ($stale.Count -gt 0) {
+    Write-Host "Removing $($stale.Count) existing '$Subject' certificate(s) from CurrentUser\My:"
+    foreach ($old in $stale) {
+        Write-Host "  $($old.Thumbprint)"
+        Remove-Item -Path "Cert:\CurrentUser\My\$($old.Thumbprint)" -Force
+    }
+}
+
 Write-Host "Creating self-signed certificate: $Subject"
 
 $cert = New-SelfSignedCertificate `
@@ -39,8 +50,13 @@ $cert = New-SelfSignedCertificate `
 Write-Host "  Thumbprint: $($cert.Thumbprint)"
 
 # Random password; it never leaves this machine and the pfx is gitignored.
+#
+# Create().GetBytes() rather than the static Fill(): this script is run elevated, and an elevated
+# shell on this machine is Windows PowerShell 5.1 on .NET Framework, where the static does not exist.
 $bytes = [byte[]]::new(24)
-[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try   { $rng.GetBytes($bytes) }
+finally { $rng.Dispose() }
 $plain = [Convert]::ToBase64String($bytes)
 $password = ConvertTo-SecureString -String $plain -Force -AsPlainText
 
