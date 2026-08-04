@@ -12,30 +12,52 @@ namespace Klangbruecke.Audio;
 /// </summary>
 public sealed class AudioRouter : IDisposable
 {
+    /// <summary>
+    /// One Start..Stop session: both its identity and whether it is still alive.
+    ///
+    /// Liveness belongs here rather than in a field of the router because a worker thread can be
+    /// preempted between reading the current session and marking it dead. A router-level flag written
+    /// at that point lands on whichever session is current when the write finally retires, and after
+    /// an intervening Stop/Start pair that is a healthy new one - so IsRunning would report a live
+    /// route as dead. The one consumer is TrayContext.SelectOutput, which would then silently decline
+    /// to re-point the stream, with no status line to say why. Scoped to the session, the same write
+    /// cannot escape the session it describes.
+    /// </summary>
+    private sealed class Session
+    {
+        // Set on NAudio's worker threads, read on the UI thread. Volatile for the release/acquire
+        // edge, not for atomicity.
+        public volatile bool Dead;
+    }
+
     private readonly IUiDispatcher _ui;
 
-    private WasapiCapture? _capture;
-    private WasapiOut? _output;
+    // Volatile: both are read from NAudio's capture and play threads by the sender guards below, and
+    // written on the thread that runs Start and Stop.
+    private volatile WasapiCapture? _capture;
+    private volatile WasapiOut? _output;
+
     private BufferedWaveProvider? _buffer;
 
     /// <summary>
-    /// Identity of the current Start..Stop session, and the authority on whether a deferred teardown
-    /// is still wanted. A stopped event can be in flight while the UI thread replaces the session, so
-    /// by the time the teardown runs the fields it would tear down may belong to a healthy new route.
-    /// Volatile because it is written on the UI thread and read on NAudio's capture and play threads.
+    /// The current session, or null between Stop and the next Start. Also the authority on whether a
+    /// deferred teardown is still wanted: a stopped event can be in flight while the UI thread
+    /// replaces the session, so by the time the teardown runs the fields it would tear down may
+    /// belong to a healthy new route.
     /// </summary>
-    private volatile object? _session;
-
-    // Written from NAudio's worker threads and read on the UI thread, which is what rules out an auto
-    // property: without a release/acquire edge a reader has no guarantee of ever seeing the store, and
-    // the tray would keep claiming it is routing a stream that has already died.
-    private volatile bool _running;
+    private volatile Session? _session;
 
     private bool _disposed;
 
+    /// <summary>
+    /// The dispatcher is not a convenience. RequestTeardown is free of deadlock only because the
+    /// dispatcher actually defers work off the thread that raised the stopped event - see there for
+    /// what happens otherwise. <see cref="ImmediateUiDispatcher"/> runs every action inline and would
+    /// reinstate the self-join in full, so it is safe here only in a test that never starts a route.
+    /// </summary>
     public AudioRouter(IUiDispatcher ui) => _ui = ui;
 
-    public bool IsRunning => _running;
+    public bool IsRunning => _session is { Dead: false };
 
     public event EventHandler<string>? Status;
 
@@ -115,13 +137,14 @@ public sealed class AudioRouter : IDisposable
             _output.Init(_buffer);
 
             // Before either worker thread exists, so no stopped event can be raised against a session
-            // that has not been published yet and be discarded as stale.
-            _session = new object();
+            // that has not been published yet and be discarded as stale. This is also what makes
+            // IsRunning true, a few statements earlier than the old flag did; the difference is not
+            // observable, because any failure below reaches Stop and nulls it again.
+            _session = new Session();
 
             _capture.StartRecording();
             _output.Play();
 
-            _running = true;
             Report($"Routing '{source.FriendlyName}' -> '{sink.FriendlyName}'.");
             return true;
         }
@@ -149,6 +172,9 @@ public sealed class AudioRouter : IDisposable
     {
         // Mirrors the playback guard below: this can be raised after Stop dropped this capture or a
         // later Start replaced it, and reporting that session dead would describe the wrong one.
+        // NAudio snapshots the delegate before raising, so unsubscribing in Stop does not reliably
+        // prevent this call - which is why the guard exists at all, and why _capture is volatile:
+        // this is the one check the session token cannot back up, because it runs before it.
         if (!ReferenceEquals(sender, _capture))
         {
             return;
@@ -170,7 +196,8 @@ public sealed class AudioRouter : IDisposable
     private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
     {
         // Raised via SynchronizationContext.Post, so it can arrive after Stop dropped this output
-        // or a later Start replaced it. Clearing IsRunning then would report the wrong session dead.
+        // or a later Start replaced it. Reporting then would describe the wrong session as dead.
+        // Volatile for the same reason as the capture guard above.
         if (!ReferenceEquals(sender, _output))
         {
             return;
@@ -199,11 +226,21 @@ public sealed class AudioRouter : IDisposable
     /// NAudio 2.2.1 on this machine rather than reasoned about. WasapiOut captures
     /// SynchronizationContext.Current in its constructor and, when that was null, calls the handler
     /// directly on its play thread. WasapiOut.Dispose -> Stop then does playThread.Join() whenever
-    /// playbackState is not already Stopped - which is exactly the failure case, because PlayThread
-    /// assigns Stopped only on the normal-completion path, never from the catch. Joining the running
-    /// thread from itself parks it forever: a probe against the real library hung there and never
-    /// returned. Calling Stop() from this handler would therefore have introduced the deadlock the
-    /// old do-nothing handlers avoided by accident.
+    /// playbackState is not already Stopped. Joining the running thread from itself parks it forever:
+    /// a probe against the real library hung there and never returned. Calling Stop() from this
+    /// handler would therefore have introduced the deadlock the old do-nothing handlers avoided by
+    /// accident.
+    ///
+    /// Do not narrow that to "only when it threw". PlayThread has exactly one assignment of Stopped,
+    /// on the single fall-through at the end of its try, so every abnormal exit reaches the finally
+    /// still marked Playing. That includes an early return when FillBuffer reports end-of-stream, and
+    /// it includes a throw from anywhere in the body - which is wide: the DMO resampler construction,
+    /// audioClient.BufferSize, Start, CurrentPadding, every GetBuffer/ReleaseBuffer COM call, and
+    /// audioClient.Stop() itself, which runs one line *before* the Stopped assignment. An endpoint
+    /// that vanishes mid-stream, which is what a phone walking out of range looks like, lands there.
+    /// The end-of-stream return happens to be dormant for us - BufferedWaveProvider.ReadFully
+    /// defaults to true, so its Read pads with zeroes and never returns 0 - but that is a default on
+    /// a different class, not a property of this one, and it is not what makes this safe.
     ///
     /// Posting through the dispatcher removes it in both configurations. With no
     /// SynchronizationContext the event arrives on the play thread, ControlUiDispatcher sees
@@ -220,7 +257,7 @@ public sealed class AudioRouter : IDisposable
     /// </summary>
     private void RequestTeardown(string half)
     {
-        object? session = _session;
+        Session? session = _session;
         if (session is null)
         {
             // Stop already ran. Nothing to tear down, and posting would only risk killing whatever
@@ -228,9 +265,11 @@ public sealed class AudioRouter : IDisposable
             return;
         }
 
-        // Eagerly, on this thread: the teardown below is deferred, and until it lands the tray must
-        // not go on claiming the route is live.
-        _running = false;
+        // Eagerly, because the teardown below is deferred and until it lands the tray must not go on
+        // claiming the route is live. Written through the token rather than to a field of the router,
+        // so that a Stop/Start pair completing between the read above and this write cannot mark the
+        // new session dead; see Session.
+        session.Dead = true;
 
         _ui.Post(() =>
         {
@@ -250,7 +289,11 @@ public sealed class AudioRouter : IDisposable
 
     public void Stop()
     {
-        // First, so a stopped event racing this teardown reads null and declines to post another.
+        // First, and this ordering is load-bearing twice over. It makes a stopped event racing this
+        // teardown read null and decline to post another - and, less obviously, it is what makes a
+        // teardown that is *already* queued harmless. Thread.Join on an STA thread pumps, so the
+        // Dispose calls below can dispatch that queued lambda from inside themselves; it finds a null
+        // session, returns, and never re-enters this method. Do not move this after the unsubscribes.
         _session = null;
 
         if (_capture is not null)
@@ -275,7 +318,6 @@ public sealed class AudioRouter : IDisposable
         }
 
         _buffer = null;
-        _running = false;
     }
 
     public void Dispose()
