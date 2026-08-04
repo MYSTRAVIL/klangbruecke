@@ -47,6 +47,57 @@ The only remaining gate is that `phoneLineTransportManagement` is a **restricted
 That gates *Microsoft Store submission* only. **Sideloading requires no approval.** Hence MSIX
 packaging + self-signed cert + sideload.
 
+### The capability gates registration, not discovery
+
+Probed unpackaged on this machine, 2026-08-04, with the phone connected. All of these **worked with
+no package identity**:
+
+| Call | Result |
+|---|---|
+| `PhoneLineTransportDevice.GetDeviceSelector()` | returned the selector |
+| `DeviceInformation.FindAllAsync(selector)` | returned the real transport, 1 result |
+| `PhoneLineTransportDevice.FromId(<real id>)` | succeeded, `DeviceId` round-tripped |
+| `IsRegistered()` | returned `False` cleanly, no throw |
+
+`Package.Current` threw `InvalidOperationException 0x80073D54` in the same run, confirming there was
+genuinely no identity.
+
+`RegisterApp()` was **not** tested, and is almost certainly where the capability actually bites. So
+do not tell a user "calls are unavailable without MSIX" — enumeration works fine unpackaged, and
+saying otherwise sends the next maintainer looking for a packaging problem they do not have.
+
+### Detecting identity — and how to verify the detector
+
+`GetCurrentPackageFullName` (kernel32, no `W` variant — `ExactSpelling = true`) with a zero length
+and a null buffer answers the question without allocating:
+
+| Return | Meaning |
+|---|---|
+| 15700 | `APPMODEL_ERROR_NO_PACKAGE` — no identity |
+| 122 | `ERROR_INSUFFICIENT_BUFFER` — there is a package |
+
+Preferred over `Package.Current`, which answers by throwing on every unpackaged run, in a startup
+path.
+
+**Measured both directions, 2026-08-04:**
+
+```
+unpackaged                                        probe=15700
+packaged (Microsoft.WindowsTerminal_8wekyb3d8bbwe) probe=122
+```
+
+The unit suite can only ever see the first: the test host is unpackaged. The second is the direction
+that matters — a probe that always answered "unpackaged" would silently disable **both** halves in
+the shipped MSIX (see §8: identity now guards the music half too) with every test still green.
+
+`Invoke-CommandInDesktopPackage` gets that answer without building an MSIX, by running the probe with
+an already-installed package's identity. Identity rides on the process token and trust level gates
+capabilities rather than identity, so a borrowed full-trust desktop-bridge package answers for
+Klangbruecke's own package too.
+
+`packaging/Test-PackageIdentity.ps1` automates it. **Re-run it after any change to the `DllImport` in
+`src/Klangbruecke/Platform/PackageIdentity.cs`** — nothing else covers that direction.
+
 ## 3. The stale-IRK pairing bug — check this FIRST when anything fails
 
 Cost roughly an hour to find. Will masquerade as an API problem.

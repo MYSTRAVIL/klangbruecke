@@ -53,10 +53,14 @@ public sealed class CallsPolicyTests
         Assert.Contains("RegisterApp", explanation);
     }
 
+    // Enumerated rather than listed. A hand-written list would have made the totality test the one
+    // place a fourth CallsAvailability member could be added without anything noticing - which is the
+    // very arrival Explain_DoesNotBlameMsixForAnUnrecognisedValue below exists to survive.
+    public static IEnumerable<object[]> EveryAvailability() =>
+        Enum.GetValues<CallsAvailability>().Select(availability => new object[] { availability });
+
     [Theory]
-    [InlineData(CallsAvailability.Enabled)]
-    [InlineData(CallsAvailability.DisabledBySetting)]
-    [InlineData(CallsAvailability.DisabledNoPackageIdentity)]
+    [MemberData(nameof(EveryAvailability))]
     public void Explain_ReturnsSomethingForEveryCase(CallsAvailability availability)
     {
         Assert.False(string.IsNullOrWhiteSpace(CallsPolicy.Explain(availability)));
