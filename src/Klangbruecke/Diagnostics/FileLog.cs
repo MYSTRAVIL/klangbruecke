@@ -26,7 +26,9 @@ public sealed class FileLog : ILog
     public FileLog(string directory, int retentionDays = 7, Func<DateTimeOffset>? clock = null)
     {
         _directory = directory;
-        _retentionDays = retentionDays;
+        // Floored at one day: a zero window puts the cutoff on today, so the sweep would delete the
+        // very file the write is about to append to, discarding the day's earlier lines with it.
+        _retentionDays = Math.Max(1, retentionDays);
         _clock = clock ?? (() => DateTimeOffset.Now);
     }
 
@@ -56,16 +58,27 @@ public sealed class FileLog : ILog
                 Directory.CreateDirectory(_directory);
 
                 string fileName = FileNameFor(now);
-                File.AppendAllText(Path.Combine(_directory, fileName), line + Environment.NewLine, Encoding.UTF8);
 
                 if (_prunedForFile != fileName)
                 {
-                    // Swept after the line is on disk, and the day claimed before the sweep runs:
-                    // retention is best-effort, so a sweep that throws costs at most one day's
-                    // pruning rather than the caller's line and every line after it.
+                    // The day is claimed before the sweep and the sweep has its own catch, so a
+                    // failing sweep can neither cost this line nor make every later write retry it.
+                    // With that settled, sweeping before the append is the better order: on a full
+                    // disk the append is what fails, and freeing space first is the only chance it
+                    // has of succeeding.
                     _prunedForFile = fileName;
-                    Prune(now);
+
+                    try
+                    {
+                        Prune(now);
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.WriteLine(ex);
+                    }
                 }
+
+                File.AppendAllText(Path.Combine(_directory, fileName), line + Environment.NewLine, Encoding.UTF8);
             }
         }
         catch (Exception ex)
@@ -89,7 +102,12 @@ public sealed class FileLog : ILog
     /// </summary>
     private void Prune(DateTimeOffset now)
     {
-        DateTimeOffset cutoff = now.AddDays(-_retentionDays);
+        // Dates compared to dates, never to an instant. A name carries a day and no time, so
+        // measuring it against a wall-clock 'now' would hand the boundary file's fate to the hour
+        // the day's first write happened to land on and to the machine's UTC offset - retaining a
+        // day less than promised on a westward offset. A file exactly _retentionDays old is not
+        // older than _retentionDays, so the boundary day is kept.
+        DateOnly cutoff = DateOnly.FromDateTime(now.Date).AddDays(-_retentionDays);
 
         foreach (string path in Directory.EnumerateFiles(_directory, FileNamePrefix + "*" + FileNameExtension))
         {
@@ -97,8 +115,8 @@ public sealed class FileLog : ILog
 
             // Invariant, pairing FileNameFor: parsing under CurrentCulture would reject the names
             // this app writes on any non-Gregorian calendar, and retention would silently stop.
-            if (!DateTimeOffset.TryParseExact(stamp, "yyyyMMdd", CultureInfo.InvariantCulture,
-                    DateTimeStyles.AssumeUniversal, out DateTimeOffset day)
+            if (!DateOnly.TryParseExact(stamp, "yyyyMMdd", CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out DateOnly day)
                 || day >= cutoff)
             {
                 continue;

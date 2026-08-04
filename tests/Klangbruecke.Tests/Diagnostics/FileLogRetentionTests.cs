@@ -53,6 +53,91 @@ public sealed class FileLogRetentionTests : IDisposable
     }
 
     [Fact]
+    public void Write_KeepsAFileExactlyOnTheRetentionBoundary()
+    {
+        SeedLogFor(At(2026, 7, 28));   // exactly 7 days before "now"
+        var now = At(2026, 8, 4);
+
+        new FileLog(_dir, retentionDays: 7, clock: () => now).Write(LogLevel.Info, "today");
+
+        // Deliberate: "older than seven days" excludes the file that is seven days old.
+        Assert.True(File.Exists(Path.Combine(_dir, "klangbruecke-20260728.log")));
+    }
+
+    [Fact]
+    public void Write_DeletesTheFirstFilePastTheRetentionBoundary()
+    {
+        SeedLogFor(At(2026, 7, 27));   // 8 days before "now"
+        var now = At(2026, 8, 4);
+
+        new FileLog(_dir, retentionDays: 7, clock: () => now).Write(LogLevel.Info, "today");
+
+        Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260727.log")));
+    }
+
+    [Theory]
+    [InlineData(0, 5, 0)]      // just after midnight
+    [InlineData(23, 55, 0)]    // just before midnight
+    [InlineData(20, 0, -8)]    // an evening on the US west coast
+    [InlineData(9, 0, 13)]     // a morning in New Zealand
+    public void Write_DrawsTheBoundaryByDate_NotByTimeOfDayOrOffset(int hour, int minute, int offsetHours)
+    {
+        SeedLogFor(At(2026, 7, 28));   // the boundary day
+        SeedLogFor(At(2026, 7, 27));   // one day past it
+        var now = new DateTimeOffset(2026, 8, 4, hour, minute, 0, TimeSpan.FromHours(offsetHours));
+
+        new FileLog(_dir, retentionDays: 7, clock: () => now).Write(LogLevel.Info, "today");
+
+        // Whatever the clock reads and wherever the machine sits, the same seven days survive.
+        Assert.True(File.Exists(Path.Combine(_dir, "klangbruecke-20260728.log")));
+        Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260727.log")));
+    }
+
+    [Fact]
+    public void Write_PrunesOncePerDay_NotOncePerWrite()
+    {
+        var now = At(2026, 8, 4);
+        var log = new FileLog(_dir, retentionDays: 7, clock: () => now);
+        log.Write(LogLevel.Info, "first");
+
+        SeedLogFor(At(2026, 7, 20));
+        log.Write(LogLevel.Info, "second");
+
+        // Sweeping the directory on every line would cost a disk enumeration per log statement.
+        Assert.True(File.Exists(Path.Combine(_dir, "klangbruecke-20260720.log")));
+    }
+
+    [Fact]
+    public void Write_PrunesAgainOnTheNextDay_NotOncePerProcess()
+    {
+        var now = At(2026, 8, 4);
+        var log = new FileLog(_dir, retentionDays: 7, clock: () => now);
+        log.Write(LogLevel.Info, "first");
+
+        SeedLogFor(At(2026, 7, 20));
+        now = At(2026, 8, 5);
+        log.Write(LogLevel.Info, "next day");
+
+        // The app runs for weeks between reboots; a sweep that fires once per process never
+        // reaches the files that expire while it is running.
+        Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260720.log")));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Write_WithANonsensicalRetentionWindow_KeepsTheFileItIsWritingTo(int retentionDays)
+    {
+        SeedLogFor(At(2026, 8, 4));
+
+        new FileLog(_dir, retentionDays, clock: () => At(2026, 8, 4)).Write(LogLevel.Info, "today");
+
+        string text = File.ReadAllText(Path.Combine(_dir, "klangbruecke-20260804.log"));
+        Assert.Contains("seeded", text);
+        Assert.Contains("today", text);
+    }
+
+    [Fact]
     public void Write_IgnoresUnrelatedFilesInTheDirectory()
     {
         Directory.CreateDirectory(_dir);
@@ -80,6 +165,7 @@ public sealed class FileLogRetentionTests : IDisposable
     [Fact]
     public void Write_SurvivesAnExpiredFileThatCannotBeDeleted()
     {
+        SeedLogFor(At(2026, 7, 19));
         SeedLogFor(At(2026, 7, 20));
         SeedLogFor(At(2026, 7, 21));
         string locked = Path.Combine(_dir, "klangbruecke-20260720.log");
@@ -90,7 +176,9 @@ public sealed class FileLogRetentionTests : IDisposable
         }
 
         // The line matters more than the disk space, and one held file must not shelter the rest.
+        // Seeded on both sides of the locked file because EnumerateFiles promises no ordering.
         Assert.Contains("today", File.ReadAllText(Path.Combine(_dir, "klangbruecke-20260804.log")));
+        Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260719.log")));
         Assert.False(File.Exists(Path.Combine(_dir, "klangbruecke-20260721.log")));
     }
 
