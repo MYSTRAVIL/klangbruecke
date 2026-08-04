@@ -33,6 +33,11 @@ public sealed class ControlUiDispatcher : IUiDispatcher, IDisposable
         _marshaller.Visible = false;
 
         // Forces handle creation. Without a handle there is nothing to marshal to.
+        //
+        // It has to be this and not the more obvious CreateControl(): that call is gated on
+        // visibility, so with the line above it returns having done nothing, and this class then
+        // silently degrades to running every action inline on the caller's thread - the exact bug it
+        // exists to fix, with no test failure to show for it.
         _ = _marshaller.Handle;
     }
 

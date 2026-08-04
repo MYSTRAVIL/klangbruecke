@@ -1,7 +1,6 @@
 using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
-using Klangbruecke.Diagnostics;
 using NAudio.CoreAudioApi;
 using Windows.Devices.Enumeration;
 
@@ -23,7 +22,7 @@ internal sealed class TrayContext : ApplicationContext
     // the UI thread, since Program.Main is what does it.
     private readonly ControlUiDispatcher _ui = new();
 
-    private string _lastStatus = "Idle";
+    private readonly StatusPresenter _status;
 
     public TrayContext()
     {
@@ -41,6 +40,10 @@ internal sealed class TrayContext : ApplicationContext
             ContextMenuStrip = new ContextMenuStrip(),
         };
 
+        // After the icon, whose Text it writes. Nothing raises status before this point: the
+        // services subscribed above are not started until ConnectAsync at the end of this ctor.
+        _status = new StatusPresenter(_ui, text => _icon.Text = text);
+
         _icon.ContextMenuStrip.Opening += async (s, e) =>
         {
             e.Cancel = true;
@@ -54,41 +57,14 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
-    private void SetStatus(string message)
-    {
-        // Logged where the status arrives rather than inside the post below: the log is a record of
-        // what happened, not of what the tooltip ended up saying, and an update dropped during
-        // shutdown must still leave a line behind - shutdown is when one is worth most.
-        Log.Info(message);
-
-        // Reached from the WinRT threadpool and from NAudio callbacks; touching the icon
-        // off the UI thread throws intermittently rather than failing cleanly.
-        _ui.Post(() =>
-        {
-            // Assigned here, not above, so the menu that reads it and the tooltip change together
-            // on the UI thread. A menu opening is queued behind an already-posted update, so the
-            // two cannot disagree.
-            _lastStatus = message;
-
-            // Status text interpolates exception messages, so its length is unbounded, while
-            // NotifyIcon.Text throws ArgumentOutOfRangeException past 127 characters - measured, not
-            // assumed. An unguarded assignment would therefore throw from inside this callback, on
-            // the UI thread, which is the failure the dispatcher above exists to prevent. The cap is
-            // set well below 127 because a tooltip that long is unreadable anyway; the composed
-            // string is what gets measured, so the prefix cannot be forgotten in the arithmetic.
-            const int maxTooltip = 96;
-
-            string tooltip = $"Klangbruecke: {message}";
-            _icon.Text = tooltip.Length > maxTooltip ? $"{tooltip[..(maxTooltip - 3)]}..." : tooltip;
-        });
-    }
+    private void SetStatus(string message) => _status.Show(message);
 
     private async Task RebuildMenuAsync()
     {
         ContextMenuStrip menu = _icon.ContextMenuStrip!;
         menu.Items.Clear();
 
-        menu.Items.Add(new ToolStripMenuItem(_lastStatus) { Enabled = false });
+        menu.Items.Add(new ToolStripMenuItem(_status.Last) { Enabled = false });
         menu.Items.Add(new ToolStripSeparator());
 
         // --- phones ---
