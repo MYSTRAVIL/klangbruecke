@@ -865,7 +865,23 @@ git commit -m "Marshal tray status updates onto the UI thread"
 
 ---
 
-### Task 5: Resample when capture and render formats differ
+### Task 5: Log the capture/render format pair, and stop failing silently
+
+> **WARNING — this task as originally written was wrong and was reverted during execution.**
+> Everything below that inserts a `MediaFoundationResampler` is **harmful**; do not re-execute it.
+> Verified against decompiled NAudio 2.2.1: `WasapiOut.Init`'s DMO-fallback block is inside
+> `if (shareMode == Exclusive)` and never runs here, shared mode already passes
+> `SrcDefaultQuality | AutoConvertPcm` to `AudioClient.Initialize`, and
+> `MediaFoundationTransform` pulls a fixed one second from a 500 ms buffer — a structural 1 Hz
+> chop that destroys half the audio. `RequiresResampling` was additionally a tautology, comparing
+> a normalized `IeeeFloat` against a raw `Extensible`.
+>
+> What shipped instead: `AudioFormatBridge.Differ` (both sides normalized, diagnostic only),
+> the capture/render format pair logged **unconditionally** at `Start`, a `PlaybackStopped`
+> subscription (nothing had one, so play-thread failures were invisible), and an exception-safe
+> `Stop()`. See the corrected spec section and commit `d16f423`.
+
+#### Original text, superseded — kept for the record
 
 **Files:**
 - Create: `src/Klangbruecke/Audio/AudioFormatBridge.cs`
