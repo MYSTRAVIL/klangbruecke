@@ -242,7 +242,8 @@ need a phone. Table-driven tests over (state, event) → (next state, action), d
 `ConnectionManager` through fakes for the three service interfaces.
 
 Everything else — WinRT, WASAPI — is verified by hand against the OS. There is no test project
-today; Stage 1 adds an xunit project.
+today; Stage 0 adds an xunit project, because Stage 0 is itself written test-first and has nowhere
+else to put its tests.
 
 ### Stage 2 matrix
 
@@ -277,10 +278,16 @@ Each row verified by hand, with the log as evidence:
 New:
 
 ```
-src/Klangbruecke/Connection/ConnectionManager.cs
-src/Klangbruecke/Connection/ConnectionState.cs
-src/Klangbruecke/Diagnostics/Log.cs
-tests/Klangbruecke.Tests/                        (Stage 1)
+src/Klangbruecke/Connection/ConnectionManager.cs   (Stage 1)
+src/Klangbruecke/Connection/ConnectionState.cs     (Stage 1)
+src/Klangbruecke/Diagnostics/Log.cs                (Stage 0)
+src/Klangbruecke/Diagnostics/FileLog.cs            (Stage 0)
+src/Klangbruecke/Audio/AudioFormatBridge.cs        (Stage 0)
+src/Klangbruecke/Bluetooth/BluetoothDeviceId.cs    (Stage 0)
+src/Klangbruecke/Platform/PackageIdentity.cs       (Stage 0)
+src/Klangbruecke/Platform/CallsPolicy.cs           (Stage 0)
+src/Klangbruecke/UiDispatcher.cs                   (Stage 0)
+tests/Klangbruecke.Tests/                          (Stage 0)
 ```
 
 Modified: `TrayContext.cs` (orchestration out, view only), `AudioSinkService.cs` (DeviceWatcher,
