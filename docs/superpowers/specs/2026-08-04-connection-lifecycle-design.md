@@ -335,3 +335,85 @@ exceptions).
 
 `TrayContext.cs` is 228 lines and is currently the only orchestrator; moving connection logic out
 is what keeps it reviewable, not incidental cleanup.
+
+---
+
+## What Stage 0 learned that Stage 1 must honour
+
+Stage 0 shipped (153 tests, branch `stage-0-instrumentation`). These are the constraints it
+discovered empirically. They are not in the git history in this form, and several contradict what
+this document originally assumed.
+
+### Hard facts, verified on this machine
+
+- **`AudioPlaybackConnection.TryCreateFromId` terminates an unpackaged process** with an
+  `AccessViolationException` inside the CsWinRT ABI shim — a corrupted-state exception no managed
+  handler can catch or log. `docs/FINDINGS.md` §8. `AudioSinkPolicy` gates it in two places; **do
+  not remove either "to let it try"**. There is no unpackaged dev loop for the music half.
+- **Discovery works unpackaged**: `GetDeviceSelector()`, `FindAllAsync`, `PhoneLineTransportDevice.FromId`
+  and `IsRegistered()` all succeed without identity. Only registration is expected to need it.
+- **Correlation works on real hardware.** Both selectors return `BTHENUM` interfaces carrying the
+  same address; the app's log shows `AddressMatch`, not the single-candidate fallback. The
+  phone-line selector filters on `DeviceInstanceId` containing the HFP-AG service UUID, which
+  structurally guarantees the address is present.
+- Both devices also share a `System.Devices.ContainerId`, which links them to the MMDEVAPI
+  endpoints too — a stronger correlation key than the address, **but it is regenerated on
+  unpair/re-pair**, so never persist it as the phone's identity.
+- `DeviceInformation.Pairing.IsPaired` reads `false` unless `System.Devices.Aep.IsPaired` was
+  requested in `extraProps`. Any bare `FindAllAsync` result gives a false negative.
+- The MSIX disables Desktop Bridge write virtualization, which needs the `unvirtualizedResources`
+  restricted capability — **not encoded in the XSD**, so schema validation gives a false pass
+  (`FINDINGS.md` §9). Consequence: packaged and unpackaged runs share one log file, and uninstall
+  no longer removes logs or settings.
+
+### The largest risk Stage 1 inherits
+
+`AudioRouter` constructs `WasapiCapture`/`WasapiOut` inline with no seam, so **none of its
+behaviour is testable**. Five properties there are load-bearing and defended by comments alone —
+reverting any one leaves all 153 tests green:
+
+1. `_session` published before `StartRecording`/`Play`
+2. `EndSession()` called before `Report()` in both stopped handlers
+3. `_session = null` before the unsubscribes in `Stop()`
+4. the stale-session check inside the posted teardown lambda
+5. the `ReferenceEquals(sender, …)` guards
+
+**Two real defects were found there by live hardware probes after surviving three review rounds
+each.** Treat "reviewed repeatedly" as weak evidence for anything behind that seam. Introducing the
+`IAudioSinkService`/`ICallTransportService`/`IAudioRouter` interfaces this document already
+specifies is what makes it guardable — that is the point of them, not tidiness.
+
+Related: `NAudio`'s `WasapiOut` raises `PlaybackStopped` **on the play thread** when no
+`SynchronizationContext` was captured, and `PlayThread` assigns `Stopped` only on its one clean
+fall-through. So a handler that calls `Stop()`/`Dispose()` self-joins and deadlocks, and every
+abnormal exit — including `audioClient.Stop()` throwing when the phone leaves range — lands in that
+window. Teardown is posted through `IUiDispatcher` for this reason. **Any Stage 1 auto-reconnect
+that calls `Start()` from a threadpool thread would have hit this**; production avoided it only by
+field-initializer ordering.
+
+### Smaller carry-forwards
+
+- **Nothing restarts the route after teardown.** Audio stays down until the user re-picks. This is
+  the retry gap `ConnectionManager` exists to close.
+- `AudioRouter.Start()` returns `true` for a source that cannot capture — the capture thread dies
+  asynchronously. Retry logic that trusts the return value will loop.
+- `FileLog.Write` does synchronous file I/O under a lock. Harmless today because nothing logs from
+  the audio hot path. **If the reconcile loop or a capture callback ever logs, it needs a queue and
+  a single writer thread first**, or it becomes an audio dropout.
+- `Application.ThreadException`'s add accessor **overwrites** rather than combines. A second
+  subscriber silently drops the first.
+- `StatusPresenter.Last` is written on the UI thread inside the post. Even `volatile` does not stop
+  a cross-thread reader observing it a few instructions before the tooltip write.
+- `Settings.EnableCalls` toggled off skips `_calls.Disconnect()`, so an existing registration
+  survives the setting change until the next connect.
+- "Route calls to PC" shows checked while calls do nothing unpackaged. Wants a UI answer, not
+  another status line.
+- `TrayContext` subscribes the three `Status` handlers before `_status` is assigned; safe only by
+  current call ordering.
+
+### Process note
+
+Stage 0's plan embedded complete code for each task. Eight defects were found, **all eight in the
+plan text, none in the implementations** — the plan got one self-review while the code got a
+dedicated adversarial reviewer per task. Stage 1's plan should specify interfaces, test cases and
+constraints, and let implementers write the bodies.
