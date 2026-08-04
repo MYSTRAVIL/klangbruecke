@@ -165,7 +165,7 @@ public sealed class FileLogTests : IDisposable
         // A path containing a NUL character cannot be created on any Windows volume.
         var log = new FileLog("\0invalid\0", clock: () => At(2026, 8, 4));
 
-        log.Write(LogLevel.Error, "should not throw");
+        Assert.Null(Record.Exception(() => log.Write(LogLevel.Error, "should not throw")));
     }
 
     public void Dispose()
@@ -524,7 +524,7 @@ public sealed class LogTests : IDisposable
     [Fact]
     public void NullLog_AcceptsWritesWithoutThrowing()
     {
-        new NullLog().Write(LogLevel.Error, "nowhere", new Exception("x"));
+        Assert.Null(Record.Exception(() => new NullLog().Write(LogLevel.Error, "nowhere", new Exception("x"))));
     }
 
     public void Dispose() => Log.Current = _original;
@@ -724,7 +724,10 @@ public sealed class UiDispatcherTests
             var dispatcher = new ControlUiDispatcher();
             dispatcher.Dispose();
 
-            dispatcher.Post(() => throw new InvalidOperationException("must not run"));
+            // The action must be dropped, not run: a disposed dispatcher has no UI thread left
+            // to marshal onto.
+            Assert.Null(Record.Exception(
+                () => dispatcher.Post(() => throw new InvalidOperationException("must not run"))));
         });
     }
 }
