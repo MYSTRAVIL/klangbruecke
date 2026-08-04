@@ -1,6 +1,7 @@
 using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
+using Klangbruecke.Diagnostics;
 using NAudio.CoreAudioApi;
 using Windows.Devices.Enumeration;
 
@@ -17,6 +18,10 @@ internal sealed class TrayContext : ApplicationContext
     private readonly AudioSinkService _sink = new();
     private readonly CallTransportService _calls = new();
     private readonly AudioRouter _router = new();
+
+    // Field initializer, so the marshalling control is built on the thread that constructs this -
+    // the UI thread, since Program.Main is what does it.
+    private readonly ControlUiDispatcher _ui = new();
 
     private string _lastStatus = "Idle";
 
@@ -51,10 +56,23 @@ internal sealed class TrayContext : ApplicationContext
 
     private void SetStatus(string message)
     {
-        _lastStatus = message;
+        // Logged where the status arrives rather than inside the post below: the log is a record of
+        // what happened, not of what the tooltip ended up saying, and an update dropped during
+        // shutdown must still leave a line behind - shutdown is when one is worth most.
+        Log.Info(message);
 
-        // Tray tooltips are capped at 63 characters.
-        _icon.Text = message.Length > 60 ? $"Klangbruecke: {message[..57]}..." : $"Klangbruecke: {message}";
+        // Reached from the WinRT threadpool and from NAudio callbacks; touching the icon
+        // off the UI thread throws intermittently rather than failing cleanly.
+        _ui.Post(() =>
+        {
+            // Assigned here, not above, so the menu that reads it and the tooltip change together
+            // on the UI thread. A menu opening is queued behind an already-posted update, so the
+            // two cannot disagree.
+            _lastStatus = message;
+
+            // Tray tooltips are capped at 63 characters.
+            _icon.Text = message.Length > 60 ? $"Klangbruecke: {message[..57]}..." : $"Klangbruecke: {message}";
+        });
     }
 
     private async Task RebuildMenuAsync()
@@ -219,6 +237,11 @@ internal sealed class TrayContext : ApplicationContext
             _router.Dispose();
             _sink.Dispose();
             _calls.Dispose();
+
+            // After the three above, whose teardown still raises status, and before the icon:
+            // disposing it drops any queued update that would otherwise reach a dead icon.
+            _ui.Dispose();
+
             _icon.Visible = false;
             _icon.Dispose();
         }
