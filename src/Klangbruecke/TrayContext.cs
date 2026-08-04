@@ -300,7 +300,11 @@ internal sealed class TrayContext : ApplicationContext
                 return;
             }
 
-            await _calls.ConnectAsync(result.Match.Value.Id);
+            // Symmetric with the music half's "A2DP connect ..." line. Discarding this left the
+            // calls half with no single line saying whether it came up - the reader had to infer it
+            // from which of the service's own messages happened to be last.
+            bool callsOk = await _calls.ConnectAsync(result.Match.Value.Id);
+            Log.Info($"Call transport connect {(callsOk ? "succeeded" : "failed")}.");
         }
         catch (Exception ex)
         {
