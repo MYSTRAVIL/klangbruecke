@@ -1,6 +1,5 @@
 using Klangbruecke.Diagnostics;
 using NAudio.CoreAudioApi;
-using NAudio.MediaFoundation;
 using NAudio.Wave;
 
 namespace Klangbruecke.Audio;
@@ -16,7 +15,6 @@ public sealed class AudioRouter : IDisposable
     private WasapiCapture? _capture;
     private WasapiOut? _output;
     private BufferedWaveProvider? _buffer;
-    private MediaFoundationResampler? _resampler;
     private bool _disposed;
 
     public bool IsRunning { get; private set; }
@@ -84,24 +82,19 @@ public sealed class AudioRouter : IDisposable
             _capture.RecordingStopped += OnRecordingStopped;
 
             outputFormat = sink.AudioClient.MixFormat;
-            IWaveProvider playbackSource = _buffer;
 
-            if (AudioFormatBridge.RequiresResampling(_capture.WaveFormat, outputFormat))
-            {
-                // Idempotent: NAudio guards it with a static flag. There is deliberately no
-                // matching Shutdown - it is process-global and not reference counted, so calling
-                // it in Stop would tear Media Foundation out from under any resampler that
-                // outlived this router. Reconnects call Start repeatedly; MF lives for the process.
-                MediaFoundationApi.Startup();
-                _resampler = new MediaFoundationResampler(_buffer, outputFormat) { ResamplerQuality = 60 };
-                playbackSource = _resampler;
-
-                Log.Info($"Resampling {AudioFormatBridge.Describe(_capture.WaveFormat)} -> " +
-                         $"{AudioFormatBridge.Describe(outputFormat)}.");
-            }
+            // Unconditional. This pair is the first thing anyone needs when routing misbehaves on
+            // hardware that cannot be reproduced here, and it is worth as much when the formats
+            // match as when they do not.
+            Log.Info($"Capture={AudioFormatBridge.Describe(_capture.WaveFormat)} " +
+                     $"Render={AudioFormatBridge.Describe(outputFormat)}" +
+                     (AudioFormatBridge.Differ(_capture.WaveFormat, outputFormat)
+                         ? " - differ, WASAPI shared mode is converting."
+                         : " - matched."));
 
             _output = new WasapiOut(sink, AudioClientShareMode.Shared, useEventSync: true, latency: 50);
-            _output.Init(playbackSource);
+            _output.PlaybackStopped += OnPlaybackStopped;
+            _output.Init(_buffer);
 
             _capture.StartRecording();
             _output.Play();
@@ -112,12 +105,12 @@ public sealed class AudioRouter : IDisposable
         }
         catch (Exception ex)
         {
-            // Log both formats: a format mismatch that survives the resampler is the likeliest
-            // cause and is invisible from the message alone.
+            // Repeat both formats here rather than relying on the Info line above: the failure can
+            // be the MixFormat read itself, in which case that line never ran.
             string capture = _capture is null ? "unknown" : AudioFormatBridge.Describe(_capture.WaveFormat);
-            string output = outputFormat is null ? "unknown" : AudioFormatBridge.Describe(outputFormat);
+            string render = outputFormat is null ? "unknown" : AudioFormatBridge.Describe(outputFormat);
 
-            Log.Error($"Routing failed. Capture={capture} Output={output}", ex);
+            Log.Error($"Routing failed. Capture={capture} Render={render}", ex);
 
             Report($"Could not start routing: {ex.Message}");
             Stop();
@@ -134,7 +127,30 @@ public sealed class AudioRouter : IDisposable
     {
         if (e.Exception is not null)
         {
+            Log.Error("Capture stopped.", e.Exception);
             Report($"Capture stopped: {e.Exception.Message}");
+        }
+
+        IsRunning = false;
+    }
+
+    /// <summary>
+    /// WasapiOut turns play-thread failures into this event and nothing else. Unhandled, a dead
+    /// stream leaves IsRunning set and the tray still claiming it is routing.
+    /// </summary>
+    private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
+    {
+        // Raised via SynchronizationContext.Post, so it can arrive after Stop dropped this output
+        // or a later Start replaced it. Clearing IsRunning then would report the wrong session dead.
+        if (!ReferenceEquals(sender, _output))
+        {
+            return;
+        }
+
+        if (e.Exception is not null)
+        {
+            Log.Error("Playback stopped.", e.Exception);
+            Report($"Playback stopped: {e.Exception.Message}");
         }
 
         IsRunning = false;
@@ -147,29 +163,43 @@ public sealed class AudioRouter : IDisposable
             _capture.DataAvailable -= OnDataAvailable;
             _capture.RecordingStopped -= OnRecordingStopped;
 
-            try
-            {
-                _capture.StopRecording();
-            }
-            catch (Exception)
-            {
-                // Already stopped or the endpoint vanished with the connection.
-            }
-
-            _capture.Dispose();
+            // Already stopped, or the endpoint vanished with the connection.
+            Quietly(_capture.StopRecording, "stop capture");
+            Quietly(_capture.Dispose, "dispose capture");
             _capture = null;
         }
 
-        // Order matters: WasapiOut.Dispose joins its render thread, and that thread is what pulls
-        // from the resampler. Releasing the resampler first would free it mid-read.
-        _output?.Dispose();
-        _output = null;
+        if (_output is not null)
+        {
+            // Before Dispose, which joins the play thread that raises it. A deliberate teardown is
+            // not a failure, and reporting it as one would overwrite the real status.
+            _output.PlaybackStopped -= OnPlaybackStopped;
 
-        _resampler?.Dispose();
-        _resampler = null;
+            Quietly(_output.Dispose, "dispose output");
+            _output = null;
+        }
 
         _buffer = null;
         IsRunning = false;
+    }
+
+    /// <summary>
+    /// Teardown must finish even if a step fails. Stop runs from Start's catch block and from
+    /// TrayContext.Dispose - the latter during Application.Run teardown, outside the message loop's
+    /// exception guard, where a throw escapes Main and dies with a WER dialog. A throw that skipped
+    /// the null-out after it would also leave a dead object in the field, so every later Start
+    /// would fail on it and routing would never recover without a restart.
+    /// </summary>
+    private static void Quietly(Action step, string what)
+    {
+        try
+        {
+            step();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Ignoring failure to {what}: {ex.Message}");
+        }
     }
 
     public void Dispose()
