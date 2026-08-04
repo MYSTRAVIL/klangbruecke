@@ -298,7 +298,7 @@ git commit -m "Add test project and rolling file log"
 
 **Interfaces:**
 - Consumes: `FileLog(string directory, int retentionDays = 7, Func<DateTimeOffset>? clock = null)`, `FileLog.FileNameFor(DateTimeOffset)` from Task 1.
-- Produces: no new public API. `FileLog` prunes files older than `retentionDays` on the first write of each day.
+- Produces: no new public API. On the first write of each day, `FileLog` prunes so that exactly `retentionDays` dated files remain (today through today minus `retentionDays` - 1). `retentionDays` is a **file count**, not an age threshold — the ambiguity between those two readings cost a fix round.
 
 - [ ] **Step 1: Write the failing tests**
 
