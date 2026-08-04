@@ -20,7 +20,7 @@ public sealed class StatusPresenter
     private readonly IUiDispatcher _ui;
     private readonly Action<string> _write;
 
-    private string _last = "Idle";
+    private volatile string _last = "Idle";
 
     public StatusPresenter(IUiDispatcher ui, Action<string> write)
     {
@@ -29,8 +29,17 @@ public sealed class StatusPresenter
     }
 
     /// <summary>
-    /// The message the tooltip is currently showing, for the menu to repeat. Assigned and read on the
-    /// UI thread only, which is what keeps it consistent with the tooltip without synchronization.
+    /// The message the tooltip is currently showing, for the menu to repeat.
+    ///
+    /// Assigned inside the posted callback rather than when the status arrives, so it and the tooltip
+    /// change in the same UI-thread turn and the menu can never contradict the tray.
+    ///
+    /// The field is volatile because nothing structurally confines callers to the UI thread. A
+    /// reference assignment is already atomic, so the risk was never a torn read; it was that without
+    /// an acquire/release edge a reader on another thread has no guarantee of ever seeing the new
+    /// value, and a read inside a polling loop can be hoisted out of it entirely. Volatile does not
+    /// make this atomic with the tooltip write - a cross-thread reader can still catch it in the few
+    /// instructions before the sink runs - but the two converge within the same callback.
     /// </summary>
     public string Last => _last;
 

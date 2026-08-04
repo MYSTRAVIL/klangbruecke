@@ -4,12 +4,18 @@ using Xunit;
 
 namespace Klangbruecke.Tests;
 
-/// <summary>Captures the posted action instead of running it, so "did it go through Post?" is observable.</summary>
+/// <summary>
+/// Captures posted actions instead of running them, so "did it go through Post?" is observable at
+/// all - no assertion on the sink alone can distinguish a posted write from a direct one.
+///
+/// Every action is kept, not just the latest: a double that overwrote would let a multi-Show test
+/// silently exercise only its final call and prove less than it appeared to.
+/// </summary>
 file sealed class DeferringUiDispatcher : IUiDispatcher
 {
-    public Action? Captured { get; private set; }
+    public List<Action> Captured { get; } = new();
 
-    public void Post(Action action) => Captured = action;
+    public void Post(Action action) => Captured.Add(action);
 }
 
 /// <summary>Stands in for a dispatcher disposed mid-shutdown, which drops what it is handed.</summary>
@@ -43,7 +49,8 @@ public sealed class StatusPresenterTests
         // happened while the posted action is still sitting unrun.
         Assert.Empty(written);
 
-        ui.Captured!();
+        Assert.Single(ui.Captured);
+        ui.Captured[0]();
 
         Assert.Equal(new[] { "Klangbruecke: connected" }, written);
     }
@@ -98,9 +105,31 @@ public sealed class StatusPresenterTests
         // the tooltip disagree, and would write it from whichever thread raised the status.
         Assert.Equal("Idle", presenter.Last);
 
-        ui.Captured!();
+        ui.Captured[0]();
 
         Assert.Equal("connected", presenter.Last);
+    }
+
+    [Fact]
+    public void Show_PostsOncePerCall()
+    {
+        var ui = new DeferringUiDispatcher();
+        StatusPresenter presenter = Presenter(ui, out List<string> written);
+
+        presenter.Show("first");
+        presenter.Show("second");
+
+        Assert.Equal(2, ui.Captured.Count);
+
+        foreach (Action post in ui.Captured)
+        {
+            post();
+        }
+
+        // Both calls survive and keep their order. A dispatcher double that held only the latest
+        // action would drop the first silently, which is the weakness this asserts against.
+        Assert.Equal(new[] { "Klangbruecke: first", "Klangbruecke: second" }, written);
+        Assert.Equal("second", presenter.Last);
     }
 
     [Fact]
