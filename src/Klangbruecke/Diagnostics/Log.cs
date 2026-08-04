@@ -14,16 +14,12 @@ public sealed class NullLog : ILog
 /// </summary>
 public static class Log
 {
+    // Unsynchronized on purpose. The app assigns this once, in Main, before the WinRT and NAudio
+    // threads that read it exist; the readers race only with each other, and a reference read is
+    // atomic, so none of them can see a half-assigned log.
     private static ILog _current = new NullLog();
 
-    /// <summary>
-    /// Settable so tests can swap in a recording fake.
-    ///
-    /// No lock: the writes this races with are reads of a reference field, which are atomic, so no
-    /// caller can observe a half-assigned log. Nor a stale one - the app's single real assignment
-    /// happens in Main before the WinRT and NAudio threads that log exist, and starting a thread
-    /// publishes everything written before it.
-    /// </summary>
+    /// <summary>Settable so tests can swap in a recording fake.</summary>
     public static ILog Current
     {
         get => _current;

@@ -31,7 +31,7 @@ public sealed class LogTests : IDisposable
     {
         Log.Warn("no transport matched");
 
-        Assert.Equal(LogLevel.Warn, _recording.Entries[0].Level);
+        Assert.Equal((LogLevel.Warn, "no transport matched"), (_recording.Entries[0].Level, _recording.Entries[0].Message));
     }
 
     [Fact]
@@ -41,7 +41,7 @@ public sealed class LogTests : IDisposable
 
         Log.Error("routing failed", boom);
 
-        Assert.Equal(LogLevel.Error, _recording.Entries[0].Level);
+        Assert.Equal((LogLevel.Error, "routing failed"), (_recording.Entries[0].Level, _recording.Entries[0].Message));
         Assert.Same(boom, _recording.Entries[0].Exception);
     }
 
@@ -82,4 +82,18 @@ public sealed class LogTests : IDisposable
     }
 
     public void Dispose() => Log.Current = _original;
+}
+
+// Separate class because LogTests replaces Log.Current in its constructor, so it can never observe
+// the default. Every other test in the assembly restores what it swapped, and collections do not
+// run in parallel, so the default is what is current here.
+public sealed class LogDefaultTests
+{
+    [Fact]
+    public void Current_BeforeStartupConfiguresIt_IsADiscardingLog_NotNull()
+    {
+        // Call sites log unconditionally, and static initializers and Main's own early lines run
+        // before Log.Current is assigned. A null default would make those the app's first crash.
+        Assert.IsType<NullLog>(Log.Current);
+    }
 }
