@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Klangbruecke.Diagnostics;
 
 namespace Klangbruecke.Config;
 
@@ -40,7 +41,9 @@ public sealed class Settings
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
-            // Corrupt or unreadable settings must not stop the app starting.
+            // Corrupt or unreadable settings must not stop the app starting - but silently starting
+            // from defaults presents as "it forgot my phone", which reads like a Bluetooth fault.
+            Log.Warn($"Could not read settings, starting from defaults: {ex.Message}");
         }
 
         return new Settings();
@@ -55,7 +58,9 @@ public sealed class Settings
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Best effort.
+            // Best effort - the run continues on the in-memory copy. The cost lands at the next start,
+            // as a selection that did not stick, so the record of it has to be made here.
+            Log.Warn($"Could not save settings: {ex.Message}");
         }
     }
 }

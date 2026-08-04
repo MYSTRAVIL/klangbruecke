@@ -2,6 +2,7 @@ using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
 using Klangbruecke.Diagnostics;
+using Klangbruecke.Platform;
 using NAudio.CoreAudioApi;
 using Windows.Devices.Enumeration;
 
@@ -61,7 +62,13 @@ internal sealed class TrayContext : ApplicationContext
 
         if (_settings.PhoneDeviceId is not null)
         {
-            _ = ConnectAsync(_settings.PhoneDeviceId);
+            // Fire-and-forget by necessity - a constructor cannot await - but not unobserved.
+            // ConnectGuardedAsync catches for itself because the alternative is
+            // TaskScheduler.UnobservedTaskException, which fires when the Task is finalized: a
+            // reconnect that failed at startup could surface a collection later, or never, and
+            // reconnect-after-reboot is the predecessor app's defining bug. It is the one path that
+            // must not be able to fail quietly.
+            _ = ConnectGuardedAsync(_settings.PhoneDeviceId);
         }
     }
 
@@ -91,12 +98,16 @@ internal sealed class TrayContext : ApplicationContext
                 {
                     Checked = device.Id == _sink.ConnectedDeviceId,
                 };
-                item.Click += async (_, _) => await ConnectAsync(device.Id);
+                item.Click += async (_, _) => await ConnectGuardedAsync(device.Id);
                 phoneMenu.DropDownItems.Add(item);
             }
         }
         catch (Exception ex)
         {
+            // Logged as well as shown. A disabled menu item lives until the menu closes and takes the
+            // stack trace with it; the failure it describes - device enumeration throwing - is the
+            // first thing anyone reading the log will need, and it left no other trace.
+            Log.Error("Device enumeration for the phone menu failed.", ex);
             phoneMenu.DropDownItems.Add(new ToolStripMenuItem($"Enumeration failed: {ex.Message}") { Enabled = false });
         }
 
@@ -165,33 +176,97 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
+    /// <summary>
+    /// The only way in to <see cref="ConnectAsync"/>. Both call sites - the startup reconnect and a
+    /// menu click - are fire-and-forget, so an escaping exception would land somewhere that logs it
+    /// late or not at all; catching here makes every connect attempt account for itself.
+    /// </summary>
+    private async Task ConnectGuardedAsync(string deviceId)
+    {
+        try
+        {
+            await ConnectAsync(deviceId);
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Connect failed for id={deviceId}", ex);
+            SetStatus($"Connect failed: {ex.Message}");
+        }
+    }
+
     private async Task ConnectAsync(string deviceId)
     {
+        Log.Info($"Connect requested for id={deviceId}");
+
         _settings.PhoneDeviceId = deviceId;
         _settings.Save();
 
         bool sinkOk = await _sink.ConnectAsync(deviceId);
+        Log.Info($"A2DP connect {(sinkOk ? "succeeded" : "failed")}.");
+
         if (sinkOk)
         {
             StartRouting();
         }
 
-        if (_settings.EnableCalls)
+        await ConnectCallsAsync(deviceId);
+    }
+
+    /// <summary>
+    /// The calls half. Independent of the music half - one failing must not take out the other - and
+    /// deliberately not gated as a whole on the availability verdict: see <see cref="CallTransportPlan"/>
+    /// for why an unpackaged run still enumerates.
+    /// </summary>
+    private async Task ConnectCallsAsync(string phoneDeviceId)
+    {
+        CallsAvailability availability = CallsPolicy.Decide(_settings.EnableCalls, PackageIdentity.IsPackaged);
+
+        // Straight to the log rather than through SetStatus: the explanation runs to a couple of
+        // hundred characters and the tooltip caps at 96, so routing it through the tray would truncate
+        // the log copy too - and overwrite "A2DP sink connected" with a permanent condition the user
+        // cannot act on from the tray. The music status is the one worth showing there.
+        Log.Info(CallsPolicy.Explain(availability));
+
+        if (!CallTransportPlan.ShouldEnumerate(availability))
         {
-            // Independent of the music half - one failing must not take out the other.
-            try
+            return;
+        }
+
+        try
+        {
+            IReadOnlyList<DeviceInformation> transports = await CallTransportService.FindDevicesAsync();
+
+            TransportMatchResult result = TransportMatcher.Match(
+                transports.Select(t => new TransportCandidate(t.Id, t.Name)).ToList(),
+                phoneDeviceId);
+
+            if (result.Outcome == TransportMatchOutcome.AddressMatch)
             {
-                IReadOnlyList<DeviceInformation> transports = await CallTransportService.FindDevicesAsync();
-                DeviceInformation? match = transports.FirstOrDefault();
-                if (match is not null)
-                {
-                    await _calls.ConnectAsync(match.Id);
-                }
+                Log.Info(result.Reason);
             }
-            catch (Exception ex)
+            else
             {
-                SetStatus($"Call transport unavailable: {ex.Message}");
+                Log.Warn(result.Reason);
             }
+
+            if (!CallTransportPlan.ShouldRegister(availability))
+            {
+                Log.Info("Enumeration only: not registering or connecting the call transport.");
+                return;
+            }
+
+            if (result.Match is null)
+            {
+                SetStatus("No call transport matches the selected phone.");
+                return;
+            }
+
+            await _calls.ConnectAsync(result.Match.Value.Id);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Call transport enumeration failed.", ex);
+            SetStatus($"Call transport unavailable: {ex.Message}");
         }
     }
 
@@ -200,6 +275,9 @@ internal sealed class TrayContext : ApplicationContext
         MMDevice? source = AudioRouter.FindSinkCaptureEndpoint();
         if (source is null)
         {
+            // Per docs/FINDINGS.md §4 this is the expected state when nothing holds a connection open,
+            // not a bug. It is also exactly what a failed connect looks like, which is why the A2DP
+            // connect result is logged above rather than inferred from here.
             SetStatus("No A2DP sink endpoint - nothing is holding a connection open.");
             return;
         }
@@ -211,11 +289,19 @@ internal sealed class TrayContext : ApplicationContext
             return;
         }
 
+        // Both endpoint names, before the stream starts: a route that runs silently is almost always
+        // the right source paired with the wrong sink, and afterwards nothing says which two were used.
+        Log.Info($"Routing source='{source.FriendlyName}' sink='{sink.FriendlyName}'.");
+
         _router.Start(source, sink);
     }
 
     private void Disconnect()
     {
+        // Distinguishes a deliberate teardown from a dropped connection. Both end with the router
+        // stopped and the same endpoints gone; only this one was asked for.
+        Log.Info("Disconnect requested from the tray.");
+
         _router.Stop();
         _sink.Disconnect();
         _calls.Disconnect();

@@ -1,3 +1,4 @@
+using Klangbruecke.Diagnostics;
 using Windows.ApplicationModel.Calls;
 using Windows.Devices.Enumeration;
 
@@ -29,6 +30,16 @@ public sealed class CallTransportService : IDisposable
     {
         string selector = PhoneLineTransportDevice.GetDeviceSelector();
         DeviceInformationCollection devices = await DeviceInformation.FindAllAsync(selector);
+
+        // Runs unpackaged too, and the whole point of letting it: this list, in full, is the answer to
+        // whether the phone's transport is discoverable at all - the one calls-side fact a development
+        // run can establish before the packaged build ever claims the hands-free role.
+        Log.Info($"Phone-line selector matched {devices.Count} device(s).");
+        foreach (DeviceInformation device in devices)
+        {
+            Log.Info($"  Transport candidate '{device.Name}' id={device.Id}");
+        }
+
         return devices.ToList();
     }
 

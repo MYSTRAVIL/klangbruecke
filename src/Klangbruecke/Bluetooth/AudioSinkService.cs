@@ -1,3 +1,4 @@
+using Klangbruecke.Diagnostics;
 using Windows.Devices.Enumeration;
 using Windows.Media.Audio;
 
@@ -31,19 +32,41 @@ public sealed class AudioSinkService : IDisposable
     {
         string selector = AudioPlaybackConnection.GetDeviceSelector();
         DeviceInformationCollection devices = await DeviceInformation.FindAllAsync(selector);
+
+        // Logged in full, not counted. The id is the input to BluetoothDeviceId's address extraction
+        // and to the transport correlation built on it, so when either misbehaves the log has to carry
+        // the exact text that produced it - a name and a count cannot be re-run against a regex.
+        Log.Info($"A2DP selector matched {devices.Count} device(s).");
+        foreach (DeviceInformation device in devices)
+        {
+            Log.Info($"  A2DP candidate '{device.Name}' id={device.Id}");
+        }
+
         return devices.ToList();
     }
 
     public async Task<bool> ConnectAsync(string deviceId)
     {
+        Log.Info($"Opening A2DP sink connection to id={deviceId}");
+
         Disconnect();
 
+        // Bracketed by log lines rather than wrapped in a try, because unpackaged this call does not
+        // throw - it takes the process down with an AccessViolationException raised inside the CsWinRT
+        // ABI shim (ABI.Windows.Media.Audio.IAudioPlaybackConnectionStaticsMethods.TryCreateFromId).
+        // A corrupted-state exception runs no managed handler, so nothing here, in Program.Main's
+        // hooks, or in the log can record it after the fact. The only instrument left is absence: the
+        // "Opening A2DP sink connection" line above with no line below it means the process died
+        // inside this call. Reproduced with a valid live device id and with garbage, on STA and MTA,
+        // on two Windows SDK projection versions. See docs/FINDINGS.md §8.
         AudioPlaybackConnection? connection = AudioPlaybackConnection.TryCreateFromId(deviceId);
         if (connection is null)
         {
             Report("Could not create an audio playback connection for that device.");
             return false;
         }
+
+        Log.Info("Playback connection created; starting the listener.");
 
         _connection = connection;
         _connection.StateChanged += OnStateChanged;
@@ -76,6 +99,9 @@ public sealed class AudioSinkService : IDisposable
 
     private void OnStateChanged(AudioPlaybackConnection sender, object args)
     {
+        // Reports state only. Acting on a drop is Stage 1's job; recording it is this stage's - and
+        // Report is already a recording: StatusPresenter writes every status to the log before it
+        // touches the tray, so a Log call beside this one would only double the entry.
         Report($"A2DP sink state: {sender.State}");
     }
 
