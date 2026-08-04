@@ -12,6 +12,7 @@ Verified empirically on the target machine, 2026-08-04:
 
 - **Music** — AudioPlaybackConnector (third-party, abandoned) opened an `AudioPlaybackConnection`,
   which produced the recording endpoint `Line (<phone name> A2DP SNK)`. Audio routed fine.
+  It is a *packaged* app, and that turns out to matter — see §8.
 - **Calls** — Thy Phone (Store app, `InTheHandLtd.PearYourPhone` 1.0.39.0) routed a live cellular
   call to the PC headset. Mic worked. Caller audio worked.
 
@@ -128,3 +129,49 @@ Bluetooth\Audio\A2dp\Sink         Enabled=1
 Bluetooth\Audio\Hfp\HandsFree     Enabled=1  ProfileVersion=263 (HFP 1.7)
                                   RfcommServerChannel=2  BrsfSupportedFeatures=183
 ```
+
+## 8. `AudioPlaybackConnection.TryCreateFromId` kills an unpackaged process
+
+Found 2026-08-04 by the Stage 0 instrumentation, on its first real run against the phone.
+**`dotnet run` is not a usable development loop for the music half.**
+
+**Symptom:** the process disappears. No exception, no log line, no status, nothing in the app's own
+output — only an `Application Error` / `.NET Runtime` 1026 pair in the Windows Application log:
+
+```
+System.AccessViolationException: Attempted to read or write protected memory.
+   at ABI.Windows.Media.Audio.IAudioPlaybackConnectionStaticsMethods.TryCreateFromId(WinRT.IObjectReference, System.String)
+   at Windows.Media.Audio.AudioPlaybackConnection.TryCreateFromId(System.String)
+```
+
+An `AccessViolationException` is a corrupted-state exception: no managed handler runs. Neither
+`AppDomain.UnhandledException`, `Application.ThreadException`, nor a `try`/`catch` around the call
+can see it, so **it cannot be logged after the fact.** `AudioSinkService.ConnectAsync` therefore
+brackets the call with log lines — an `Opening A2DP sink connection to id=...` line with nothing
+after it is the fingerprint.
+
+**Verified, not assumed** — reproduced on every attempt, varying one thing at a time:
+
+| Varied | Values tried | Result |
+|---|---|---|
+| Device id | real live id from `FindAllAsync`; well-formed but nonexistent; arbitrary garbage | AV in all three |
+| Apartment | STA (WinForms UI thread, and an explicit STA thread) and MTA (test host) | AV in both |
+| SDK projection | `Microsoft.Windows.SDK.NET.Ref` 10.0.19041.56 and 10.0.22621.41 | AV in both |
+| Host | the tray app itself, and a plain xunit test host with no app code | AV in both |
+
+**What still works unpackaged:** `AudioPlaybackConnection.GetDeviceSelector()` plus
+`DeviceInformation.FindAllAsync` return the phone correctly, as do the phone-line equivalents. The
+statics interface is live and activating — only this one method on it faults.
+
+**Leading hypothesis, not verified:** `AudioPlaybackConnection` needs MSIX package identity, and
+without it the capability check faults instead of failing cleanly. Consistent with §1, where the
+music implementation observed working on this machine was a packaged Store app. Two consequences:
+
+- The next experiment is the **packaged** build, not a code change. Do not go hunting for a bug in
+  `AudioSinkService` — the same call crashes a bare test host with no app code in the frame.
+- Raising the Windows SDK projection version has been tried and does not help. Do not repeat it.
+
+**Trap:** `TrayContext.ConnectAsync` saves `PhoneDeviceId` *before* connecting. Once a phone has been
+picked, every later unpackaged launch auto-connects at startup, crashes, and does it again — the app
+is unusable until `%LOCALAPPDATA%\Klangbruecke\settings.json` is deleted by hand. What to do about
+that is Stage 1's call; knowing it is the point of this entry.
