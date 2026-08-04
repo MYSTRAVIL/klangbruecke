@@ -1,4 +1,5 @@
 using Klangbruecke.Diagnostics;
+using Klangbruecke.Platform;
 using Windows.Devices.Enumeration;
 using Windows.Media.Audio;
 
@@ -47,6 +48,16 @@ public sealed class AudioSinkService : IDisposable
 
     public async Task<bool> ConnectAsync(string deviceId)
     {
+        // Backstop, not the primary gate - TrayContext checks the same policy so it can log the
+        // reason once and skip the attempt cleanly. This one guards the call itself, because the
+        // failure mode is process death rather than a false return: a Stage 1 reconnect watcher that
+        // called straight into here without asking would silently reintroduce a bricked startup.
+        if (!AudioSinkPolicy.CanOpenConnection(PackageIdentity.IsPackaged))
+        {
+            Log.Warn(AudioSinkPolicy.Explain(isPackaged: false));
+            return false;
+        }
+
         Log.Info($"Opening A2DP sink connection to id={deviceId}");
 
         Disconnect();

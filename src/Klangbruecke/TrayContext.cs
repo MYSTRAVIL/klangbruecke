@@ -198,8 +198,33 @@ internal sealed class TrayContext : ApplicationContext
     {
         Log.Info($"Connect requested for id={deviceId}");
 
+        // Saved before either half is attempted, and deliberately still saved when the music half is
+        // skipped below: the choice is the user's answer to "which phone", not a record of what
+        // happened to connect, and the packaged build needs it on the next start.
         _settings.PhoneDeviceId = deviceId;
         _settings.Save();
+
+        await ConnectMusicAsync(deviceId);
+        await ConnectCallsAsync(deviceId);
+    }
+
+    /// <summary>
+    /// The music half. Gated on package identity for the same reason as the calls half but a blunter
+    /// consequence: unpackaged, the connect call kills the process outright rather than failing.
+    /// See <see cref="AudioSinkPolicy"/>.
+    /// </summary>
+    private async Task ConnectMusicAsync(string deviceId)
+    {
+        if (!AudioSinkPolicy.CanOpenConnection(PackageIdentity.IsPackaged))
+        {
+            Log.Warn(AudioSinkPolicy.Explain(PackageIdentity.IsPackaged));
+
+            // Worth the tooltip, unlike the calls explanation: there is no music status for it to
+            // overwrite, because unpackaged there is never any music. Without it the tray reads
+            // "Idle" forever and the app looks broken rather than incomplete.
+            SetStatus("Music needs the packaged build (MSIX).");
+            return;
+        }
 
         bool sinkOk = await _sink.ConnectAsync(deviceId);
         Log.Info($"A2DP connect {(sinkOk ? "succeeded" : "failed")}.");
@@ -208,8 +233,6 @@ internal sealed class TrayContext : ApplicationContext
         {
             StartRouting();
         }
-
-        await ConnectCallsAsync(deviceId);
     }
 
     /// <summary>
