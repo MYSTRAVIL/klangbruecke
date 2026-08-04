@@ -52,9 +52,13 @@ public sealed class AudioSinkService : IDisposable
         // reason once and skip the attempt cleanly. This one guards the call itself, because the
         // failure mode is process death rather than a false return: a Stage 1 reconnect watcher that
         // called straight into here without asking would silently reintroduce a bricked startup.
-        if (!AudioSinkPolicy.CanOpenConnection(PackageIdentity.IsPackaged))
+        // Read once and passed to both, so the reason logged is provably the reason decided on. The
+        // literal that used to sit in the Explain call was right only because the policy currently
+        // takes one input; this call site exists for a caller that does not exist yet.
+        bool isPackaged = PackageIdentity.IsPackaged;
+        if (!AudioSinkPolicy.CanOpenConnection(isPackaged))
         {
-            Log.Warn(AudioSinkPolicy.Explain(isPackaged: false));
+            Log.Warn(AudioSinkPolicy.Explain(isPackaged));
             return false;
         }
 

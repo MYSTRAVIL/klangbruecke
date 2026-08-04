@@ -222,7 +222,21 @@ music implementation observed working on this machine was a packaged Store app. 
   `AudioSinkService` — the same call crashes a bare test host with no app code in the frame.
 - Raising the Windows SDK projection version has been tried and does not help. Do not repeat it.
 
-**Trap:** `TrayContext.ConnectAsync` saves `PhoneDeviceId` *before* connecting. Once a phone has been
-picked, every later unpackaged launch auto-connects at startup, crashes, and does it again — the app
-is unusable until `%LOCALAPPDATA%\Klangbruecke\settings.json` is deleted by hand. What to do about
-that is Stage 1's call; knowing it is the point of this entry.
+**The trap this used to set, and the code that closes it.** `TrayContext.ConnectAsync` saves
+`PhoneDeviceId` *before* connecting, so once a phone had been picked, every later unpackaged launch
+auto-connected at startup, died here, and did it again — an app bricked by one menu click, with a log
+reading `starting.` and nothing else, recoverable only by deleting
+`%LOCALAPPDATA%\Klangbruecke\settings.json` by hand.
+
+**`AudioSinkPolicy.CanOpenConnection` is what stops that**, and it is load-bearing rather than
+defensive tidiness. Unpackaged it returns false and the connect call is never reached: checked in
+`TrayContext.ConnectMusicAsync` so the reason is logged once and the attempt skipped cleanly, and
+again as the first statement of `AudioSinkService.ConnectAsync`, immediately above the call, so a
+later caller that goes straight to the service cannot reintroduce it. **Do not remove either check to
+"let it try" — the failure is process death, not a false return.** Verified over two consecutive
+unpackaged launches with a real phone id saved: both survived, both logged the full connect path,
+zero `Application Error` events.
+
+Saving `PhoneDeviceId` before connecting is therefore deliberate and safe. It records the user's
+answer to "which phone", not what managed to connect, and the packaged build needs it on the next
+start.

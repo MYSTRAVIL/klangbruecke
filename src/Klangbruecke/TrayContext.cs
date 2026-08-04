@@ -68,7 +68,7 @@ internal sealed class TrayContext : ApplicationContext
             // reconnect that failed at startup could surface a collection later, or never, and
             // reconnect-after-reboot is the predecessor app's defining bug. It is the one path that
             // must not be able to fail quietly.
-            _ = ConnectGuardedAsync(_settings.PhoneDeviceId);
+            _ = ConnectGuardedAsync(_settings.PhoneDeviceId, StartupTrigger);
         }
     }
 
@@ -98,7 +98,7 @@ internal sealed class TrayContext : ApplicationContext
                 {
                     Checked = device.Id == _sink.ConnectedDeviceId,
                 };
-                item.Click += async (_, _) => await ConnectGuardedAsync(device.Id);
+                item.Click += async (_, _) => await ConnectGuardedAsync(device.Id, MenuTrigger);
                 phoneMenu.DropDownItems.Add(item);
             }
         }
@@ -176,27 +176,35 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
+    // What started a connect, carried into the log. Reconnect-after-reboot is the predecessor app's
+    // defining bug, so "did this run because the app just started, or because someone clicked?" is
+    // the question the log will be read to answer. It is inferable from position relative to the
+    // "starting." line, but only while the two are adjacent - a reconnect that fires seconds late,
+    // which is exactly the failure being hunted, is the case where the inference stops working.
+    private const string StartupTrigger = "startup reconnect";
+    private const string MenuTrigger = "menu selection";
+
     /// <summary>
     /// The only way in to <see cref="ConnectAsync"/>. Both call sites - the startup reconnect and a
     /// menu click - are fire-and-forget, so an escaping exception would land somewhere that logs it
     /// late or not at all; catching here makes every connect attempt account for itself.
     /// </summary>
-    private async Task ConnectGuardedAsync(string deviceId)
+    private async Task ConnectGuardedAsync(string deviceId, string trigger)
     {
         try
         {
-            await ConnectAsync(deviceId);
+            await ConnectAsync(deviceId, trigger);
         }
         catch (Exception ex)
         {
-            Log.Error($"Connect failed for id={deviceId}", ex);
+            Log.Error($"Connect failed ({trigger}) for id={deviceId}", ex);
             SetStatus($"Connect failed: {ex.Message}");
         }
     }
 
-    private async Task ConnectAsync(string deviceId)
+    private async Task ConnectAsync(string deviceId, string trigger)
     {
-        Log.Info($"Connect requested for id={deviceId}");
+        Log.Info($"Connect requested ({trigger}) for id={deviceId}");
 
         // Saved before either half is attempted, and deliberately still saved when the music half is
         // skipped below: the choice is the user's answer to "which phone", not a record of what
@@ -215,9 +223,11 @@ internal sealed class TrayContext : ApplicationContext
     /// </summary>
     private async Task ConnectMusicAsync(string deviceId)
     {
-        if (!AudioSinkPolicy.CanOpenConnection(PackageIdentity.IsPackaged))
+        // One read, passed to both, so the reason logged is the reason decided on.
+        bool isPackaged = PackageIdentity.IsPackaged;
+        if (!AudioSinkPolicy.CanOpenConnection(isPackaged))
         {
-            Log.Warn(AudioSinkPolicy.Explain(PackageIdentity.IsPackaged));
+            Log.Warn(AudioSinkPolicy.Explain(isPackaged));
 
             // Worth the tooltip, unlike the calls explanation: there is no music status for it to
             // overwrite, because unpackaged there is never any music. Without it the tray reads
@@ -280,7 +290,13 @@ internal sealed class TrayContext : ApplicationContext
 
             if (result.Match is null)
             {
-                SetStatus("No call transport matches the selected phone.");
+                // Only NoCandidates and Ambiguous get here, and they are different facts: nothing
+                // offered a transport, versus several did and none was this phone's. The log tells
+                // them apart through result.Reason; the tooltip must not assert a mismatch that
+                // never happened, because "matches" sends the reader looking for the other phone.
+                SetStatus(result.Outcome == TransportMatchOutcome.NoCandidates
+                    ? "No call transport found for this phone."
+                    : "No call transport matches the selected phone.");
                 return;
             }
 
