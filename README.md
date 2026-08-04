@@ -67,8 +67,14 @@ dotnet build src/Klangbruecke/Klangbruecke.csproj -c Release
 
 ## Package and install
 
-MSIX packaging is required — not cosmetic. The `phoneLineTransportManagement` restricted
-capability only works with package identity. Sideloading needs no Microsoft approval.
+MSIX packaging is required — not cosmetic, and not only for the reason originally believed. Package
+identity is what keeps `AudioPlaybackConnection.TryCreateFromId` from killing the process outright
+(FINDINGS §8), so the music half needs it regardless.
+
+It was also meant to satisfy the `phoneLineTransportManagement` restricted capability, on the
+premise that sideloading needs no Microsoft approval. **That premise is now in doubt** — the
+capability is declared and the package installs, but `RegisterApp()` is refused at runtime, and a
+Store-signed package is the leading suspect for the difference. FINDINGS §12.
 
 ```powershell
 ./packaging/New-DevCert.ps1      # once: create + trust a self-signed dev cert
