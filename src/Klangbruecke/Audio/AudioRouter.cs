@@ -12,12 +12,30 @@ namespace Klangbruecke.Audio;
 /// </summary>
 public sealed class AudioRouter : IDisposable
 {
+    private readonly IUiDispatcher _ui;
+
     private WasapiCapture? _capture;
     private WasapiOut? _output;
     private BufferedWaveProvider? _buffer;
+
+    /// <summary>
+    /// Identity of the current Start..Stop session, and the authority on whether a deferred teardown
+    /// is still wanted. A stopped event can be in flight while the UI thread replaces the session, so
+    /// by the time the teardown runs the fields it would tear down may belong to a healthy new route.
+    /// Volatile because it is written on the UI thread and read on NAudio's capture and play threads.
+    /// </summary>
+    private volatile object? _session;
+
+    // Written from NAudio's worker threads and read on the UI thread, which is what rules out an auto
+    // property: without a release/acquire edge a reader has no guarantee of ever seeing the store, and
+    // the tray would keep claiming it is routing a stream that has already died.
+    private volatile bool _running;
+
     private bool _disposed;
 
-    public bool IsRunning { get; private set; }
+    public AudioRouter(IUiDispatcher ui) => _ui = ui;
+
+    public bool IsRunning => _running;
 
     public event EventHandler<string>? Status;
 
@@ -96,10 +114,14 @@ public sealed class AudioRouter : IDisposable
             _output.PlaybackStopped += OnPlaybackStopped;
             _output.Init(_buffer);
 
+            // Before either worker thread exists, so no stopped event can be raised against a session
+            // that has not been published yet and be discarded as stale.
+            _session = new object();
+
             _capture.StartRecording();
             _output.Play();
 
-            IsRunning = true;
+            _running = true;
             Report($"Routing '{source.FriendlyName}' -> '{sink.FriendlyName}'.");
             return true;
         }
@@ -125,13 +147,20 @@ public sealed class AudioRouter : IDisposable
 
     private void OnRecordingStopped(object? sender, StoppedEventArgs e)
     {
+        // Mirrors the playback guard below: this can be raised after Stop dropped this capture or a
+        // later Start replaced it, and reporting that session dead would describe the wrong one.
+        if (!ReferenceEquals(sender, _capture))
+        {
+            return;
+        }
+
         if (e.Exception is not null)
         {
             Log.Error("Capture stopped.", e.Exception);
             Report($"Capture stopped: {e.Exception.Message}");
         }
 
-        IsRunning = false;
+        RequestTeardown("capture");
     }
 
     /// <summary>
@@ -153,19 +182,85 @@ public sealed class AudioRouter : IDisposable
             Report($"Playback stopped: {e.Exception.Message}");
         }
 
-        IsRunning = false;
+        RequestTeardown("playback");
+    }
+
+    /// <summary>
+    /// Stops both halves after either one dies, on the dispatcher thread rather than here.
+    ///
+    /// Half a session is worse than none. A dead capture leaves WasapiOut playing the zero-fill a
+    /// drained BufferedWaveProvider returns; a dead output leaves WasapiCapture recording into a
+    /// buffer nobody drains, and because DiscardOnBufferOverflow is set that is a callback spinning
+    /// forever, throwing every buffer away, while holding the A2DP capture endpoint open. That
+    /// endpoint is how the app proves it is connected at all (docs/FINDINGS.md section 4), and this
+    /// is the phone-initiated-reconnect path.
+    ///
+    /// The teardown must not run on the thread that raised the event, and this is measured against
+    /// NAudio 2.2.1 on this machine rather than reasoned about. WasapiOut captures
+    /// SynchronizationContext.Current in its constructor and, when that was null, calls the handler
+    /// directly on its play thread. WasapiOut.Dispose -> Stop then does playThread.Join() whenever
+    /// playbackState is not already Stopped - which is exactly the failure case, because PlayThread
+    /// assigns Stopped only on the normal-completion path, never from the catch. Joining the running
+    /// thread from itself parks it forever: a probe against the real library hung there and never
+    /// returned. Calling Stop() from this handler would therefore have introduced the deadlock the
+    /// old do-nothing handlers avoided by accident.
+    ///
+    /// Posting through the dispatcher removes it in both configurations. With no
+    /// SynchronizationContext the event arrives on the play thread, ControlUiDispatcher sees
+    /// InvokeRequired and defers to the UI thread, and the play thread runs to completion - so the
+    /// later Join finds a thread that has already exited. With one installed - and a Control
+    /// constructor does install it, so TrayContext has one today - the event already arrives on the
+    /// UI thread, Post runs inline, and the Join is on a different thread and returns at once. It
+    /// also keeps teardown on the one thread that already serialises Start, Stop and Dispose, so no
+    /// new concurrency domain appears.
+    ///
+    /// The capture half does not have the same hazard - WasapiCapture nulls its thread field before
+    /// raising, so Dispose finds nothing to join - but it is routed the same way rather than relying
+    /// on that asymmetry holding.
+    /// </summary>
+    private void RequestTeardown(string half)
+    {
+        object? session = _session;
+        if (session is null)
+        {
+            // Stop already ran. Nothing to tear down, and posting would only risk killing whatever
+            // starts next.
+            return;
+        }
+
+        // Eagerly, on this thread: the teardown below is deferred, and until it lands the tray must
+        // not go on claiming the route is live.
+        _running = false;
+
+        _ui.Post(() =>
+        {
+            // The window between the post and here is exactly long enough for a menu click to have
+            // started a new route. Tearing that one down would turn a recoverable failure into a
+            // silent one, and this is also what makes a second post - the other half reporting the
+            // same death - a no-op instead of a double teardown.
+            if (!ReferenceEquals(session, _session))
+            {
+                return;
+            }
+
+            Log.Warn($"Tearing the route down: the {half} half stopped.");
+            Stop();
+        });
     }
 
     public void Stop()
     {
+        // First, so a stopped event racing this teardown reads null and declines to post another.
+        _session = null;
+
         if (_capture is not null)
         {
             _capture.DataAvailable -= OnDataAvailable;
             _capture.RecordingStopped -= OnRecordingStopped;
 
             // Already stopped, or the endpoint vanished with the connection.
-            Quietly(_capture.StopRecording, "stop capture");
-            Quietly(_capture.Dispose, "dispose capture");
+            Teardown.Quietly(_capture.StopRecording, "stop capture");
+            Teardown.Quietly(_capture.Dispose, "dispose capture");
             _capture = null;
         }
 
@@ -175,31 +270,12 @@ public sealed class AudioRouter : IDisposable
             // not a failure, and reporting it as one would overwrite the real status.
             _output.PlaybackStopped -= OnPlaybackStopped;
 
-            Quietly(_output.Dispose, "dispose output");
+            Teardown.Quietly(_output.Dispose, "dispose output");
             _output = null;
         }
 
         _buffer = null;
-        IsRunning = false;
-    }
-
-    /// <summary>
-    /// Teardown must finish even if a step fails. Stop runs from Start's catch block and from
-    /// TrayContext.Dispose - the latter during Application.Run teardown, outside the message loop's
-    /// exception guard, where a throw escapes Main and dies with a WER dialog. A throw that skipped
-    /// the null-out after it would also leave a dead object in the field, so every later Start
-    /// would fail on it and routing would never recover without a restart.
-    /// </summary>
-    private static void Quietly(Action step, string what)
-    {
-        try
-        {
-            step();
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"Ignoring failure to {what}: {ex.Message}");
-        }
+        _running = false;
     }
 
     public void Dispose()

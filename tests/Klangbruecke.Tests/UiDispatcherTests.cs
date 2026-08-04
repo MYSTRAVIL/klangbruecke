@@ -4,36 +4,9 @@ namespace Klangbruecke.Tests;
 
 public sealed class UiDispatcherTests
 {
-    /// <summary>
-    /// WinForms controls want an STA thread. xunit v2 gives tests an MTA thread and has no
-    /// built-in way to change that, so the STA thread is created explicitly here rather than
-    /// via a custom test framework.
-    /// </summary>
-    private static void OnStaThread(Action action)
-    {
-        Exception? captured = null;
-
-        var thread = new Thread(() =>
-        {
-            try
-            {
-                action();
-            }
-            catch (Exception ex)
-            {
-                captured = ex;
-            }
-        });
-
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        thread.Join();
-
-        if (captured is not null)
-        {
-            throw captured;
-        }
-    }
+    // Moved to StaThread when TeardownMarshallingTests needed the same thing; kept as a local alias
+    // so the bodies below read unchanged.
+    private static void OnStaThread(Action action) => StaThread.Run(action);
 
     [Fact]
     public void Immediate_RunsTheActionSynchronously()

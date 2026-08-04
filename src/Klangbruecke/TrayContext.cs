@@ -1,6 +1,7 @@
 using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
+using Klangbruecke.Diagnostics;
 using NAudio.CoreAudioApi;
 using Windows.Devices.Enumeration;
 
@@ -16,17 +17,24 @@ internal sealed class TrayContext : ApplicationContext
     private readonly Settings _settings;
     private readonly AudioSinkService _sink = new();
     private readonly CallTransportService _calls = new();
-    private readonly AudioRouter _router = new();
 
     // Field initializer, so the marshalling control is built on the thread that constructs this -
     // the UI thread, since Program.Main is what does it.
     private readonly ControlUiDispatcher _ui = new();
+
+    // Not a field initializer, unlike its neighbours: it needs _ui, and a field initializer cannot
+    // read another instance field.
+    private readonly AudioRouter _router;
 
     private readonly StatusPresenter _status;
 
     public TrayContext()
     {
         _settings = Settings.Load();
+
+        // The router hands its stopped-event teardown to this dispatcher so it never runs on the
+        // NAudio thread that raised the event; see AudioRouter.RequestTeardown for why that deadlocks.
+        _router = new AudioRouter(_ui);
 
         _sink.Status += (_, m) => SetStatus(m);
         _calls.Status += (_, m) => SetStatus(m);
@@ -218,16 +226,25 @@ internal sealed class TrayContext : ApplicationContext
     {
         if (disposing)
         {
-            _router.Dispose();
-            _sink.Dispose();
-            _calls.Dispose();
+            // Every step is guarded separately rather than the sequence as a whole. This runs during
+            // Application.Run's teardown, outside the message loop's exception guard, so a throw here
+            // reaches neither Application.ThreadException nor Main's try - it kills the process with a
+            // WER dialog, which is a visible window in an app that must never show one. Guarding the
+            // sequence would stop the crash but let the first failure skip everything after it; the
+            // tray icon in particular is the last thing hidden, and leaving it drawn strands a dead
+            // icon on the taskbar until the shell next reaps it.
+            Teardown.Quietly(_router.Dispose, "dispose the audio router");
+            Teardown.Quietly(_sink.Dispose, "dispose the audio sink");
+            Teardown.Quietly(_calls.Dispose, "dispose the call transport");
 
             // After the three above, whose teardown still raises status, and before the icon:
             // disposing it drops any queued update that would otherwise reach a dead icon.
-            _ui.Dispose();
+            Teardown.Quietly(_ui.Dispose, "dispose the ui dispatcher");
 
-            _icon.Visible = false;
-            _icon.Dispose();
+            // Split from the Dispose below it. Hiding is what the user sees; if the property setter
+            // throws - it touches the shell - the handle must still be released.
+            Teardown.Quietly(() => _icon.Visible = false, "hide the tray icon");
+            Teardown.Quietly(_icon.Dispose, "dispose the tray icon");
         }
 
         base.Dispose(disposing);
