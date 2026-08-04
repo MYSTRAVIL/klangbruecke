@@ -305,3 +305,108 @@ in-process that separates `C:\Program Files\WindowsApps\Klangbruecke_...` from
 Uninstalling no longer removes the log or `settings.json`, since they are no longer package-private.
 That is deliberate: an install-fix-reinstall loop that wiped its own evidence at each step would be
 useless.
+
+## 10. Stage 0 validation: both halves work through this app
+
+Verified 2026-08-04 with the packaged build (`0.1.0.1`, MSIX, sideloaded), phone `MYSTRAPIX9`
+(Pixel 9, `C01C6A90E174`):
+
+- **Music** — A2DP sink connects, `Line (MYSTRAPIX9 A2DP SNK)` appears, audio routes.
+- **Calls** — a real cellular call routes to the PC. **Audio works in both directions.**
+
+This is the first time both halves have run from one application. §1 established that the approach
+works; it did so using AudioPlaybackConnector and Thy Phone, two separate third-party apps. That is
+the thing this project existed to replace, and it is now done.
+
+Confirmed at the same time, from the app's own log rather than by inference:
+
+- Transport correlation works on real hardware. Both selectors return `BTHENUM` interfaces carrying
+  the same address, and the log records `Matched transport 'MYSTRAPIX9' to phone address
+  C01C6A90E174` — the address match, not the single-candidate fallback.
+- The packaged build writes to `%LOCALAPPDATA%\Klangbruecke\` as documented (§9), and reports its
+  own build with `Klangbruecke 0.1.0.1 (built …)` and `Base directory: C:\Program
+  Files\WindowsApps\Klangbruecke_…`.
+
+### The bug the first packaged run found
+
+The tray menu never opened. `ContextMenuStrip.Show()` re-raises `Opening`, so the scaffold's
+cancel-rebuild-show handler cancelled its own display and rebuilt, forever — about three device
+enumerations a second, 335 of them before the process was killed, with nothing ever on screen. From
+outside, a tray icon that ignores right-clicks; from the log, obvious in one glance.
+
+Worth recording because it is the sixth defect found in scaffold code that compiled and had never
+been executed, after the `AudioPlaybackConnection` crash (§8), the dev-cert script's use of a .NET
+Core-only API in a script that must run under Windows PowerShell 5.1, and the pfx password file that
+`*.pfx` did not match in `.gitignore`. **In this project, "it builds" has predicted nothing.**
+
+## 11. Outgoing call audio is degraded by the Bluetooth link, not by the PC
+
+**Open issue.** Outgoing voice is intelligible but noticeably worse through the bridge than holding
+the phone directly: muffled, with harsh artifacts described as "some frequencies too high".
+
+What has been ruled out, each by direct test:
+
+| Suspect | Test | Result |
+|---|---|---|
+| VoiceMeeter in the mic path | Set default *communications* capture to the beyerdynamic directly | **No change** |
+| Microphone itself | Same mic into Discord and OBS | Sounds good |
+| Cellular network | Same call, same network, phone directly vs through the bridge | **Bridge is notably worse** |
+
+The network is constant across that last comparison, so the delta is the bridge. And since swapping
+the microphone source changed nothing, the degradation is not in the Windows capture path either.
+What both tests have in common is the SCO link.
+
+### Topology, which is not what it looks like
+
+The PC is the **Hands-Free** device; the phone is the **Audio Gateway**. During a call the
+`MYSTRAPIX9 Hands-Free HF Audio` endpoints do **not** appear in `MMDeviceEnumerator` at all, and
+`Line (… A2DP SNK)` reads `Unplugged`. Windows takes the PC's own default *communications* capture
+device and encodes it straight onto SCO. There is no intermediate Windows endpoint to inspect,
+which is why looking for one finds nothing.
+
+So the app cannot affect this. `AudioRouter` bridges the A2DP sink only; for calls the app registers
+the transport and Windows owns the entire audio path.
+
+### Leading hypothesis: the link negotiated CVSD, not mSBC
+
+SCO carries one codec in both directions. CVSD is narrowband (~4 kHz) with slope-overload distortion
+on transients — which matches "muffled plus odd high-frequency harshness" well. mSBC is wideband.
+
+Windows advertises wideband. `HKLM:\SYSTEM\CurrentControlSet\Control\Bluetooth\Audio\Hfp\HandsFree`:
+
+```
+BrsfSupportedFeatures = 183   bit 7 set -> codec negotiation
+SdpSupportedFeatures  = 55    bit 5 set -> wide band speech
+Enabled = 1   ProfileVersion = 263 (HFP 1.7)   RfcommServerChannel = 2
+```
+
+Advertising is not negotiating. The prime suspect is the radio driver:
+
+```
+RZ616 Bluetooth(R) Adapter   Mediatek Inc.   1.5.21.157   2021-12-27
+```
+
+Four years old, and the only non-Microsoft component in the stack — everything else enumerates as
+Microsoft inbox at 10.0.19041.x. Old MediaTek Bluetooth drivers are known for weak or absent mSBC
+support.
+
+### How to confirm it, and the trap in confirming it
+
+**ETW is a dead end.** The Bluetooth components (`BTHPORT`, `BTHUSB`, `BthHFEnum`) use WPP tracing,
+and Microsoft does not publish the TMF files needed to decode it. A capture is opaque.
+
+Measure the audio bandwidth instead — SCO uses the same codec both ways, so the *incoming*
+direction is capturable on the PC. `packaging/Measure-CallBandwidth.ps1` loopback-captures the
+default communications render endpoint and reports spectral content.
+
+**The trap:** a normal cellular call is narrowband *at the network level*, so it reads as ~4 kHz
+regardless of what Bluetooth negotiated. The measurement is only conclusive over a **wideband**
+call — WhatsApp, Signal, Telegram, FaceTime Audio — placed from a second phone to the bridged phone.
+Run it on a cellular call and it will confirm the hypothesis whether or not the hypothesis is true.
+
+### If it is CVSD
+
+The lever is the driver, from the OEM support page or MediaTek. This is a normal supported update,
+not the WinUSB rebinding §5 rejects — and it is reversible via Device Manager → Roll Back Driver.
+Worth a restore point regardless: that radio also carries the Xbox and Switch Pro controllers, and
+§5 exists because regressing them is expensive.
