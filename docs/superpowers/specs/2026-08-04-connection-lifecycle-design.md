@@ -1,0 +1,291 @@
+# Connection lifecycle design
+
+Date: 2026-08-04
+Status: approved, not yet implemented
+
+## Problem
+
+The scaffold has never been run against a phone. It compiles, and the music path is wired end to
+end, but no MSIX has been installed and no connection has ever been attempted with this code. The
+approach is proven — `docs/FINDINGS.md` records both halves working on this machine — but it was
+proven with two third-party apps, not with this one.
+
+Separately, the scaffold has no connection lifecycle at all:
+
+- `Settings.AutoReconnect` is written by the tray menu and read by no code. It is a dead setting.
+- The only connect attempt is a fire-and-forget call in the `TrayContext` constructor
+  (`TrayContext.cs:46-49`). If the phone is out of range at launch, it fails once and never retries.
+- `AudioSinkService.OnStateChanged` (`AudioSinkService.cs:77-80`) is the sole signal that a
+  connection dropped. It formats a tooltip string and nothing else — it does not stop the router,
+  clear state, or retry.
+- `IsConnected` tests `_connection is not null`, so it stays `true` after the phone has gone.
+- There is no `DeviceWatcher`, no timer, no retry, and no sleep/resume handling.
+
+`CLAUDE.md` names reconnect-after-reboot and phone-initiated reconnect as the predecessor app's
+defining bug. That is the one part of this app with no implementation.
+
+There is also no logging anywhere. The tray tooltip is the entire diagnostic surface and every
+status change overwrites it. A failed first run would produce no evidence.
+
+## Goals
+
+1. Find out whether the connect path works at all, with enough instrumentation that a failure is
+   diagnosable on the first attempt rather than the second.
+2. Make the connection survive the transitions that killed the predecessor: reboot, walking out of
+   range and back, PC sleep/resume, phone-initiated disconnect, Bluetooth off and on.
+3. Never claim "connected" when the OS disagrees.
+
+## Non-goals
+
+- Fixing the outgoing-call ringback gap (`FINDINGS.md` §6). Cosmetic, and the fix is unverified.
+- Anything in `FINDINGS.md` §5. Those are settled decisions, not open questions.
+- Microsoft Store submission. Sideloading needs no approval; the restricted capability only gates
+  the Store.
+
+## Architecture
+
+`TrayContext` currently orchestrates everything and holds all state implicitly. It becomes a view:
+it renders the menu and tooltip and forwards user intent. All connection logic moves into a new
+single owner.
+
+```
+ConnectionManager  (state machine + reconcile timer)
+├── AudioSinkService      A2DP  — exists; gains DeviceWatcher + real state reporting
+├── CallTransportService  HFP   — exists; gains device correlation
+├── AudioRouter           WASAPI bridge — exists; gains resampler
+└── Log                   new; rolling file under %LOCALAPPDATA%\Klangbruecke\logs\
+```
+
+The services stop deciding anything. Each reports facts upward via events and exposes
+`ConnectAsync` / `Disconnect`; `ConnectionManager` decides what to do about them. That boundary is
+what lets the state machine be tested without a phone in the room.
+
+Each service sits behind an interface (`IAudioSinkService`, `ICallTransportService`,
+`IAudioRouter`) so `ConnectionManager` can be driven by fakes in tests.
+
+### Grounding `IsConnected` in observable facts
+
+Both services currently report connectivity from whether they hold a non-null object. That survives
+the phone leaving. It gets re-grounded:
+
+- **Music** — the A2DP SNK capture endpoint is present and active. Per `FINDINGS.md` §4, if that
+  endpoint is absent then nothing is holding an `AudioPlaybackConnection` open and the phone
+  physically cannot offer the PC as an output.
+- **Calls** — `PhoneLineTransportDevice.IsRegistered()`.
+
+## State machine
+
+| From | Event | To |
+|---|---|---|
+| `Idle` | phone selected in settings | `Discovering` |
+| `Discovering` | device appears (`DeviceWatcher`) | `Connecting` |
+| `Connecting` | all enabled halves up | `Connected` |
+| `Connecting` | one half up, one failed | `Degraded` |
+| `Connecting` | all halves failed | `RetryBackoff` |
+| `RetryBackoff` | backoff elapsed | `Connecting` |
+| `Connected` / `Degraded` | close, and link gone after grace window | `Discovering` |
+| `Connected` / `Degraded` | close, but link alive after grace window | `Suppressed` |
+| `Connected` / `Degraded` | tray Disconnect clicked | `Suppressed` |
+| `Degraded` | reconcile tick | retry failed half in place |
+| `Suppressed` | link drops **and** returns | `Discovering` |
+| any | phone deselected | `Idle` |
+
+| State | Meaning |
+|---|---|
+| `Idle` | No phone selected in settings. |
+| `Discovering` | Phone selected but not present. A `DeviceWatcher` is running; this costs nothing. |
+| `Connecting` | Opening `AudioPlaybackConnection`, and registering the call transport if enabled. |
+| `Connected` | Every enabled half is up and confirmed against the OS. |
+| `Degraded` | One half up, the other failed. |
+| `Suppressed` | Deliberate disconnect. Dormant on purpose. |
+| `RetryBackoff` | Connect failed; waiting before the next attempt. |
+
+`Degraded` is a first-class state because the two halves fail independently — A2DP sink and HFP
+hands-free are different profiles on different channels (`FINDINGS.md` §1). Music up with calls
+unregistered is a real and useful condition, and the tray must say so rather than reporting
+"Connected". `FINDINGS.md` §4 is explicit that a lying indicator cost an hour of debugging.
+
+**Disabled is not failed.** A half that is switched off (`Settings.EnableCalls` false) or
+structurally unavailable (no package identity, so the restricted capability cannot apply) is not
+attempted at all, and its absence does not produce `Degraded`. Music alone, with calls disabled,
+is `Connected`. Otherwise running unpackaged during development would pin the app in `Degraded`
+permanently and retry a call registration that cannot succeed.
+
+**`Degraded` retries in place.** The failed half is re-attempted on each reconcile tick, subject to
+the same backoff schedule, while the working half keeps running untouched. A2DP sink and HFP
+hands-free are independent profiles on independent channels (`FINDINGS.md` §1), so recovering one
+must never tear down the other. `Degraded` is a working state, not an error state — it is how the
+app spends its time when, say, the call transport has not come back after resume but music has.
+
+### Deliberate disconnect vs. walking away
+
+`AudioPlaybackConnection.StateChanged` reports *that* the connection closed and never *why*.
+"Disconnected on the phone" and "walked out of range" are indistinguishable at that layer, and they
+need opposite responses.
+
+The separating signal is `BluetoothDevice.ConnectionStatus`. On connection close, do not act
+immediately — wait a **3 second grace window**, then read it:
+
+- Still `Connected` → the ACL link is alive, only the audio profile went away → **deliberate** →
+  `Suppressed`.
+- `Disconnected` → the whole link is gone → **out of range** → `Discovering`.
+
+The grace window exists because leaving range tears down the audio connection a beat before the ACL
+link drops. Without it every range exit is misread as deliberate and the app goes dormant —
+silently, and precisely when it would not be noticed.
+
+### Leaving `Suppressed`
+
+`Suppressed` is entered by a tray Disconnect click or a phone-initiated disconnect. It is left when
+the Bluetooth link genuinely drops and returns — `ConnectionStatus` transitioning
+`Connected → Disconnected → Connected`. Deliberate intent expires when the phone leaves the room.
+
+**Suppression is in-memory only.** It does not persist across app restart or reboot, which follows
+from the same rule: a reboot is the link dropping and returning. Disconnecting before bed leaves
+the app connected again in the morning.
+
+### Retry and resume
+
+- **Backoff** — 2s, 4s, 8s, 16s, 30s, then every 60s. Reset on success.
+- **Resume** — `SystemEvents.PowerModeChanged` with `PowerModes.Resume` does not reconcile
+  immediately. The Bluetooth stack is not back yet and an instant attempt only burns the first
+  backoff step. Wait 5s, then force a reconcile.
+
+### Reconcile loop
+
+Every 30 seconds, compare desired state against observed reality: is the connection object alive,
+is the A2DP SNK capture endpoint actually present, is the router running, is the transport
+registered. Correct any drift.
+
+This is the backstop that makes the design robust rather than merely event-driven. WinRT device
+events are unreliable across sleep/resume, and under a purely edge-triggered design a single
+dropped event leaves the app idle believing it is connected, with nothing to correct it — the
+predecessor's dormant-forever bug, reproduced. Level-triggered reconciliation turns that into a
+30-second annoyance.
+
+Rejected alternatives: pure event-driven (leaner, no idle wakeups, but every event source becomes
+load-bearing and the failure mode is silent permanent death); pure polling (simplest and
+self-healing, but 30s of latency after unlocking the phone, and cutting the interval to fix that
+means enumerating WinRT devices every second or two all day).
+
+## Staging
+
+The stages exist because designing reconnect hardening on top of a connect path that has never once
+succeeded is building on sand.
+
+### Stage 0 — instrument, then validate
+
+Smallest diff that makes a first-run failure diagnosable.
+
+1. **`Log`** — hand-rolled rolling file at `%LOCALAPPDATA%\Klangbruecke\logs\`, one file per day,
+   7-day retention. No NuGet dependency. Logs every state transition, every WinRT call and its
+   result, and every device enumeration.
+2. **UI thread marshalling** — capture the `SynchronizationContext` in the `TrayContext`
+   constructor and post through it. Today `SetStatus` writes `_icon.Text` directly while being
+   invoked from the WinRT threadpool (`AudioPlaybackConnection.StateChanged`) and from NAudio's
+   `RecordingStopped`. This surfaces as an intermittent `InvalidOperationException`, not a clean
+   failure.
+3. **Resampler** — `AudioRouter.cs:69-80` builds a `BufferedWaveProvider` from the capture
+   `WaveFormat` and hands it straight to `WasapiOut` in shared mode. Insert a
+   `MediaFoundationResampler` when it does not match the output's mix format. With VoiceMeeter and
+   VB-Cable in the chain (`FINDINGS.md` §7) a mismatch is likely rather than hypothetical, and it
+   presents as silence rather than an error.
+4. **Transport correlation** — `TrayContext.cs:175` takes `transports.FirstOrDefault()` and never
+   correlates the transport to the phone the user selected. With one phone paired this works by
+   accident. Correlate on the Bluetooth address embedded in the device ID.
+5. **Unpackaged fallback** — detect package identity at startup. Without it, skip the calls half
+   and log the reason; music is unaffected. This buys `dotnet run` as the inner loop instead of a
+   full MSIX install cycle for every music-side change.
+
+Then package, install, and run the two checks below.
+
+**Open question Stage 0 answers:** whether `AudioPlaybackConnection` works without package
+identity. It is not a restricted capability, so it probably does, but WinRT is inconsistent here.
+If it turns out to require identity, the fast dev loop disappears and every iteration costs an
+install — worth knowing before Stage 1 rather than during it.
+
+### Stage 1 — connection lifecycle
+
+Build `ConnectionManager` and the state machine described above, informed by what Stage 0 actually
+observed. Move orchestration out of `TrayContext`. Make `Settings.AutoReconnect` live.
+
+### Stage 2 — reconnect matrix
+
+Verify the transitions that define the project.
+
+## Testing
+
+The two halves are independent and are tested independently, per `CLAUDE.md`.
+
+**Music** — connect, then confirm the endpoint exists and the phone offers the PC:
+
+```powershell
+Get-PnpDevice -Class AudioEndpoint | Where-Object { $_.FriendlyName -match 'SNK|A2DP' }
+```
+
+Expect `Line (Pixel 9 A2DP SNK)`. Then confirm the PC appears in the phone's output picker and
+audio reaches the selected output device.
+
+**Calls** — place a real cellular call. Verify audio in **both** directions; the mic half fails
+silently otherwise.
+
+**Never trust the tray indicator.** Verify against `Get-PnpDevice` (`FINDINGS.md` §4).
+
+**When something does not connect**, check the pairing before suspecting the code. The stale-IRK
+bug (`FINDINGS.md` §3) presents exactly like an API failure. Look at `BTHUSB` events 35 / 16 / 24
+in the System log first.
+
+### Unit tests
+
+The state machine is the only part with logic worth unit-testing, and the only part that must not
+need a phone. Table-driven tests over (state, event) → (next state, action), driving
+`ConnectionManager` through fakes for the three service interfaces.
+
+Everything else — WinRT, WASAPI — is verified by hand against the OS. There is no test project
+today; Stage 1 adds an xunit project.
+
+### Stage 2 matrix
+
+Each row verified by hand, with the log as evidence:
+
+| Scenario | Expected |
+|---|---|
+| Reboot PC, phone in range | Auto-connects without interaction |
+| App restart while connected | Reconnects |
+| Walk out of range, return | `Discovering`, then reconnects on return |
+| PC sleep, resume | Reconnects within ~35s of resume |
+| Disconnect on the phone | `Suppressed`; no reconnect while phone stays in range |
+| Suppressed, then leave and return | Auto-connect resumes |
+| Tray Disconnect click | `Suppressed`; same re-arm rule |
+| Bluetooth off on phone, back on | Reconnects |
+| Phone off entirely, back on | Reconnects |
+| Connect with phone absent at launch | `Discovering`, backs off, connects when phone appears |
+
+## Error handling
+
+- **Connect failures** are expected, not exceptional — the phone is often simply absent. They log
+  at info and feed the backoff; they do not surface a dialog.
+- **`Settings` load/save** already swallows IO and JSON exceptions deliberately. Keep that, but log
+  the swallowed exception instead of discarding it.
+- **`AudioRouter.Init` failure** on format mismatch is what the resampler addresses. If it still
+  fails, the state is `Degraded` with the format pair logged, not silence.
+- **Missing capability or package identity** logs a clear single line naming what is disabled and
+  why, rather than failing opaquely.
+
+## Files
+
+New:
+
+```
+src/Klangbruecke/Connection/ConnectionManager.cs
+src/Klangbruecke/Connection/ConnectionState.cs
+src/Klangbruecke/Diagnostics/Log.cs
+tests/Klangbruecke.Tests/                        (Stage 1)
+```
+
+Modified: `TrayContext.cs` (orchestration out, view only), `AudioSinkService.cs` (DeviceWatcher,
+real state), `CallTransportService.cs` (correlation), `AudioRouter.cs` (resampler),
+`Settings.cs` (log swallowed exceptions).
+
+`TrayContext.cs` is 228 lines and is currently the only orchestrator; moving connection logic out
+is what keeps it reviewable, not incidental cleanup.
