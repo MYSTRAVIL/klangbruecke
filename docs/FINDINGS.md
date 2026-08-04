@@ -458,15 +458,28 @@ a Store-signed identity in practice.
 as enumeration, `FromId` and `IsRegistered()` — all of which work unpackaged. The capability was
 never actually exercised.
 
-### Ruled out: a registration conflict
+### NOT ruled out: a registration conflict (an earlier revision of this section said otherwise)
 
 The scaffold's own comment in `CallTransportService.cs` anticipated this — *"Registering claims the
 hands-free role for this app. If another app already holds it, this is where things fail"* — and
 Thy Phone (`InTheHandLtd.PearYourPhone`, the Store app §1 used to prove calls work) was still
 installed when the failure was first seen.
 
-**It was uninstalled and `RegisterApp()` still throws, identically.** Verified 2026-08-04 20:41 on a
-clean relaunch. So the role is not held by another app, and the mundane explanation is gone.
+It was uninstalled and `RegisterApp()` still throws, identically (2026-08-04 20:41, clean relaunch).
+**That does not clear the conflict hypothesis, and an earlier revision of this file wrongly said it
+did.** `RegisterApp()` registers a *package*, not a process, and an uninstall plausibly does not
+release an HFP registration until the Bluetooth stack restarts or the device is re-paired. The
+retry was immediate. The test is inconclusive, not negative.
+
+**Decisive counter-evidence against "Windows does this natively":** before either Thy Phone or
+Klangbruecke was installed, the PC could not be selected as a call audio device from Android at all.
+So the hands-free role must be claimed by *some* application for the phone to offer the PC — Windows
+does not provide it on its own. Any explanation that assumes otherwise is wrong, including one this
+file previously carried.
+
+The remaining clean test is to restart the Bluetooth stack (or reboot, or remove and re-pair the
+phone) with Thy Phone gone, then retry — and to check whether the phone still offers the PC as a
+call audio device in the meantime, which reveals directly whether anything still holds the role.
 
 Also ruled out: a deployment-time capability refusal. `Microsoft-Windows-AppModel-Runtime/Admin`
 logs the app launching into its Desktop AppX container normally, with no denial of any kind. Windows
