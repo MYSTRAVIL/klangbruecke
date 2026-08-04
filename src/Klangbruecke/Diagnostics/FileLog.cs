@@ -58,9 +58,14 @@ public sealed class FileLog : ILog
         {
             // Deliberate. Logging must never be the reason the app fails.
             // If the directory is permanently unwritable, nothing is ever written and there is no
-            // other signal that anything was attempted. Debug.WriteLine cannot throw with the
-            // default listener and costs nothing in a release run.
-            Debug.WriteLine(ex);
+            // other signal that anything was attempted. Trace, not Debug: Debug.WriteLine is
+            // [Conditional("DEBUG")] and so compiles out of the Release build that ships, which
+            // would leave this catch empty exactly where the signal is needed. TRACE is defined in
+            // Release, and DefaultTraceListener forwards to OutputDebugString, so this is readable
+            // under DebugView on the target machine. The default listener will not throw; a
+            // pathological Exception.ToString() override could, which is why this is the last
+            // statement of a catch that is already the never-throw boundary.
+            Trace.WriteLine(ex);
         }
     }
 
