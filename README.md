@@ -70,10 +70,10 @@ MSIX packaging is required — not cosmetic, and not only for the reason origina
 identity is what keeps `AudioPlaybackConnection.TryCreateFromId` from killing the process outright
 (FINDINGS §8), so the music half needs it regardless.
 
-It was also meant to satisfy the `phoneLineTransportManagement` restricted capability, on the
-premise that sideloading needs no Microsoft approval. **That premise is now in doubt** — the
-capability is declared and the package installs, but `RegisterApp()` is refused at runtime, and a
-Store-signed package is the leading suspect for the difference. FINDINGS §12.
+It also carries the `phoneLineTransportManagement` restricted capability the calls half needs.
+**Sideloading it requires no Microsoft approval** — that premise was doubted for several hours and
+then confirmed: registration works from a self-signed sideloaded package. The blocker was a missing
+`RequestAccessAsync()` call, not signing. FINDINGS §12.
 
 ```powershell
 ./packaging/New-DevCert.ps1      # once: create + trust a self-signed dev cert
