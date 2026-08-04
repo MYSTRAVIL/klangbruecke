@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
@@ -29,6 +30,12 @@ internal sealed class TrayContext : ApplicationContext
 
     private readonly StatusPresenter _status;
 
+    /// <summary>
+    /// Set only across the <c>Show()</c> call in <see cref="OnMenuOpening"/>, to let the Opening
+    /// that <c>Show()</c> itself raises through. UI thread only, so no synchronization.
+    /// </summary>
+    private bool _menuRebuilt;
+
     public TrayContext()
     {
         _settings = Settings.Load();
@@ -56,12 +63,7 @@ internal sealed class TrayContext : ApplicationContext
         // services subscribed above are not started until ConnectAsync at the end of this ctor.
         _status = new StatusPresenter(_ui, text => _icon.Text = text);
 
-        _icon.ContextMenuStrip.Opening += async (s, e) =>
-        {
-            e.Cancel = true;
-            await RebuildMenuAsync();
-            _icon.ContextMenuStrip.Show(Cursor.Position);
-        };
+        _icon.ContextMenuStrip.Opening += OnMenuOpening;
 
         if (_settings.PhoneDeviceId is not null)
         {
@@ -84,6 +86,49 @@ internal sealed class TrayContext : ApplicationContext
 
     /// <summary>The tray's own messages, which are progress unless this class says otherwise.</summary>
     private void SetStatus(string message, LogLevel level = LogLevel.Info) => _status.Show(message, level);
+
+    /// <summary>
+    /// The menu lists devices, which must be enumerated, which is async - but Opening is a
+    /// synchronous veto. So the first open is cancelled, the menu rebuilt, and Show() called.
+    ///
+    /// Show() raises Opening again. Without <see cref="_menuRebuilt"/> that second pass cancels
+    /// its own display and rebuilds again, forever: about three enumerations a second, no menu
+    /// ever on screen, and the only outward sign is a tray icon that ignores right-clicks.
+    /// </summary>
+    private async void OnMenuOpening(object? sender, CancelEventArgs e)
+    {
+        if (_menuRebuilt)
+        {
+            _menuRebuilt = false;
+            return;
+        }
+
+        e.Cancel = true;
+
+        try
+        {
+            await RebuildMenuAsync();
+        }
+        catch (Exception ex)
+        {
+            // Show what was built regardless; a menu missing its device list still offers Exit,
+            // and a tray app whose only exit is Task Manager is worse than a partial menu.
+            Log.Error("Rebuilding the tray menu failed.", ex);
+        }
+
+        _menuRebuilt = true;
+
+        try
+        {
+            _icon.ContextMenuStrip!.Show(Cursor.Position);
+        }
+        catch (Exception ex)
+        {
+            // Leaving the flag set would let the next right-click through without a rebuild.
+            _menuRebuilt = false;
+            Log.Error("Showing the tray menu failed.", ex);
+        }
+    }
 
     private async Task RebuildMenuAsync()
     {
