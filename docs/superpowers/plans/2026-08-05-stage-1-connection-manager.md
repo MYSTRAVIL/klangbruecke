@@ -510,10 +510,19 @@ Evaluation order — **first match wins**:
 2. `Suppression != None` → `Suppressed`
 3. `Link == Absent` → `Discovering`
 4. any enabled half in `Connecting` / `Registering` → `Connecting`
-5. every enabled half up (music `Linked` **or** `Up` counts) → `Connected`
-6. at least one enabled half up and at least one in `Backoff` → `Degraded`
-7. every enabled half in `Backoff` → `RetryBackoff`
-8. no half enabled → `Idle`
+5. at least one half enabled, and every enabled half up (music `Linked` **or** `Up` counts) → `Connected`
+6. at least one enabled half up, and at least one enabled half **not** up → `Degraded`
+7. no enabled half up, and at least one enabled half in `Backoff` → `RetryBackoff`
+8. otherwise — no half enabled, or every enabled half still `Off` → `Idle`
+
+Rules 5-8 are wider than the design document's table, which was **not exhaustive**: an *enabled*
+half sitting in `Off` matched none of its rows, so a phone selected with the link `Present` and
+neither half yet initiated — the ordinary startup instant — fell off the end. Rule 5 also needs the
+"at least one half enabled" conjunct because "every enabled half is up" is vacuously true over an
+empty set, which would report `Connected` on an unpackaged run with calls switched off. Widening
+the existing rules is deliberate rather than adding a narrow rule plus a fallback: two branches
+that agree on every input are mutually un-killable by any mutation, which is exactly what the
+standing "everything gets an assertion" rule exists to catch.
 
 - [ ] **Step 1: Write the failing tests**
 

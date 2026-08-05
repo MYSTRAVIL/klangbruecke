@@ -425,9 +425,17 @@ Pure function of `(phoneSelected, latch, link, music, calls)`. Evaluated in orde
 | suppression latch set, either reason | `Suppressed` |
 | link `Absent` | `Discovering` |
 | any enabled half in `Connecting` / `Registering` | `Connecting` |
-| every enabled half `Up`, music `Linked` counting as up | `Connected` |
-| at least one enabled half `Up`, at least one in `Backoff` | `Degraded` |
-| every enabled half in `Backoff` | `RetryBackoff` |
+| at least one half enabled, and every enabled half `Up`, music `Linked` counting as up | `Connected` |
+| at least one enabled half `Up`, at least one enabled half **not** up | `Degraded` |
+| no enabled half up, at least one enabled half in `Backoff` | `RetryBackoff` |
+| otherwise | `Idle` |
+
+**Correction, found during Task 6.** The first four rows above were originally written without the
+last three's widening, and that table was **not exhaustive**: an *enabled* half sitting in `Off`
+matched no row at all, so a phone selected with the link `Present` and neither half yet initiated —
+the ordinary startup instant — fell off the end of the projection. The `Connected` row also needs
+its "at least one half enabled" conjunct, because "every enabled half is up" is vacuously true over
+an empty set and would otherwise report `Connected` on an unpackaged run with calls switched off.
 
 Music `Linked` reports `Connected` with detail `waiting for phone audio`. The Bluetooth connection
 genuinely is open and the phone genuinely can select the PC; the only thing missing is the phone
