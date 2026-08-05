@@ -8,8 +8,12 @@ the fallback is a 2 s poll of `AudioRouter.FindSinkCaptureEndpoint`. This probe 
 that with measurements rather than with what the internet says about COM callbacks.
 
 Everything below marked **Measured** came out of a throwaway console probe run on this machine on
-2026-08-05. Everything marked **Not measured** is exactly that — no phone-side disconnect was
-available, and nothing here is inferred and then written up as if it had been observed.
+2026-08-05. Everything marked **Not measured** is exactly that: the phone stayed connected for the
+whole session and no disconnect was forced, so nothing about that path is inferred here and then
+written up as if it had been observed.
+
+"Task 13" below means the task that builds `EndpointMonitor` — numbered 13 in the Stage 1
+execution brief and 15 in this probe's own brief. Same task.
 
 ---
 
