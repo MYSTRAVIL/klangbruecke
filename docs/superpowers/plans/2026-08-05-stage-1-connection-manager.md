@@ -188,7 +188,7 @@ public interface IScheduler
     IDisposable SchedulePeriodic(TimeSpan period, Action action);
 }
 
-/// <summary>Delivers every callback on the thread that constructed it. UI thread only.</summary>
+/// <summary>Delivers every callback on the thread that scheduled it. UI thread only.</summary>
 public sealed class UiScheduler : IScheduler, IDisposable
 {
     public UiScheduler();
