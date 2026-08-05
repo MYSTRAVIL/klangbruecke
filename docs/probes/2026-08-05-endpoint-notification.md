@@ -3,7 +3,9 @@
 **Date:** 2026-08-05
 **Machine:** the development target — Windows 10 Pro 19045, .NET 8.0.23, NAudio 2.2.1, x64.
 **Why:** Stage 1 wants an endpoint-*arrival* event instead of the one-shot look that misses
-`Line (<phone> A2DP SNK)` in 5 of 8 recorded launches. `IMMNotificationClient` is the candidate;
+`Line (<phone> A2DP SNK)` in 5 of 8 recorded launches
+(`docs/superpowers/specs/2026-08-05-stage-1-connection-manager-design.md` §2).
+`IMMNotificationClient` is the candidate;
 the fallback is a 2 s poll of `AudioRouter.FindSinkCaptureEndpoint`. This probe exists to answer
 that with measurements rather than with what the internet says about COM callbacks.
 
@@ -27,19 +29,45 @@ as asked.
 What *was* measured, in a controlled 96-second window with the registration proven live on both
 sides of the event:
 
+Each "control" below is a *pair* of default-endpoint flips — set the default to microphone B, then
+restore all three roles about 3 s later — and each flip raises 5 `OnDefaultDeviceChanged`
+callbacks, so each control accounts for 10.
+
 | Time (probe clock) | What happened | Callbacks about the A2DP endpoint |
 |---|---|---|
-| +6 s | control: default capture endpoint flipped | — (5 `OnDefaultDeviceChanged`) |
-| +30 s | control: flipped again | — (5 `OnDefaultDeviceChanged`) |
+| +6 s | control 1: default capture endpoint flipped, then restored at +10 s | — (10 `OnDefaultDeviceChanged`) |
+| +30 s | control 2: flipped, restored at +34 s | — (10 `OnDefaultDeviceChanged`) |
 | +32 s | `Line (MYSTRAPIX9 A2DP SNK)` enumerated: **Active** | |
 | +32 s | packaged Klangbruecke 0.1.0.2 launched, logged `A2DP sink connected`, routed audio | **none** |
-| +55 s | control: flipped again | — (5 `OnDefaultDeviceChanged`) |
+| +55 s | control 3: flipped, restored at +59 s | — (10 `OnDefaultDeviceChanged`) |
 | +57 s | Klangbruecke killed (connection object destroyed with the process) | **none** |
 | +75 s | `Line (MYSTRAPIX9 A2DP SNK)` enumerated: **Active** | |
-| +79 s | control: flipped again | — (5 `OnDefaultDeviceChanged`) |
+| +79 s | control 4: flipped, restored at +83 s | — (10 `OnDefaultDeviceChanged`) |
 
-40 callbacks arrived in the window, all of them from the deliberate controls. **Zero** mentioned
-the A2DP endpoint.
+**The arithmetic, in full, because this section's whole argument is that every callback is
+accounted for and none of it was the A2DP endpoint.** 4 controls × 2 flips × 5 = **40**, which is
+exactly the probe's own tally (`Watch window over. 40 callback(s) seen.`) and exactly the 8 bursts
+of 5 in the log:
+
+```
+02:19:17 -> 5   02:19:20 -> 5     (control 1: flip, restore)
+02:19:41 -> 5   02:19:45 -> 5     (control 2)
+02:20:05 -> 5   02:20:09 -> 5     (control 3)
+02:20:30 -> 5   02:20:33 -> 5     (control 4)
+```
+
+Grouping those 40 callback lines by the device name each one carries accounts for all of them:
+
+```
+Mikrofon (beyerdynamic LL Adapter)              24 callbacks
+VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)  16 callbacks
+TOTAL                                           40
+```
+
+Those are the two endpoints the controls flip between. **No callback named any other device**, and
+the strings `A2DP` and `SNK` do not occur anywhere in that log at all — 0 matches each, case
+sensitive. The negative is a census of every callback, not a single pattern that could have been
+silently broken.
 
 The reason is not that the notification failed. It is that **the endpoint never changed**: it was
 `Active` before the app opened its `AudioPlaybackConnection` and still `Active` after the app died.
@@ -65,13 +93,22 @@ is disconnected and reconnected for real**, and record the result here.
 
 **Measured, and it is the same answer whether registration happens from an MTA or an STA thread.**
 
-| Registering thread | Callback arrives on |
-|---|---|
-| MTA (`tid=4`) | `tid=5/6/7/8`, **MTA**, not a thread-pool thread, `IsBackground=true` |
-| STA, no message pump (`tid=4`) | `tid=5/6/7`, **MTA**, not a thread-pool thread, `IsBackground=true` |
-| STA, pumping the message queue (`tid=4`) | `tid=6/7`, **MTA**, not a thread-pool thread, `IsBackground=true` |
+Thread ids below are the ones that appear in the saved logs, counted with a case-sensitive match on
+the logger's `CALLBACK <client>.` field. (A first pass at this used a case-insensitive `CALLBACK`,
+which also matches `RegisterEndpointNotificationCallback returned …` and `40 callback(s) seen` —
+main-thread lines — and so wrongly made `tid=4`, the registering thread, look like a callback
+thread. The numbers here are from the corrected count.)
 
-Consequences, all of them measured rather than assumed:
+| Registering thread | Callback arrives on | Log |
+|---|---|---|
+| MTA (`tid=4`) | `tid=5`, `6` — **MTA**, `pool=N`, `bg=Y` | `lifetime-mta.log` (70 callbacks), `a2dp-cycle.log` (40), `throwing.log` (10), `reentrant.log` (10) |
+| STA, no message pump (`tid=4`) | `tid=5`, `6`, `7` — **MTA**, `pool=N`, `bg=Y` | `lifetime-sta.log` (70 callbacks) |
+| STA, pumping the message queue (`tid=4`) | `tid=6`, `7` — **MTA**, `pool=N`, `bg=Y` | `watch-stapump.log` (10 callbacks) |
+
+Every callback line in every log reads `apt=MTA pool=N bg=Y`, without exception. The STA-with-pump
+row is excerpted under "Raw output" below along with the other two.
+
+Consequences:
 
 - **Callbacks never arrive on the registering thread.** They arrive on MMDevAPI's own worker
   threads. A WinForms tray app must marshal to the UI thread itself — `IUiDispatcher` is already
@@ -80,9 +117,18 @@ Consequences, all of them measured rather than assumed:
   received every callback, on an MTA thread. So there is no dependency on the WinForms message loop
   being healthy. (The likely explanation — not measured, and not relied on — is that the CLR's CCW
   is context-agile, so MMDevAPI calls straight in instead of marshalling into the STA.)
-- **Delivery is not serialised onto one thread.** Within a single run, callbacks came in on
-  `tid=5`, `6`, `7` and `8`. Two callbacks can be in a handler concurrently. The handler must be
-  thread-safe; it cannot rely on a single-threaded notification thread.
+- **Delivery is not pinned to one thread** — measured. A single run delivers on more than one
+  thread id (`5` and `6` in `lifetime-mta.log`; `5`, `6` and `7` in `lifetime-sta.log`). So a
+  handler cannot cache thread affinity or assume it always runs on the same thread.
+- **Whether two callbacks can be *in flight at once* was NOT measured, and the evidence leans
+  against it.** Distinct thread ids over time do not establish overlap. The only run that holds a
+  handler open long enough to test it — `reentrant`, where each handler blocks 152–282 ms in an
+  inline lookup — shows strict serialization: the next callback starts 1 ms *after* the previous
+  handler returned, every time (`02:17:00.606` enter → `.858` return → `.859` next enter). Two
+  milliseconds across all logs carry two different callback thread ids, which at the log's 1 ms
+  resolution is equally consistent with fast sequential delivery. **Build the handler thread-safe
+  anyway** — that is a precaution against an unmeasured hypothesis, not a measured requirement, and
+  it is cheap.
 - **Callbacks are duplicated.** One trigger — `SetDefaultEndpoint` called once for each of the
   three roles — produced five `OnDefaultDeviceChanged` calls, `Console` and `Multimedia` twice each.
   Reproduced in every run. **The handler must be idempotent** — "the endpoint arrived" will be
@@ -125,7 +171,14 @@ exactly as long as it is registered, and the type that owns that field must itse
 | `Unregister` a second time for the same client | **throws** `COMException 0x80070490` "Element not found" |
 | `Unregister` a client that was never registered | **throws** `COMException 0x80070490` |
 | `Unregister` on an enumerator that was already `Dispose()`d | **throws** `NullReferenceException` (NAudio nulls its inner COM reference in `Dispose`) |
-| Process exit after a clean unregister | exit code 0, no crash, no hang |
+| Process exit after a clean unregister | exit code 0, no crash, no hang — re-confirmed at 02:36 (`lifetime-exitcheck.log`, `EXITCODE=0`) |
+
+Rows 2 and 3 look contradictory and are not. Row 2 is a client that **is** registered, unregistered
+a second time after the first unregister already removed it. Row 3 is a client that was **never**
+registered at all. Both end up asking the audio service to remove a registration it does not hold,
+which is why both give `0x80070490`. The contrast to keep in mind is with question 3's third row:
+unregistering a *currently registered* client succeeds with `S_OK` even from an enumerator instance
+that never registered it — the call is keyed on the client, not on the instance.
 
 So shutdown order is fixed: **unregister first, dispose the enumerator second, and unregister
 exactly once.** A `Dispose()` that is called twice, or a teardown path that runs after the
@@ -160,12 +213,19 @@ before touching the name. Anything that widens that filter must wrap the name re
 
 **Task 13 should build `EndpointMonitor` on `IMMNotificationClient`, not on the 2 s poll.**
 
-The mechanism is sound where it matters: registration succeeds, delivery is prompt (single-digit
-milliseconds from cause to callback), it survives the enumerator being disposed or collected,
-unregistration genuinely stops delivery, and it needs no message pump — so it works the same in the
-tray app as in a console. A 2 s poll would add a wake-up every 2 seconds for the whole time music is
-`Linked`, in an app whose reason for existing is to sit in the tray, and would still need every
-piece of thread-safety work the event path needs.
+The mechanism is sound where it matters: registration succeeds, delivery is prompt (8 ms from cause
+to callback), it survives the enumerator being disposed or collected, unregistration genuinely stops
+delivery, and it needs no message pump — so it works the same in the tray app as in a console. The
+case against the poll is the wake-up: every 2 seconds for the whole time music is `Linked`, plus a
+full `EnumerateAudioEndPoints` each time — measured at 152–282 ms of COM work per enumeration in the
+reentrant run — in an app whose reason for existing is to sit in the tray and be forgotten.
+
+To be fair to the fallback: it does *not* inherit most of the pinned rules below. Five of the six
+are properties of the callback path (strong reference, MTA delivery, duplicates, no work on the
+notification thread, unregister ordering) and simply do not arise for a timer. The poll's cost is
+the wake-up, and its benefit is that it cannot miss an arrival it was never told about — which is
+precisely the open question. That is why the fallback stays one class away rather than being argued
+out of existence here.
 
 The decision is made with one gap open, stated plainly: **it has not been observed that the A2DP
 endpoint's own appearance raises a callback**, because the endpoint could not be made to appear or
@@ -180,16 +240,19 @@ Because of that gap, the interface must be built so the fallback costs nothing:
 2. **Check for the endpoint once at subscribe time, before waiting for any event.** This is
    required regardless: it is measured above that the endpoint can already be `Active` when the
    monitor starts, and it also makes the monitor correct even if the arrival callback never comes.
-3. **Verify the gap on the next real disconnect/reconnect.** Run the probe's `watch` mode across a
-   genuine phone disconnect and reconnect and record which callback fires here. If none does, take
-   the fallback.
+3. **Verify the gap on the next real disconnect/reconnect.** Rebuild the probe by copy-pasting the
+   source at the end of this note, run `EndpointProbe watch mta 300` across a genuine phone
+   disconnect and reconnect, and record which callback fires here. If none does, take the fallback.
 
-Rules the implementation is pinned to, all from the measurements above:
+Rules the implementation is pinned to. Five come from measurements above; the concurrency one is
+flagged because it does not:
 
 - Hold a strong reference to the `IMMNotificationClient` for the whole registration, or the process
   dies with `0xC0000005`.
-- Assume callbacks arrive concurrently on several non-UI MTA threads; marshal to the UI thread
-  through `IUiDispatcher`.
+- Callbacks arrive on non-UI MTA worker threads and not always the same one; marshal to the UI
+  thread through `IUiDispatcher`. Make the handler thread-safe **as a precaution** — that two
+  callbacks can overlap is a hypothesis this probe did not confirm, and the one run able to test it
+  showed serialization.
 - Assume duplicate notifications; make the handler idempotent.
 - Do no real work and no MMDevice lookups on the notification thread.
 - Catch everything inside the handler and log it; nothing else will.
@@ -199,10 +262,14 @@ Rules the implementation is pinned to, all from the measurements above:
 
 ## The probe
 
-A throwaway console app (net8.0-windows10.0.19041.0, NAudio 2.2.1), in the session scratchpad and
-not committed. Modes: `list`, `watch <mta|sta|sta-pump> <seconds>`, `lifetime`, `weakclient`,
-`throwing`, `reentrant`. The excerpts below are verbatim; what is omitted around them is logging
-plumbing and command-line dispatch.
+A throwaway console app (net8.0-windows10.0.19041.0, NAudio 2.2.1) that lived in the session
+scratchpad — a temp directory that will not survive, which is why its **full source is reproduced at
+the end of this note**: decision item 3 asks for it to be re-run, and a pointer to a deleted
+directory is not a re-runnable probe. Modes: `list`, `watch <mta|sta|sta-pump> <seconds>`,
+`lifetime`, `weakclient`, `throwing`, `reentrant`, `setdefault <role> <deviceId>`.
+
+The excerpts immediately below are the parts that produced each answer; the complete file follows
+later.
 
 The callback client. Note the name lookup reads a dictionary filled *outside* the callback — the
 probe never re-enters COM from a callback except in the one mode that exists to test that:
@@ -318,8 +385,20 @@ from "the listener was dead".
 
 Registration, delivery, and the threads — MTA registrant (`lifetime mta`):
 
-The device-id suffix `[{0.0.1.00000000}.{03bb069a-...}]` is trimmed off the end of the callback
-lines for width; nothing else is edited.
+**How these blocks are edited.** The logger (source at the end of this note) emits every line as
+`HH:mm:ss.fff +N,NNs [tid=N apt=X pool=Y bg=Y] text`, unconditionally. In the blocks below:
+
+- device-id suffixes like `[{0.0.1.00000000}.{03bb069a-…}]` are trimmed off the end;
+- the logger's column padding (it pads `apt=` to 11 characters) is collapsed to single spaces;
+- the `pool=` and `bg=` columns are dropped **only** where they are constant for the whole block —
+  they read `pool=N bg=N` on main-thread lines and `pool=N bg=Y` on every callback line, without
+  exception, and the first block below keeps them in full so the real format is visible;
+- `[... x omitted ...]` marks lines removed from the middle of a run;
+- `(xN)` marks N consecutive identical lines collapsed to one;
+- anything in `( )` at the right-hand end of a line, and any `<-` marker, is my annotation, not
+  probe output.
+
+Nothing is reworded, reordered, or re-timed.
 
 ```
 02:15:39.539 +  1,36s [tid=4   apt=MTA  pool=N bg=N] Register -> 0x00000000
@@ -330,6 +409,9 @@ lines for width; nothing else is edited.
 02:15:39.557 +  1,38s [tid=5   apt=MTA  pool=N bg=Y] CALLBACK P1.OnDefaultDeviceChanged: flow=Capture role=Console 'Mikrofon (Steam Streaming Microphone)'
 02:15:39.574 +  1,40s [tid=5   apt=MTA  pool=N bg=Y] CALLBACK P1.OnDefaultDeviceChanged: flow=Capture role=Communications 'Mikrofon (Steam Streaming Microphone)'
 02:15:41.085 +  2,91s [tid=4   apt=MTA  pool=N bg=N]   verified default capture/Console is now 'Mikrofon (Steam Streaming Microphone)' -> trigger TOOK EFFECT
+[... 7 lines omitted: TRIGGER (P1 B) flips back to 'Mikrofon (beyerdynamic LL Adapter)', 5 further
+     callbacks on tid=5 at 02:15:41.089-.119, and its own TOOK EFFECT verification. That second
+     flip is where the other 5 of the 10 counted below come from. ...]
 02:15:42.626 +  4,45s [tid=4   apt=MTA  pool=N bg=N] RESULT P1: 10 callback(s) while the enumerator was held.
 02:15:42.626 +  4,45s [tid=4   apt=MTA  pool=N bg=N] Unregister -> 0x00000000
 02:15:44.174 +  6,00s [tid=4   apt=MTA  pool=N bg=N] RESULT P1: 0 callback(s) AFTER unregister (expect 0 if unregister works).
@@ -371,6 +453,20 @@ Same phases with an STA registrant and no message pump (`lifetime sta`) — the 
 02:16:13.082 + 15,30s [tid=4  apt=STA  pool=N bg=N] RESULT P6: 0 callback(s) after unregister (expect 0).
 ```
 
+The STA registrant that *does* pump its message queue — same answer, callbacks still on MTA worker
+threads (`watch-stapump.log`; every callback line reads `pool=N bg=Y`):
+
+```
+02:16:17.404 +  0,01s [tid=4 apt=STA pool=N bg=N] Probe start. mode=watch apartment-arg=sta-pump actual=STA pid=31472 os=Microsoft Windows NT 10.0.19045.0 clr=8.0.23
+02:16:18.487 +  1,08s [tid=4 apt=STA pool=N bg=N] RegisterEndpointNotificationCallback returned 0x00000000
+02:16:18.487 +  1,08s [tid=4 apt=STA pool=N bg=N] Pumping the STA message queue.
+02:16:23.758 +  6,35s [tid=6 apt=MTA pool=N bg=Y] CALLBACK watch.OnDefaultDeviceChanged: flow=Capture role=Console 'Mikrofon (beyerdynamic LL Adapter)'
+[... 8 further callbacks, on tid=6 and tid=7 ...]
+02:16:28.340 + 10,94s [tid=7 apt=MTA pool=N bg=Y] CALLBACK watch.OnDefaultDeviceChanged: flow=Capture role=Communications 'Mikrofon (beyerdynamic LL Adapter)'
+02:16:38.542 + 21,14s [tid=4 apt=STA pool=N bg=N] Watch window over. 10 callback(s) seen.
+02:16:38.542 + 21,14s [tid=4 apt=STA pool=N bg=N] UnregisterEndpointNotificationCallback returned 0x00000000
+```
+
 The weakly-held client, run twice, identical both times (`weakclient mta`):
 
 ```
@@ -404,23 +500,43 @@ A handler that throws (`throwing mta`):
 02:17:01.023 +  1,77s [tid=6  apt=MTA  pool=N bg=Y]   reentrant: inline lookup returned 'Line (MYSTRAPIX9 A2DP SNK)'
 ```
 
-The A2DP window, with the app's own log interleaved (`watch mta 95` + packaged launch/kill):
+The A2DP window. **This one is a constructed timeline, not a single log** — it merges three
+sources, each labelled in the left-hand column: `probe` = `a2dp-cycle.log`, `app` =
+`%LOCALAPPDATA%\Klangbruecke\logs\klangbruecke-20260805.log`, `list` = a separate `EndpointProbe
+list` process. The `pool=`/`bg=` columns are dropped, and each control's 10 callbacks (5 on the
+flip, 5 on the restore ~3 s later) are collapsed to the first line of the first burst.
+
+Three lines here are **not** backed by a saved file, and are marked so you do not go looking: the
+two `list` lines (`02:19:42.920`, `02:20:25.406`) came from separate short-lived processes whose
+output went to the console, and the kill marker (`02:20:08.261`) is the orchestrating shell's own
+timestamp. Every other timestamp quoted anywhere in this note appears in one of the probe logs or
+in the app log named above.
 
 ```
 probe  02:19:11.854 +  1,12s [tid=4 apt=MTA] RegisterEndpointNotificationCallback returned 0x00000000
-probe  02:19:17.127 +  6,39s [tid=6 apt=MTA] CALLBACK watch.OnDefaultDeviceChanged  (control 1, x5)
-probe  02:19:41.545 + 30,81s [tid=6 apt=MTA] CALLBACK watch.OnDefaultDeviceChanged  (control 2, x5)
-list   02:19:42.920                          Active 'Line (MYSTRAPIX9 A2DP SNK)'   (separate process)
+probe  02:19:17.127 +  6,39s [tid=6 apt=MTA] CALLBACK watch.OnDefaultDeviceChanged   (control 1: 5 here + 5 at 02:19:20)
+probe  02:19:41.545 + 30,81s [tid=6 apt=MTA] CALLBACK watch.OnDefaultDeviceChanged   (control 2: 5 here + 5 at 02:19:45)
+list   02:19:42.920                          Active 'Line (MYSTRAPIX9 A2DP SNK)'
 app    02:19:43.646 [INF] Opening A2DP sink connection to id=...\SNK
 app    02:19:43.697 [INF] A2DP sink connected.
 app    02:19:43.986 [INF] Routing 'Line (MYSTRAPIX9 A2DP SNK)' -> 'VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)'.
-probe  02:20:05.952 + 55,22s [tid=6 apt=MTA] CALLBACK watch.OnDefaultDeviceChanged  (control 3, x5)
-                                             <- app killed at 02:20:08
-list   02:20:25.406                          Active 'Line (MYSTRAPIX9 A2DP SNK)'   (separate process)
-probe  02:20:30.373 + 79,64s [tid=6 apt=MTA] CALLBACK watch.OnDefaultDeviceChanged  (control 4, x5)
+probe  02:20:05.952 + 55,22s [tid=6 apt=MTA] CALLBACK watch.OnDefaultDeviceChanged   (control 3: 5 here + 5 at 02:20:09)
+                                             <- Klangbruecke killed at 02:20:08.261
+list   02:20:25.406                          Active 'Line (MYSTRAPIX9 A2DP SNK)'
+probe  02:20:30.373 + 79,64s [tid=6 apt=MTA] CALLBACK watch.OnDefaultDeviceChanged   (control 4: 5 here + 5 at 02:20:33)
 probe  02:20:46.963 + 96,23s [tid=4 apt=MTA] Watch window over. 40 callback(s) seen.
+```
 
-grep 'CALLBACK.*(A2DP|SNK)' -> 0 matches
+The negative was taken by censusing all 40 callback lines by device name, as set out under question
+1 — not by one pattern match. For the record, the checks were PowerShell `Select-String`
+(.NET regex, where `(A2DP|SNK)` really is an alternation, unlike a POSIX BRE `grep` where those
+metacharacters would be literal and the check would silently pass against any input):
+
+```
+Select-String -Path a2dp-cycle.log -Pattern 'CALLBACK [A-Za-z0-9]+\.' -CaseSensitive   -> 40   (positive control)
+Select-String -Path a2dp-cycle.log -Pattern 'A2DP' -CaseSensitive                      ->  0
+Select-String -Path a2dp-cycle.log -Pattern 'SNK'  -CaseSensitive                      ->  0
+Select-String -Path lifetime-mta.log -Pattern 'CALLBACK.*(Steam|beyerdynamic)'          -> 62   (alternation works)
 ```
 
 ---
@@ -435,3 +551,935 @@ grep 'CALLBACK.*(A2DP|SNK)' -> 0 matches
 - Launched and killed the installed package `Klangbruecke_0.1.0.2_x64__vwcm37s2b7kd8` twice.
 - Did **not** touch the Bluetooth radio, the pairing, any device's enable/disable state, or the
   default *render* endpoint.
+
+---
+
+## Probe source
+
+The probe itself is throwaway and was never committed as code — but it lived in a session-scoped
+temp directory, and the decision above asks for it to be re-run against a real phone disconnect. So
+the whole thing is reproduced here. Three files, copy-paste into an empty directory,
+`dotnet run -c Release -- <mode>`. Nothing outside NAudio 2.2.1 is required.
+
+This was verified rather than asserted: the two source blocks below were extracted back out of this
+markdown file, diffed against the files that produced every measurement above (`Program.cs`,
+832 lines — **identical**), then built and run from the extracted copy. That round-trip build
+succeeded with 0 warnings and the resulting binary delivered callbacks normally
+(`watch mta 16` at 02:42, 10 callbacks on `tid=6`/`tid=7`, controls verified `TOOK EFFECT`,
+exit code 0).
+
+The parts worth reading before re-running:
+
+- **`PolicyConfig`** — the default-endpoint flip used as a synthetic notification, and the
+  `IPolicyConfigVista` vs `IPolicyConfig` IID discovery. On Windows 10 19045, `{568b9108-…}` (the
+  IID in most sample code) returns `E_NOINTERFACE`; `{f8679f50-…}` works and has one extra vtable
+  slot. `SetDefaultEndpoint` returns `S_OK` for a normal, non-elevated user.
+- **`Trigger`** — never trusts the flip. It re-reads the default afterwards and prints
+  `TOOK EFFECT` / `DID NOT TAKE EFFECT`. Every claim in this note rests on that line.
+- **`SetupToggleTargets` / `RestoreDefaults`** — record the machine's three capture-role defaults
+  before touching anything and put them back after. `setdefault` mode exists so an orchestration
+  script can restore them from outside even when a probe run dies mid-way, which two of them do on
+  purpose.
+- **`PhaseClientOnlyWeaklyHeld`** — the one that kills the process. It runs as its own mode, last,
+  because a crash mid-suite skips both the remaining phases and the restore.
+
+### `EndpointProbe.csproj`
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>EndpointProbe</AssemblyName>
+    <RootNamespace>EndpointProbe</RootNamespace>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+</Project>
+```
+
+### `Program.cs`
+
+```csharp
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
+
+namespace EndpointProbe;
+
+internal static class Log
+{
+    private static readonly object Gate = new();
+    private static readonly Stopwatch Clock = Stopwatch.StartNew();
+
+    public static void Line(string text)
+    {
+        lock (Gate)
+        {
+            Console.WriteLine(
+                $"{DateTime.Now:HH:mm:ss.fff} +{Clock.Elapsed.TotalSeconds,6:F2}s " +
+                $"[tid={Environment.CurrentManagedThreadId,-3} " +
+                $"apt={Thread.CurrentThread.GetApartmentState(),-11} " +
+                $"pool={(Thread.CurrentThread.IsThreadPoolThread ? "Y" : "N")} " +
+                $"bg={(Thread.CurrentThread.IsBackground ? "Y" : "N")}] {text}");
+            Console.Out.Flush();
+        }
+    }
+
+    public static void Head(string text)
+    {
+        lock (Gate)
+        {
+            Console.WriteLine();
+            Console.WriteLine("=== " + text + " " + new string('=', Math.Max(0, 60 - text.Length)));
+            Console.Out.Flush();
+        }
+    }
+}
+
+/// <summary>id -> friendly name, filled outside callbacks so no callback ever re-enters COM.</summary>
+internal static class Names
+{
+    private static readonly ConcurrentDictionary<string, string> Map = new(StringComparer.OrdinalIgnoreCase);
+
+    public static void Refresh()
+    {
+        using var e = new MMDeviceEnumerator();
+        foreach (MMDevice d in e.EnumerateAudioEndPoints(DataFlow.All, DeviceState.All))
+        {
+            try { Map[d.ID] = d.FriendlyName; } catch { /* a vanishing device */ }
+        }
+    }
+
+    public static string Describe(string? id)
+    {
+        if (id is null) return "(null id)";
+        return Map.TryGetValue(id, out string? name) ? $"'{name}' [{id}]" : $"(unknown) [{id}]";
+    }
+}
+
+internal sealed class ProbeClient : IMMNotificationClient
+{
+    private readonly string _name;
+    private int _count;
+
+    public ProbeClient(string name) => _name = name;
+
+    public int Count => Volatile.Read(ref _count);
+
+    private void Fire(string callback, string detail)
+    {
+        Interlocked.Increment(ref _count);
+        Log.Line($"CALLBACK {_name}.{callback}: {detail}");
+    }
+
+    public void OnDeviceStateChanged(string deviceId, DeviceState newState) =>
+        Fire("OnDeviceStateChanged", $"newState={newState} {Names.Describe(deviceId)}");
+
+    public void OnDeviceAdded(string pwstrDeviceId) =>
+        Fire("OnDeviceAdded", Names.Describe(pwstrDeviceId));
+
+    public void OnDeviceRemoved(string deviceId) =>
+        Fire("OnDeviceRemoved", Names.Describe(deviceId));
+
+    public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId) =>
+        Fire("OnDefaultDeviceChanged", $"flow={flow} role={role} {Names.Describe(defaultDeviceId)}");
+
+    public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key) =>
+        Fire("OnPropertyValueChanged", $"key={key.formatId}/{key.propertyId} {Names.Describe(pwstrDeviceId)}");
+}
+
+/// <summary>
+/// A client that deliberately re-enters the MMDevice API from inside the callback, to find out
+/// whether the endpoint can be looked up on the notification thread (what an EndpointMonitor
+/// would want to do) or whether that deadlocks / throws.
+/// </summary>
+internal sealed class ReentrantClient : IMMNotificationClient
+{
+    public void OnDeviceStateChanged(string deviceId, DeviceState newState)
+    {
+        Log.Line($"CALLBACK reentrant.OnDeviceStateChanged newState={newState} id={deviceId}");
+        Lookup();
+    }
+
+    public void OnDeviceAdded(string pwstrDeviceId)
+    {
+        Log.Line($"CALLBACK reentrant.OnDeviceAdded id={pwstrDeviceId}");
+        Lookup();
+    }
+
+    public void OnDeviceRemoved(string deviceId)
+    {
+        Log.Line($"CALLBACK reentrant.OnDeviceRemoved id={deviceId}");
+        Lookup();
+    }
+
+    public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId)
+    {
+        Log.Line($"CALLBACK reentrant.OnDefaultDeviceChanged flow={flow} role={role}");
+        Lookup();
+    }
+
+    public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key)
+    {
+        Log.Line($"CALLBACK reentrant.OnPropertyValueChanged key={key.propertyId}");
+    }
+
+    private static void Lookup()
+    {
+        try
+        {
+            Log.Line("  reentrant: calling AudioRouter-style FindSinkCaptureEndpoint() inline...");
+            using var e = new MMDeviceEnumerator();
+            MMDevice? hit = e.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active)
+                .FirstOrDefault(d => d.FriendlyName.Contains("A2DP", StringComparison.OrdinalIgnoreCase)
+                                  || d.FriendlyName.Contains("SNK", StringComparison.OrdinalIgnoreCase));
+            Log.Line($"  reentrant: inline lookup returned {(hit is null ? "null" : "'" + hit.FriendlyName + "'")}");
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"  reentrant: inline lookup THREW {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+}
+
+/// <summary>Lets an exception escape the callback, to see what the process does about it.</summary>
+internal sealed class ThrowingClient : IMMNotificationClient
+{
+    private int _thrown;
+
+    public int Thrown => Volatile.Read(ref _thrown);
+
+    public void OnDeviceStateChanged(string deviceId, DeviceState newState) => Boom("OnDeviceStateChanged");
+
+    public void OnDeviceAdded(string pwstrDeviceId) => Boom("OnDeviceAdded");
+
+    public void OnDeviceRemoved(string deviceId) => Boom("OnDeviceRemoved");
+
+    public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId) => Boom("OnDefaultDeviceChanged");
+
+    public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key) => Boom("OnPropertyValueChanged");
+
+    private void Boom(string callback)
+    {
+        Interlocked.Increment(ref _thrown);
+        Log.Line($"CALLBACK throwing.{callback}: about to throw InvalidOperationException");
+        throw new InvalidOperationException("deliberate probe failure inside the callback");
+    }
+}
+
+internal static class PolicyConfig
+{
+    [ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")]
+    private class PolicyConfigClient
+    {
+    }
+
+    [ComImport, Guid("568b9108-44bf-40b4-9006-86afe5b5a620"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPolicyConfigVista
+    {
+        // Vtable placeholders: GetMixFormat, GetDeviceFormat, SetDeviceFormat, GetProcessingPeriod,
+        // SetProcessingPeriod, GetShareMode, SetShareMode, GetPropertyValue, SetPropertyValue.
+        // Never called; they only push SetDefaultEndpoint to the right slot.
+        void Slot0();
+        void Slot1();
+        void Slot2();
+        void Slot3();
+        void Slot4();
+        void Slot5();
+        void Slot6();
+        void Slot7();
+        void Slot8();
+
+        [PreserveSig]
+        int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string deviceId, int role);
+    }
+
+    // Windows 10 19045 answers this IID, not the "Vista" one (measured: QueryInterface for
+    // {568B9108-...} returns E_NOINTERFACE). One extra vtable slot: ResetDeviceFormat sits
+    // between GetDeviceFormat and SetDeviceFormat.
+    [ComImport, Guid("f8679f50-850a-41cf-9c72-430f290290c8"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPolicyConfig
+    {
+        void Slot0();
+        void Slot1();
+        void Slot2();
+        void Slot3();
+        void Slot4();
+        void Slot5();
+        void Slot6();
+        void Slot7();
+        void Slot8();
+        void Slot9();
+
+        [PreserveSig]
+        int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string deviceId, int role);
+    }
+
+    /// <summary>Sets the default endpoint for one role. Returns the HRESULT.</summary>
+    public static int SetDefaultEndpoint(string deviceId, Role role)
+    {
+        object? raw = null;
+        try
+        {
+            raw = new PolicyConfigClient();
+
+            if (raw is IPolicyConfig modern)
+            {
+                return modern.SetDefaultEndpoint(deviceId, (int)role);
+            }
+
+            if (raw is IPolicyConfigVista vista)
+            {
+                return vista.SetDefaultEndpoint(deviceId, (int)role);
+            }
+
+            Log.Line("  PolicyConfigClient supports neither IPolicyConfig nor IPolicyConfigVista.");
+            return -1;
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"  SetDefaultEndpoint threw {ex.GetType().Name}: {ex.Message}");
+            return -1;
+        }
+        finally
+        {
+            if (raw is not null)
+            {
+                Marshal.ReleaseComObject(raw);
+            }
+        }
+    }
+}
+
+internal static class Program
+{
+    private const uint PM_REMOVE = 1;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public int ptX;
+        public int ptY;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool PeekMessageW(out MSG lpMsg, IntPtr hWnd, uint min, uint max, uint remove);
+
+    [DllImport("user32.dll")]
+    private static extern bool TranslateMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessageW(ref MSG lpMsg);
+
+    private static int Main(string[] args)
+    {
+        string mode = args.Length > 0 ? args[0] : "list";
+        string apartment = args.Length > 1 ? args[1] : "mta";
+
+        int exit = 0;
+        var thread = new Thread(() => exit = Run(mode, apartment, args), 1024 * 1024);
+        thread.SetApartmentState(apartment.StartsWith("sta", StringComparison.OrdinalIgnoreCase)
+            ? ApartmentState.STA
+            : ApartmentState.MTA);
+        thread.Start();
+        thread.Join();
+
+        Log.Line($"Main returning {exit}.");
+        return exit;
+    }
+
+    private static int Run(string mode, string apartment, string[] args)
+    {
+        Log.Line($"Probe start. mode={mode} apartment-arg={apartment} " +
+                 $"actual={Thread.CurrentThread.GetApartmentState()} pid={Environment.ProcessId} " +
+                 $"os={Environment.OSVersion.VersionString} clr={Environment.Version}");
+        Names.Refresh();
+
+        switch (mode)
+        {
+            case "list":
+                ListEndpoints();
+                return 0;
+            case "watch":
+                return Watch(apartment, args.Length > 2 ? int.Parse(args[2]) : 60);
+            case "lifetime":
+                return Lifetime();
+            case "reentrant":
+                return Reentrant(args.Length > 2 ? int.Parse(args[2]) : 30);
+            case "throwing":
+                return Throwing();
+            case "weakclient":
+                // Phase 5 alone: it can kill the process, so it must not be able to skip anything.
+                return PhaseClientOnlyWeaklyHeld() ? 0 : 3;
+            case "setdefault":
+                // setdefault <roleIndex> <deviceId> - used by the orchestration script to put the
+                // machine back exactly as it was, even after a probe run dies.
+                int role = int.Parse(args[2]);
+                Log.Line($"SetDefaultEndpoint(role={(Role)role}, {args[3]}) -> " +
+                         $"0x{PolicyConfig.SetDefaultEndpoint(args[3], (Role)role):X8}");
+                return 0;
+            default:
+                Log.Line("Unknown mode. Use: list | watch <mta|sta|sta-pump> <seconds> | lifetime | reentrant <seconds> | throwing");
+                return 2;
+        }
+    }
+
+    private static void ListEndpoints()
+    {
+        using var e = new MMDeviceEnumerator();
+        foreach (DataFlow flow in new[] { DataFlow.Render, DataFlow.Capture })
+        {
+            Log.Head($"{flow} endpoints (all states)");
+            foreach (MMDevice d in e.EnumerateAudioEndPoints(flow, DeviceState.All))
+            {
+                string name;
+                try
+                {
+                    name = "'" + d.FriendlyName + "'";
+                }
+                catch (Exception ex)
+                {
+                    // Measured: reading FriendlyName on some non-Active endpoints throws
+                    // COMException 0xE000020B (SPAPI_E_NO_SUCH_DEVINST).
+                    name = $"(FriendlyName threw {ex.GetType().Name} 0x{ex.HResult:X8})";
+                }
+
+                Log.Line($"  {d.State,-10} {name} [{d.ID}]");
+            }
+        }
+
+        foreach (DataFlow flow in new[] { DataFlow.Render, DataFlow.Capture })
+        {
+            foreach (Role role in new[] { Role.Console, Role.Multimedia, Role.Communications })
+            {
+                string id = e.HasDefaultAudioEndpoint(flow, role)
+                    ? e.GetDefaultAudioEndpoint(flow, role).ID
+                    : "(none)";
+                Log.Line($"default {flow}/{role}: {Names.Describe(id)}");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- watch
+
+    private static int Watch(string apartment, int seconds)
+    {
+        Log.Head($"WATCH for {seconds}s ({apartment})");
+        var enumerator = new MMDeviceEnumerator();
+        var client = new ProbeClient("watch");
+        int hr = enumerator.RegisterEndpointNotificationCallback(client);
+        Log.Line($"RegisterEndpointNotificationCallback returned 0x{hr:X8}");
+
+        // A deterministic self-trigger at +5s, restored at +12s, so that every watch run proves the
+        // registration was actually live during the window - separate from whatever the machine
+        // does on its own (an app opening the A2DP connection, the phone dropping, ...).
+        DateTime selfTriggerUntil = DateTime.UtcNow.AddSeconds(seconds - 8);
+        var selfTrigger = new Thread(() =>
+        {
+            Thread.Sleep(5000);
+            if (!SetupToggleTargets())
+            {
+                return;
+            }
+
+            // Repeated, not once: a run that watches for an externally caused endpoint change needs
+            // a positive control on BOTH sides of it, or "no callbacks" cannot be told apart from
+            // "the listener was dead".
+            while (DateTime.UtcNow < selfTriggerUntil)
+            {
+                Trigger("watch self-trigger", _idB);
+                Thread.Sleep(2000);
+                RestoreDefaults();
+                Thread.Sleep(20000);
+            }
+        })
+        { IsBackground = true };
+        selfTrigger.SetApartmentState(ApartmentState.MTA);
+        selfTrigger.Start();
+
+        DateTime deadline = DateTime.UtcNow.AddSeconds(seconds);
+        bool pump = apartment.Equals("sta-pump", StringComparison.OrdinalIgnoreCase);
+        Log.Line(pump ? "Pumping the STA message queue." : "NOT pumping any message queue; just sleeping.");
+
+        var lastRefresh = DateTime.UtcNow;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (pump && PeekMessageW(out MSG msg, IntPtr.Zero, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(ref msg);
+                DispatchMessageW(ref msg);
+                continue;
+            }
+
+            Thread.Sleep(50);
+
+            // Keep the id -> name map current so newly added endpoints can be named, but never
+            // from inside a callback.
+            if (DateTime.UtcNow - lastRefresh > TimeSpan.FromSeconds(3))
+            {
+                lastRefresh = DateTime.UtcNow;
+                Names.Refresh();
+            }
+        }
+
+        Log.Line($"Watch window over. {client.Count} callback(s) seen.");
+        int hr2 = enumerator.UnregisterEndpointNotificationCallback(client);
+        Log.Line($"UnregisterEndpointNotificationCallback returned 0x{hr2:X8}");
+        enumerator.Dispose();
+        return 0;
+    }
+
+    // ------------------------------------------------------------- lifetime
+
+    private static string? _origConsole;
+    private static string? _origMultimedia;
+    private static string? _origCommunications;
+    private static string _idA = "";
+    private static string _idB = "";
+
+    /// <summary>
+    /// Picks two active capture endpoints to flip the default between, and remembers the current
+    /// defaults so they can be put back. Capture rather than render so nothing audible changes.
+    /// </summary>
+    private static bool SetupToggleTargets()
+    {
+        using var e = new MMDeviceEnumerator();
+        List<MMDevice> capture = e.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active)
+            // Never touch the endpoint under study.
+            .Where(d => !d.FriendlyName.Contains("A2DP", StringComparison.OrdinalIgnoreCase)
+                     && !d.FriendlyName.Contains("SNK", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (capture.Count < 2)
+        {
+            Log.Line("Need two active capture endpoints to toggle the default between. Aborting.");
+            return false;
+        }
+
+        _origConsole = e.HasDefaultAudioEndpoint(DataFlow.Capture, Role.Console)
+            ? e.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Console).ID : null;
+        _origMultimedia = e.HasDefaultAudioEndpoint(DataFlow.Capture, Role.Multimedia)
+            ? e.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Multimedia).ID : null;
+        _origCommunications = e.HasDefaultAudioEndpoint(DataFlow.Capture, Role.Communications)
+            ? e.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications).ID : null;
+
+        _idA = capture[0].ID;
+        _idB = capture[1].ID;
+
+        Log.Line($"Toggle target A: {Names.Describe(_idA)}");
+        Log.Line($"Toggle target B: {Names.Describe(_idB)}");
+        Log.Line($"Original capture defaults: Console={Names.Describe(_origConsole)} " +
+                 $"Multimedia={Names.Describe(_origMultimedia)} Comms={Names.Describe(_origCommunications)}");
+        return true;
+    }
+
+    private static int Lifetime()
+    {
+        if (!SetupToggleTargets())
+        {
+            return 3;
+        }
+
+        try
+        {
+            PhaseSanity();
+            PhaseEnumeratorDropped();
+            PhaseEnumeratorDisposed();
+            PhaseCrossInstanceUnregister();
+            // Phase 5 is deliberately NOT here: it kills the process, which would skip both the
+            // phase below it and the restore in the finally. It runs as its own "weakclient" mode.
+            PhaseUnregisterTwiceAndAfterDispose();
+        }
+        finally
+        {
+            RestoreDefaults();
+        }
+
+        Log.Head("Process is about to exit normally");
+        return 0;
+    }
+
+    /// <summary>Flips the default capture endpoint, which is the trigger for every phase below.</summary>
+    private static bool Trigger(string label, string toId)
+    {
+        Log.Line($"TRIGGER ({label}): setting default capture endpoint to {Names.Describe(toId)}");
+        foreach (Role role in new[] { Role.Console, Role.Multimedia, Role.Communications })
+        {
+            int hr = PolicyConfig.SetDefaultEndpoint(toId, role);
+            if (hr != 0)
+            {
+                Log.Line($"  SetDefaultEndpoint({role}) returned 0x{hr:X8}");
+            }
+        }
+
+        Thread.Sleep(1500);
+
+        using var e = new MMDeviceEnumerator();
+        string now = e.HasDefaultAudioEndpoint(DataFlow.Capture, Role.Console)
+            ? e.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Console).ID : "(none)";
+        bool ok = string.Equals(now, toId, StringComparison.OrdinalIgnoreCase);
+        Log.Line($"  verified default capture/Console is now {Names.Describe(now)} -> trigger {(ok ? "TOOK EFFECT" : "DID NOT TAKE EFFECT")}");
+        return ok;
+    }
+
+    private static void RestoreDefaults()
+    {
+        Log.Head("Restoring the original default capture endpoints");
+        if (_origConsole is not null) Log.Line($"  Console -> 0x{PolicyConfig.SetDefaultEndpoint(_origConsole, Role.Console):X8}");
+        if (_origMultimedia is not null) Log.Line($"  Multimedia -> 0x{PolicyConfig.SetDefaultEndpoint(_origMultimedia, Role.Multimedia):X8}");
+        if (_origCommunications is not null) Log.Line($"  Communications -> 0x{PolicyConfig.SetDefaultEndpoint(_origCommunications, Role.Communications):X8}");
+
+        Thread.Sleep(800);
+        using var e = new MMDeviceEnumerator();
+        foreach (Role role in new[] { Role.Console, Role.Multimedia, Role.Communications })
+        {
+            string id = e.HasDefaultAudioEndpoint(DataFlow.Capture, role)
+                ? e.GetDefaultAudioEndpoint(DataFlow.Capture, role).ID : "(none)";
+            Log.Line($"  default capture/{role} is now {Names.Describe(id)}");
+        }
+    }
+
+    private static void PhaseSanity()
+    {
+        Log.Head("PHASE 1: does registration deliver at all, and on which thread");
+        var enumerator = new MMDeviceEnumerator();
+        var client = new ProbeClient("P1");
+        Log.Line($"Register -> 0x{enumerator.RegisterEndpointNotificationCallback(client):X8}");
+
+        int before = client.Count;
+        Trigger("P1 A", _idA);
+        Trigger("P1 B", _idB);
+        Log.Line($"RESULT P1: {client.Count - before} callback(s) while the enumerator was held.");
+
+        Log.Line($"Unregister -> 0x{enumerator.UnregisterEndpointNotificationCallback(client):X8}");
+        int after = client.Count;
+        Trigger("P1 after-unregister", _idA);
+        Log.Line($"RESULT P1: {client.Count - after} callback(s) AFTER unregister (expect 0 if unregister works).");
+        enumerator.Dispose();
+    }
+
+    private static void PhaseEnumeratorDropped()
+    {
+        Log.Head("PHASE 2: registration survives the enumerator going out of scope + GC?");
+        var client = new ProbeClient("P2");
+        WeakReference weakEnumerator = RegisterAndDrop(client);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        Log.Line($"Enumerator reference dropped; full GC + finalizers done. " +
+                 $"MMDeviceEnumerator IsAlive={weakEnumerator.IsAlive} " +
+                 "(False => the wrapper really was collected and its COM reference released).");
+
+        int before = client.Count;
+        Trigger("P2 after-GC", _idB);
+        Trigger("P2 after-GC", _idA);
+        Log.Line($"RESULT P2: {client.Count - before} callback(s) after the registering enumerator was collected.");
+    }
+
+    // Separate method so the enumerator local cannot stay rooted on the caller's frame.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference RegisterAndDrop(ProbeClient client)
+    {
+        var enumerator = new MMDeviceEnumerator();
+        Log.Line($"Register (enumerator local to this frame) -> 0x{enumerator.RegisterEndpointNotificationCallback(client):X8}");
+        return new WeakReference(enumerator);
+    }
+
+    private static void PhaseEnumeratorDisposed()
+    {
+        Log.Head("PHASE 3: registration survives MMDeviceEnumerator.Dispose()?");
+        var enumerator = new MMDeviceEnumerator();
+        var client = new ProbeClient("P3");
+        Log.Line($"Register -> 0x{enumerator.RegisterEndpointNotificationCallback(client):X8}");
+
+        int before = client.Count;
+        Trigger("P3 pre-dispose", _idB);
+        Log.Line($"  {client.Count - before} callback(s) before Dispose.");
+
+        enumerator.Dispose();
+        Log.Line("Enumerator disposed.");
+
+        int mid = client.Count;
+        Trigger("P3 post-dispose", _idA);
+        Log.Line($"RESULT P3: {client.Count - mid} callback(s) after Dispose().");
+
+        try
+        {
+            int hr = enumerator.UnregisterEndpointNotificationCallback(client);
+            Log.Line($"RESULT P3: Unregister on the DISPOSED enumerator returned 0x{hr:X8} (no throw).");
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"RESULT P3: Unregister on the DISPOSED enumerator THREW {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static void PhaseCrossInstanceUnregister()
+    {
+        Log.Head("PHASE 4: can a DIFFERENT enumerator instance unregister the callback?");
+        var e1 = new MMDeviceEnumerator();
+        var client = new ProbeClient("P4");
+        Log.Line($"Register on e1 -> 0x{e1.RegisterEndpointNotificationCallback(client):X8}");
+
+        var e2 = new MMDeviceEnumerator();
+        int hr;
+        try
+        {
+            hr = e2.UnregisterEndpointNotificationCallback(client);
+            Log.Line($"Unregister on e2 (never registered it) returned 0x{hr:X8}");
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"Unregister on e2 THREW {ex.GetType().Name}: {ex.Message}");
+        }
+
+        int before = client.Count;
+        Trigger("P4", _idB);
+        Log.Line($"RESULT P4: {client.Count - before} callback(s) after the cross-instance unregister " +
+                 "(non-zero => registration is per-enumerator-instance, and e2's unregister was a no-op).");
+
+        try
+        {
+            Log.Line($"Cleanup: unregister the same client on e1 -> 0x{e1.UnregisterEndpointNotificationCallback(client):X8}");
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"RESULT P4: unregistering on e1 after e2 already unregistered it THREW " +
+                     $"{ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message}");
+        }
+
+        e1.Dispose();
+        e2.Dispose();
+    }
+
+    private static bool PhaseClientOnlyWeaklyHeld()
+    {
+        Log.Head("PHASE 5: does the COM registration keep the managed client alive across a GC?");
+        if (!SetupToggleTargets())
+        {
+            return false;
+        }
+
+        var enumerator = new MMDeviceEnumerator();
+        WeakReference weak = RegisterWeak(enumerator);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        Log.Line($"After full GC, the client object IsAlive={weak.IsAlive} (no managed reference is held).");
+
+        Trigger("P5 after-GC", _idA);
+        var revived = weak.Target as ProbeClient;
+        Log.Line($"RESULT P5: client alive={weak.IsAlive}, callbacks seen by it = " +
+                 $"{(revived is null ? "(collected)" : revived.Count.ToString())}");
+
+        // Cannot unregister a collected client; if it is alive, clean up properly.
+        if (revived is not null)
+        {
+            try
+            {
+                Log.Line($"Cleanup unregister -> 0x{enumerator.UnregisterEndpointNotificationCallback(revived):X8}");
+            }
+            catch (Exception ex)
+            {
+                Log.Line($"Cleanup unregister THREW {ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message}");
+            }
+        }
+
+        enumerator.Dispose();
+        RestoreDefaults();
+        return true;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference RegisterWeak(MMDeviceEnumerator enumerator)
+    {
+        var client = new ProbeClient("P5");
+        Log.Line($"Register a client held only by a WeakReference -> 0x{enumerator.RegisterEndpointNotificationCallback(client):X8}");
+        return new WeakReference(client);
+    }
+
+    private static void PhaseUnregisterTwiceAndAfterDispose()
+    {
+        Log.Head("PHASE 6: shutdown behaviour of UnregisterEndpointNotificationCallback");
+        var enumerator = new MMDeviceEnumerator();
+        var client = new ProbeClient("P6");
+        Log.Line($"Register -> 0x{enumerator.RegisterEndpointNotificationCallback(client):X8}");
+
+        try
+        {
+            Log.Line($"Unregister #1 -> 0x{enumerator.UnregisterEndpointNotificationCallback(client):X8}");
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"Unregister #1 THREW {ex.GetType().Name}: {ex.Message}");
+        }
+
+        try
+        {
+            Log.Line($"Unregister #2 (double unregister) -> 0x{enumerator.UnregisterEndpointNotificationCallback(client):X8}");
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"Unregister #2 THREW {ex.GetType().Name}: {ex.Message}");
+        }
+
+        try
+        {
+            var never = new ProbeClient("never-registered");
+            Log.Line($"Unregister a client that was never registered -> 0x{enumerator.UnregisterEndpointNotificationCallback(never):X8}");
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"Unregister of a never-registered client THREW {ex.GetType().Name}: {ex.Message}");
+        }
+
+        int before = client.Count;
+        Trigger("P6 after-unregister", _idB);
+        Log.Line($"RESULT P6: {client.Count - before} callback(s) after unregister (expect 0).");
+        enumerator.Dispose();
+    }
+
+    // ------------------------------------------------------------- throwing
+
+    /// <summary>
+    /// What happens to the process when a handler throws on the notification thread? An
+    /// EndpointMonitor handler that lets an exception escape must not take the tray app down.
+    /// Deliberately the last thing any run does, and it restores the defaults first, so a
+    /// process death here cannot leave the machine's default capture endpoint changed.
+    /// </summary>
+    private static int Throwing()
+    {
+        Log.Head("THROWING: an exception escaping the callback");
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            Log.Line($"AppDomain.UnhandledException saw {(e.ExceptionObject as Exception)?.GetType().Name}, " +
+                     $"IsTerminating={e.IsTerminating}");
+
+        if (!SetupToggleTargets())
+        {
+            return 3;
+        }
+
+        var enumerator = new MMDeviceEnumerator();
+        var client = new ThrowingClient();
+        Log.Line($"Register -> 0x{enumerator.RegisterEndpointNotificationCallback(client):X8}");
+
+        try
+        {
+            Trigger("throwing", _idB);
+            Log.Line("RESULT: the process is still alive after the handler threw.");
+        }
+        finally
+        {
+            RestoreDefaults();
+            try
+            {
+                Log.Line($"Unregister -> 0x{enumerator.UnregisterEndpointNotificationCallback(client):X8}");
+            }
+            catch (Exception ex)
+            {
+                Log.Line($"Unregister THREW {ex.GetType().Name} 0x{ex.HResult:X8}: {ex.Message}");
+            }
+
+            enumerator.Dispose();
+        }
+
+        Log.Line($"RESULT: {client.Thrown} exception(s) thrown out of callbacks; process still running.");
+        return 0;
+    }
+
+    // ------------------------------------------------------------ reentrant
+
+    private static int Reentrant(int seconds)
+    {
+        Log.Head($"REENTRANT lookup inside the callback, {seconds}s");
+        Log.Line("A watchdog will hard-exit the process if a callback deadlocks.");
+
+        var watchdog = new Thread(() =>
+        {
+            Thread.Sleep(TimeSpan.FromSeconds(seconds + 25));
+            Log.Line("WATCHDOG: probe did not finish in time - the callback most likely deadlocked. Killing.");
+            Environment.Exit(99);
+        })
+        { IsBackground = true };
+        watchdog.Start();
+
+        var enumerator = new MMDeviceEnumerator();
+        var client = new ReentrantClient();
+        Log.Line($"Register -> 0x{enumerator.RegisterEndpointNotificationCallback(client):X8}");
+
+        // Self-trigger with a default-device flip, then idle so an externally caused endpoint change
+        // (app launch/exit) can also be caught.
+        if (SetupToggleTargets())
+        {
+            Trigger("reentrant", _idB);
+            RestoreDefaults();
+        }
+
+        Thread.Sleep(TimeSpan.FromSeconds(seconds));
+        Log.Line($"Unregister -> 0x{enumerator.UnregisterEndpointNotificationCallback(client):X8}");
+        enumerator.Dispose();
+        return 0;
+    }
+}
+```
+
+### `run-suite.ps1`
+
+The orchestration script. The restore after every run is unconditional and by explicit device id,
+so a run that dies cannot leave the machine's default capture endpoint changed.
+
+```powershell
+$ErrorActionPreference = 'Continue'
+$s = "C:\Users\MYSTRA~1\AppData\Local\Temp\claude\c--Users-MYSTRAVIL-Documents-Programming-Projects-klangbruecke\7bd81eec-f68e-4ad8-a0c1-fc1c489caba3\scratchpad"
+$exe = "$s\EndpointProbe\bin\Release\net8.0-windows10.0.19041.0\EndpointProbe.exe"
+
+# The defaults this machine had before any probe ran.
+$vm = "{0.0.1.00000000}.{5c619667-1059-4de0-9107-8766297156ff}"   # VoiceMeeter Output
+$bd = "{0.0.1.00000000}.{135882a4-8a93-4b59-bfcd-1a35f4559b8c}"   # Mikrofon (beyerdynamic LL Adapter)
+
+function Restore {
+    & $exe setdefault mta 0 $vm | Out-Null
+    & $exe setdefault mta 1 $vm | Out-Null
+    & $exe setdefault mta 2 $bd | Out-Null
+}
+
+function Run([string]$name, [string[]]$probeArgs) {
+    "==================== RUN $name : $($probeArgs -join ' ') ===================="
+    & $exe @probeArgs *>&1 | Out-File -FilePath "$s\$name.log" -Encoding utf8
+    $code = $LASTEXITCODE
+    "RUN $name EXITCODE=$code (0x{0:X8})" -f $code
+    Restore
+}
+
+Run "lifetime-mta"  @("lifetime", "mta")
+Run "lifetime-sta"  @("lifetime", "sta")
+Run "watch-stapump" @("watch", "sta-pump", "20")
+Run "weakclient-1"  @("weakclient", "mta")
+Run "weakclient-2"  @("weakclient", "mta")
+Run "throwing"      @("throwing", "mta")
+Run "reentrant"     @("reentrant", "mta", "12")
+
+"==================== FINAL DEFAULTS ===================="
+& $exe list | Select-String "default Capture"
+```
