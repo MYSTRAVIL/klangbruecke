@@ -56,6 +56,13 @@ public sealed class CallTransportService : ICallTransportService
     /// No device is <see cref="RegistrationStatus.NotRegistered"/>, not Unknown. There is nothing to
     /// ask, which is a known answer - the role cannot be held through a device this class does not
     /// have.
+    ///
+    /// What the guard covers is the ABI call, and only that. <see cref="Report"/> invokes
+    /// <see cref="Status"/>, so a subscriber that throws escapes this method into the very callback
+    /// the guard exists to protect. Left as it is, consistently with the rest of this class - the
+    /// connect path's catch calls <see cref="Report"/> on the same terms - because a catch around a
+    /// subscriber's throw is one nothing in this codebase can reach, and an untestable swallow is
+    /// worse than a named limit.
     /// </summary>
     public RegistrationStatus ReadRegistration()
     {
@@ -125,6 +132,14 @@ public sealed class CallTransportService : ICallTransportService
 
         try
         {
+            // Assigned before the first await, and that ordering is load-bearing outside this method.
+            // Disconnect() reads this field, so a release arriving while this call is suspended can
+            // still find the device and unregister it - which is the only thing that stops a
+            // mid-flight teardown leaking a role that gets claimed a moment later. The natural
+            // tidy-up, assigning only once RegisterApp has succeeded, would break that silently:
+            // a Disconnect during the await would have nothing to release. CallsHalf guarantees no
+            // *second* ConnectAsync starts while this one runs (CallsHalf._inFlight); it cannot
+            // guarantee that no Disconnect lands in the middle of one, and must not have to.
             _device = PhoneLineTransportDevice.FromId(transportDeviceId);
             if (_device is null)
             {

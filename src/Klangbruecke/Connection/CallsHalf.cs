@@ -25,10 +25,16 @@ namespace Klangbruecke.Connection;
 ///
 /// <b>Single-threaded, and it subscribes to nothing.</b> Every input is a method call that
 /// <c>ConnectionManager</c> has already marshalled onto the UI thread, which is what lets a class
-/// with this much state in it hold no locks. The one asynchronous seam - enumerate, then register -
-/// is guarded by a generation counter rather than a lock, because the thing that can happen across
-/// those awaits is not a data race but a stale answer: the user can switch calls off while the radio
-/// is still deciding.
+/// with this much state in it hold no locks.
+///
+/// The one asynchronous seam - enumerate, then register - needs two guards, and they are not the
+/// same guard. <see cref="_generation"/> discards a stale <em>answer</em>: the user can switch calls
+/// off while the radio is still deciding, and the answer then describes a role nothing is holding.
+/// <see cref="_inFlight"/> prevents a second <em>call</em>: a teardown sets
+/// <see cref="CallsState.Off"/> while a registration is still awaiting, and the next level-triggered
+/// link-present report would otherwise start a second <c>ConnectAsync</c> body over the same device.
+/// Neither substitutes for the other - the generation counter has never guarded the call, only what
+/// came back from it.
 /// </summary>
 public sealed class CallsHalf
 {
@@ -42,6 +48,47 @@ public sealed class CallsHalf
 
     private IDisposable? _retry;
     private DateTimeOffset? _retryDueAt;
+
+    /// <summary>
+    /// True from before a registration announces itself until its awaits have finished, whatever
+    /// they finished with.
+    ///
+    /// The state machine cannot promise this on its own. <see cref="OnLinkPresentAsync"/> starts only
+    /// from <see cref="CallsState.Off"/> and <see cref="RegisterAsync"/> leaves Off before its first
+    /// await, so the states alone look sufficient - but a teardown puts the half back in Off while a
+    /// registration is still awaiting, and the next level-triggered report then walks straight in. On
+    /// the real service that is two <c>ConnectAsync</c> bodies sharing one device field across
+    /// awaits: the second begins by unregistering, which can release the role the first is about to
+    /// claim, and the first's continuation then registers through the second's device. That is the
+    /// unregister/re-register flap this whole class is built to avoid, arriving from the inside.
+    ///
+    /// The cost, stated plainly: a service call that never completes now also blocks new attempts
+    /// rather than only stranding the state. That is the intended trade - the alternative to blocking
+    /// is the overlap above - and a registration that never returns is a reconcile-side timeout
+    /// question, which belongs to the manager and not here.
+    /// </summary>
+    private bool _inFlight;
+
+    /// <summary>
+    /// The phone the role is held on. Only meaningful while <see cref="CallsState.Up"/>.
+    ///
+    /// Without it the half can only ask "is a role held", never "on which phone", and a user who
+    /// picks a different phone while it is Up leaves it satisfied forever with the role sitting on
+    /// the handset they stopped using. Left stale on the way out rather than cleared at three
+    /// separate exits: every entry to Up rewrites it and nothing outside Up reads it.
+    /// </summary>
+    private string? _registeredPhoneId;
+
+    /// <summary>
+    /// The last match reason written to the log, so an unchanging one is written once.
+    ///
+    /// A pairing that is permanently <c>Ambiguous</c> or <c>SoleCandidate</c> produces the same Warn
+    /// on every attempt, and the attempts do not stop - that is a line every 60 seconds, forever,
+    /// against the project's rule that only a change gets logged. Never cleared: a reason that
+    /// changes is news, and after a success the next failure's reason differs from the success's, so
+    /// the recovery-then-relapse case reports itself without a reset.
+    /// </summary>
+    private string? _lastMatchReason;
 
     /// <summary>
     /// Bumped by every release of the role, and read - never written - by every registration.
@@ -96,6 +143,17 @@ public sealed class CallsHalf
     }
 
     /// <summary>
+    /// Has the scheduled retry come due? The gate on the reconcile's <see cref="CallsState.Backoff"/>
+    /// backstop, so that a poll arriving mid-countdown does not become a second retry schedule.
+    ///
+    /// No recorded due time answers "yes". That is the null arm of the unwrap rather than a branch
+    /// anyone can reach today - Backoff is only entered through <see cref="ScheduleRetry"/>, which
+    /// always records one - but it is the right default if it ever becomes reachable: nothing armed
+    /// means nothing else is going to move the half, and the reconcile is all that is left.
+    /// </summary>
+    private bool RetryIsDue => _retryDueAt is not { } due || _scheduler.Now >= due;
+
+    /// <summary>
     /// The user's settings, as far as this half is concerned - and nothing else. It records; it never
     /// registers and never unregisters.
     ///
@@ -136,11 +194,24 @@ public sealed class CallsHalf
         return RegisterAsync();
     }
 
-    /// <summary>Unregisters. Deliberate intent only.</summary>
-    public void OnPhoneDeselected() => Unregister();
+    /// <summary>
+    /// Unregisters. Deliberate intent only.
+    ///
+    /// Resets the backoff, unlike <see cref="OnDisabled"/>: a different phone is a different failure
+    /// history, and making the newly-picked phone serve out the old one's 60 s penalty punishes the
+    /// user for the action they took precisely because the first phone was not working.
+    /// </summary>
+    public void OnPhoneDeselected() => Unregister(resetBackoff: true);
 
-    /// <summary>Unregisters. Deliberate intent only.</summary>
-    public void OnDisabled() => Unregister();
+    /// <summary>
+    /// Unregisters. Deliberate intent only.
+    ///
+    /// Keeps the backoff, unlike <see cref="OnPhoneDeselected"/>: the same phone and the same radio
+    /// are still there afterwards, and flipping a switch off and on again has repaired nothing.
+    /// Forgetting an hour of failures here is how a permanently broken pairing gets retried every two
+    /// seconds for as long as somebody keeps toggling.
+    /// </summary>
+    public void OnDisabled() => Unregister(resetBackoff: false);
 
     /// <summary>
     /// The 30 s drift correction. Level-triggered, because the events that should have told us are
@@ -157,9 +228,16 @@ public sealed class CallsHalf
 
             case CallsState.Backoff:
                 // The backstop for a retry that was never delivered - a suspended machine does not
-                // run its timers. Enabled is asked as well as connectPermitted because Configure can
-                // switch the half off without moving it out of Backoff.
-                return connectPermitted && Enabled ? RegisterAsync() : Task.CompletedTask;
+                // run its timers, so the half can be found here minutes past its own deadline with
+                // nothing armed that will ever fire. RetryIsDue is what keeps it a backstop instead
+                // of a second retry schedule: this tick arrives every 30 s, so without the gate every
+                // wait longer than that was unreachable and the sequence was really 2/4/8/16/30/30/30
+                // - with the tray showing a countdown that nothing was waiting for. In the suspended
+                // case Now has jumped well past due, so the gate is open exactly when it should be.
+                //
+                // Enabled is asked as well as connectPermitted because Configure can switch the half
+                // off without moving it out of Backoff.
+                return connectPermitted && Enabled && RetryIsDue ? RegisterAsync() : Task.CompletedTask;
 
             default:
                 return Task.CompletedTask;
@@ -179,9 +257,32 @@ public sealed class CallsHalf
     /// phone's call-audio-device list - the exact harm the absent <c>OnLinkAbsent</c> exists to
     /// prevent. So <see cref="RegistrationStatus.Unknown"/> is treated as what it is, no information:
     /// nothing moves, nothing is logged, and the next tick asks again.
+    ///
+    /// There are two kinds of drift, and the wrong phone is checked first because it needs no ABI
+    /// call to detect and no answer from one could change it.
     /// </summary>
     private void ReconcileRegistration()
     {
+        if (!string.Equals(_registeredPhoneId, _phoneDeviceId, StringComparison.Ordinal))
+        {
+            // The user picked a different phone and only the settings heard about it. This is the one
+            // release that is not <see cref="OnPhoneDeselected"/>'s, and it is not the flap the
+            // missing OnLinkAbsent guards against: that rule is about releasing a role nobody asked
+            // to release, and this is the user asking. Left alone, the role sits on a handset they
+            // have stopped using and goes on offering this PC there.
+            Log.Warn("The hands-free role is held on a phone that is no longer the selected one. Moving it.");
+
+            // Explicitly, unlike the branch below: here the role really is still held, and the new
+            // phone cannot be registered while the old registration stands.
+            _calls.Disconnect();
+
+            // Through the backoff rather than straight into a registration, so that a settings change
+            // that keeps failing cannot spin at reconcile speed. The schedule was reset on the way
+            // into Up, so this waits 2 s.
+            ScheduleRetry();
+            return;
+        }
+
         if (_calls.ReadRegistration() != RegistrationStatus.NotRegistered)
         {
             return;
@@ -195,15 +296,30 @@ public sealed class CallsHalf
 
     /// <summary>
     /// Enumerate, correlate, claim. The one place <see cref="ICallTransportService.ConnectAsync"/> is
-    /// called from.
+    /// called from - which is also why the <see cref="_inFlight"/> check lives here rather than in
+    /// the three inputs that lead to it. Put at the door, no input can be added that starts a second
+    /// registration and forgets to ask; put in the callers, the two arms would agree on every input
+    /// and neither could be broken without the other covering for it.
     /// </summary>
     private async Task RegisterAsync()
     {
-        // Both captured before the state moves. SetState raises Changed, a handler is free to call
-        // straight back in, and everything this method needs from the half must therefore already be
-        // in hand - see the note on _generation for what a capture taken afterwards would let past.
+        if (_inFlight)
+        {
+            // In practice only OnLinkPresentAsync reaches this, because Off is the only state a
+            // teardown can leave a flight running in and the only state that input starts from. It is
+            // still checked for all three: what makes the overlap unsafe is the service, not the
+            // caller.
+            return;
+        }
+
+        // All three captured before the state moves. SetState raises Changed, a handler is free to
+        // call straight back in, and everything this method needs from the half must therefore
+        // already be in hand - see the note on _generation for what a capture taken afterwards would
+        // let past, and _inFlight for what a flag set afterwards would.
         string? phoneDeviceId = _phoneDeviceId;
         int generation = _generation;
+
+        _inFlight = true;
 
         CancelRetry();
         SetState(CallsState.Registering);
@@ -226,7 +342,14 @@ public sealed class CallsHalf
             // The one line that says why. "Ambiguous" and "NoCandidates" are two different facts
             // about the user's pairing and both arrive here as a half that quietly backs off; the
             // level follows the outcome, which is what TransportMatchOutcome's own summary promises.
-            Log.Write(TransportMatcher.LevelFor(match.Outcome), match.Reason);
+            //
+            // Once per distinct reason. The attempts do not stop, so a pairing that is permanently
+            // ambiguous would otherwise write the identical warning for as long as the app runs.
+            if (!string.Equals(match.Reason, _lastMatchReason, StringComparison.Ordinal))
+            {
+                _lastMatchReason = match.Reason;
+                Log.Write(TransportMatcher.LevelFor(match.Outcome), match.Reason);
+            }
 
             if (match.Match is not { } transport)
             {
@@ -254,6 +377,13 @@ public sealed class CallsHalf
             Log.Error("The calls half's registration attempt threw.", ex);
             registered = false;
         }
+        finally
+        {
+            // In a finally, not on the way out: a throw the catch above did not expect - one raised
+            // by the catch's own logging, say - would otherwise wedge the flag true and leave the
+            // half unable to register again for the life of the process.
+            _inFlight = false;
+        }
 
         if (generation != _generation)
         {
@@ -266,7 +396,11 @@ public sealed class CallsHalf
             return;
         }
 
+        // Both before the announce. A Changed handler that reconciles re-entrantly would otherwise
+        // find Up with no phone recorded against it and read that as the wrong phone.
         _backoff.Reset();
+        _registeredPhoneId = phoneDeviceId;
+
         SetState(CallsState.Up);
     }
 
@@ -299,8 +433,14 @@ public sealed class CallsHalf
     /// Standing down releases nothing, because Backoff is only ever reached with the role unheld.
     ///
     /// Fire and forget, because <see cref="IScheduler"/> hands out an <see cref="Action"/> and the
-    /// registration is genuinely asynchronous. Safe only because <see cref="RegisterAsync"/> catches
-    /// everything it awaits: there is no path out of it that faults a task nobody is holding.
+    /// registration is genuinely asynchronous. Safe for the service seam, which is the part that
+    /// actually fails: <see cref="RegisterAsync"/> catches everything it <em>awaits</em>. It is not a
+    /// blanket guarantee, and saying so would be worse than saying nothing - <see cref="SetState"/>
+    /// and <see cref="ScheduleRetry"/> run outside that try, so a <see cref="Changed"/> subscriber
+    /// that throws faults a task nobody is holding and the throw surfaces at
+    /// <c>TaskScheduler.UnobservedTaskException</c> instead of at a caller. Deliberately not wrapped:
+    /// a subscriber that throws is a defect in the subscriber, and a catch here would be one nothing
+    /// can reach through the public surface - the untestable swallow this project forbids.
     /// </summary>
     private void OnRetryDue()
     {
@@ -327,17 +467,24 @@ public sealed class CallsHalf
     /// is anything to release before releasing it. Skipping the call to avoid a no-op would be
     /// precisely the case where it was not one.
     ///
-    /// The backoff schedule is deliberately not reset. How many times registering has failed is worth
-    /// remembering across a switch flipped off and on again; the countdown belongs to the episode
-    /// that started it and ends with it, which is what <see cref="CancelRetry"/> does.
+    /// The countdown always ends here - it belongs to the episode that started it - but the
+    /// <em>schedule</em> depends on which input called, and the two are not the same question. See
+    /// <see cref="OnPhoneDeselected"/> and <see cref="OnDisabled"/>, which take opposite answers for
+    /// reasons that are opposite too: one changes the phone, the other does not.
     /// </summary>
-    private void Unregister()
+    private void Unregister(bool resetBackoff)
     {
         // Before anything else, so an answer already in flight is discarded rather than landing in a
         // half whose role has been released.
         _generation++;
 
         CancelRetry();
+
+        if (resetBackoff)
+        {
+            _backoff.Reset();
+        }
+
         _calls.Disconnect();
 
         SetState(CallsState.Off);

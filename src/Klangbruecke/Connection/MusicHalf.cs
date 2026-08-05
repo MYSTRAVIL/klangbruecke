@@ -146,6 +146,18 @@ public sealed class MusicHalf
     }
 
     /// <summary>
+    /// Has the scheduled connect retry come due? The gate on the reconcile's
+    /// <see cref="MusicState.Backoff"/> backstop, so that a poll arriving mid-countdown does not
+    /// become a second retry schedule.
+    ///
+    /// No recorded due time answers "yes". That is the null arm of the unwrap rather than a branch
+    /// anyone can reach today - Backoff is only entered through <see cref="ScheduleConnectRetry"/>,
+    /// which always records one - but it is the right default if it ever becomes reachable: nothing
+    /// armed means nothing else is going to move the half, and the reconcile is all that is left.
+    /// </summary>
+    private bool ConnectRetryIsDue => _connectRetryDueAt is not { } due || _scheduler.Now >= due;
+
+    /// <summary>
     /// The user's settings, as far as this half is concerned. Also the "phone deselected" input:
     /// switching music off, clearing the phone, or picking a different one are all the same event
     /// here - what this half was doing is no longer what was asked for.
@@ -299,10 +311,17 @@ public sealed class MusicHalf
 
             case MusicState.Backoff:
                 // The backstop for a retry that was never delivered - a suspended machine does not
-                // run its timers. Nothing else initiates from here. Being in Backoff already means
-                // a phone is picked and the switch is on, so connect permission is the only open
-                // question.
-                return connectPermitted ? ConnectAsync() : Task.CompletedTask;
+                // run its timers, so the half can be found here long past its own deadline with
+                // nothing armed that will ever fire. ConnectRetryIsDue is what keeps it a backstop
+                // instead of a second retry schedule: this tick arrives every 30 s, so without the
+                // gate every wait longer than that was unreachable and the sequence was really
+                // 2/4/8/16/30/30/30 - while the tray went on showing a countdown that nothing was
+                // waiting for. In the suspended case Now has jumped well past due, so the gate is
+                // open exactly when it should be.
+                //
+                // Nothing else initiates from here. Being in Backoff already means a phone is picked
+                // and the switch is on, so connect permission is the only other open question.
+                return connectPermitted && ConnectRetryIsDue ? ConnectAsync() : Task.CompletedTask;
 
             default:
                 return Task.CompletedTask;

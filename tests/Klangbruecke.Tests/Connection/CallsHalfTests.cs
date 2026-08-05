@@ -279,6 +279,33 @@ public sealed class CallsHalfTests : IDisposable
         Assert.Contains(_log.Entries, e => e.Level == expected && e.Message == expectedMatch.Reason);
     }
 
+    /// <summary>
+    /// Once per distinct reason. A pairing that is permanently ambiguous produces the identical
+    /// warning on every attempt, and the attempts never stop - so an unguarded line here is one
+    /// warning a minute for as long as the app runs, against the project's rule that only a change
+    /// gets logged.
+    /// </summary>
+    [Fact]
+    public async Task A_repeated_match_reason_is_logged_once()
+    {
+        Harness half = new();
+        half.Calls.Transports = new[] { OtherTransport, ThirdTransport };
+
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+        half.Scheduler.Advance(Seconds(2));
+        half.Scheduler.Advance(Seconds(4));
+
+        Assert.Equal(3, half.Calls.FindCount);
+        Assert.Single(_log.Entries);
+
+        // A reason that changed is news again, which is what makes this a filter and not a mute.
+        half.Calls.Transports = new[] { PhoneTransport };
+        half.Scheduler.Advance(Seconds(8));
+
+        Assert.Equal(CallsState.Up, half.Half.State);
+        Assert.Equal(2, _log.Entries.Count);
+    }
+
     [Fact]
     public async Task Backoff_retries_on_the_2_4_8_sequence()
     {
@@ -415,6 +442,55 @@ public sealed class CallsHalfTests : IDisposable
     }
 
     /// <summary>
+    /// A different phone is a different failure history. Making the newly-picked phone serve out the
+    /// old one's penalty punishes the user for the action they took precisely because the first phone
+    /// was not working - and the longer the first phone failed, the longer they wait for the second.
+    /// </summary>
+    [Fact]
+    public async Task Deselecting_the_phone_resets_the_backoff()
+    {
+        Harness half = new();
+        half.Calls.ConnectResult = Refused;
+
+        // Two failures, so the schedule is demonstrably past its first step.
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+        half.Scheduler.Advance(Seconds(2));
+        Assert.Equal(Seconds(4), half.Half.NextRetryIn);
+
+        half.Half.OnPhoneDeselected();
+        half.Half.Configure(enabled: true, OtherPhoneId);
+        half.Calls.Transports = new[] { OtherTransport };
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.Equal(Seconds(2), half.Half.NextRetryIn);
+    }
+
+    /// <summary>
+    /// The same phone and the same radio are still there afterwards, so flipping the switch off and
+    /// on again has repaired nothing. Forgetting the failure history here is how a permanently broken
+    /// pairing gets retried every two seconds for as long as somebody keeps toggling.
+    /// </summary>
+    [Fact]
+    public async Task Disabling_calls_keeps_the_backoff()
+    {
+        Harness half = new();
+        half.Calls.ConnectResult = Refused;
+
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+        half.Scheduler.Advance(Seconds(2));
+        Assert.Equal(Seconds(4), half.Half.NextRetryIn);
+
+        half.Half.OnDisabled();
+        half.Half.Configure(enabled: false, PhoneId);
+
+        // Back on again, same phone.
+        half.Half.Configure(enabled: true, PhoneId);
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.Equal(Seconds(8), half.Half.NextRetryIn);
+    }
+
+    /// <summary>
     /// Unconditional, with no "were we up?" guard. This class's own belief about whether the role is
     /// held is the one thing that can be stale - a registration whose answer was discarded mid-flight
     /// leaves the service holding a role this half never recorded - and the service already checks
@@ -473,6 +549,62 @@ public sealed class CallsHalfTests : IDisposable
 
         Assert.Equal(CallsState.Off, half.Half.State);
         Assert.Equal(0, half.Scheduler.PendingCount);
+
+        // Named rather than tidied away: the fake ends holding the role, because Disconnect ran while
+        // the registration was still awaiting and the answer that arrived afterwards claimed it. The
+        // real service behaves the same way, and that is why CallTransportService.ConnectAsync
+        // assigns _device before its first await - a Disconnect landing mid-flight must still find
+        // something to release. What this half owes is that no *second* registration compounds it,
+        // which is the next test's subject.
+        Assert.Equal(RegistrationStatus.Registered, half.Calls.Registration);
+        Assert.Single(half.Calls.ConnectCalls);
+    }
+
+    /// <summary>
+    /// Two registrations must never overlap on the service, and the state machine alone cannot
+    /// promise it. <c>OnLinkPresentAsync</c> starts only from <c>Off</c> and the registration leaves
+    /// <c>Off</c> before its first await - but a teardown puts the half back in <c>Off</c> while one
+    /// is still awaiting, and the very next level-triggered report walks in. On the real service that
+    /// is two <c>ConnectAsync</c> bodies sharing one device field across awaits: the second begins by
+    /// unregistering, which can release the role the first is about to claim, and the first's
+    /// continuation then registers through the second's device. The generation counter guards the
+    /// answer; it has never guarded the call.
+    /// </summary>
+    [Fact]
+    public async Task A_second_registration_does_not_start_while_one_is_in_flight()
+    {
+        Harness half = new();
+        half.Calls.DeferConnect = true;
+        Task first = half.Half.OnLinkPresentAsync(connectPermitted: true);
+        Assert.Single(half.Calls.ConnectCalls);
+
+        // The sequence the manager is told to use when the user picks a different phone.
+        half.Half.OnPhoneDeselected();
+        Assert.Equal(CallsState.Off, half.Half.State);
+        half.Half.Configure(enabled: true, OtherPhoneId);
+        half.Calls.Transports = new[] { PhoneTransport, OtherTransport };
+
+        // Deliberately not awaited on the spot. A second registration that did start would be
+        // awaiting a deferred connect nothing is going to answer, so an await here would hang the
+        // suite instead of failing it - and a mutant that hangs the runner is a mutant nobody can
+        // read a result from. Completing synchronously is itself the assertion: it is what a call
+        // that turned round at the door looks like.
+        Task blocked = half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.True(blocked.IsCompleted);
+        Assert.Single(half.Calls.ConnectCalls);
+        Assert.Equal(CallsState.Off, half.Half.State);
+        await blocked;
+
+        // And the block lifts the moment the first one answers, however it answers.
+        half.Calls.DeferConnect = false;
+        half.Calls.CompleteConnect(CallTransportResult.Claimed(true));
+        await first;
+
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.Equal(new[] { TransportId, OtherTransportId }, half.Calls.ConnectCalls);
+        Assert.Equal(CallsState.Up, half.Half.State);
     }
 
     // --- Configure ---------------------------------------------------------------------------
@@ -531,10 +663,15 @@ public sealed class CallsHalfTests : IDisposable
         half.Calls.ConnectResult = Refused;
         await half.Half.OnLinkPresentAsync(connectPermitted: true);
 
+        // Overdue, so the switch is the only thing left that could refuse.
+        half.Scheduler.Advance(Seconds(30));
+        Assert.Equal(TimeSpan.Zero, half.Half.NextRetryIn);
+        int before = half.Calls.ConnectCalls.Count;
+
         half.Half.Configure(enabled: false, PhoneId);
         await half.Half.ReconcileAsync(connectPermitted: true);
 
-        Assert.Single(half.Calls.ConnectCalls);
+        Assert.Equal(before, half.Calls.ConnectCalls.Count);
     }
 
     /// <summary>
@@ -582,6 +719,46 @@ public sealed class CallsHalfTests : IDisposable
         // The role is already gone. Releasing it again would be the flap for nothing.
         Assert.Equal(0, half.Calls.DisconnectCount);
         Assert.Contains(_log.Entries, e => e.Level == LogLevel.Warn);
+    }
+
+    /// <summary>
+    /// The second kind of drift, and the one a "is a role held?" question can never see: the role is
+    /// held, and it is held on the wrong phone. <c>Configure</c> deliberately does not release it -
+    /// only intent does - so without this the half sits satisfied in <c>Up</c> forever while the PC
+    /// goes on being offered by a handset the user has stopped using.
+    ///
+    /// Releasing it here is not the flap the missing <c>OnLinkAbsent</c> guards against. That rule is
+    /// about releasing a role nobody asked to release; this is the user asking, in the only way the
+    /// settings can say it.
+    /// </summary>
+    [Fact]
+    public async Task Reconcile_re_registers_when_the_selected_phone_changed()
+    {
+        Harness half = new();
+        await half.ReachUpAsync();
+        _log.Entries.Clear();
+
+        half.Calls.Transports = new[] { PhoneTransport, OtherTransport };
+        half.Half.Configure(enabled: true, OtherPhoneId);
+        await half.Half.ReconcileAsync(connectPermitted: true);
+
+        Assert.Equal(CallsState.Backoff, half.Half.State);
+        Assert.Equal(1, half.Calls.DisconnectCount);
+        Assert.Contains(_log.Entries, e => e.Level == LogLevel.Warn);
+
+        half.Scheduler.Advance(Seconds(2));
+
+        Assert.Equal(CallsState.Up, half.Half.State);
+        Assert.Equal(new[] { TransportId, OtherTransportId }, half.Calls.ConnectCalls);
+
+        // And it settles: the phone it is now registered on is the phone the settings name, so the
+        // next tick finds nothing to do.
+        int changed = half.ChangedCount;
+        await half.Half.ReconcileAsync(connectPermitted: true);
+
+        Assert.Equal(CallsState.Up, half.Half.State);
+        Assert.Equal(changed, half.ChangedCount);
+        Assert.Equal(1, half.Calls.DisconnectCount);
     }
 
     [Fact]
@@ -639,7 +816,8 @@ public sealed class CallsHalfTests : IDisposable
 
     /// <summary>
     /// The backstop for a retry that was never delivered - a suspended machine does not run its
-    /// timers, so the half can be found in <c>Backoff</c> minutes past its own deadline.
+    /// timers, so the half can be found in <c>Backoff</c> minutes past its own deadline with a timer
+    /// armed that will never fire.
     /// </summary>
     [Fact]
     public async Task Reconcile_registers_from_Backoff_when_permitted()
@@ -648,12 +826,43 @@ public sealed class CallsHalfTests : IDisposable
         half.Calls.ConnectResult = Refused;
         await half.Half.OnLinkPresentAsync(connectPermitted: true);
 
+        // The suspend, reproduced: the 2 s retry fired, failed and armed a 4 s one, and the clock
+        // then ran straight past that without the timer being given a chance.
+        half.Scheduler.Advance(Seconds(30));
+        Assert.Equal(2, half.Calls.ConnectCalls.Count);
+        Assert.Equal(TimeSpan.Zero, half.Half.NextRetryIn);
+
         half.Calls.ConnectResult = CallTransportResult.Claimed(true);
         await half.Half.ReconcileAsync(connectPermitted: true);
 
         Assert.Equal(CallsState.Up, half.Half.State);
-        Assert.Equal(2, half.Calls.ConnectCalls.Count);
+        Assert.Equal(3, half.Calls.ConnectCalls.Count);
         Assert.Equal(0, half.Scheduler.PendingCount);
+    }
+
+    /// <summary>
+    /// The 30 s poll is a backstop for a retry that never fired, not a second retry schedule. Without
+    /// the due-ness gate every wait longer than the tick was unreachable - the sequence was really
+    /// 2/4/8/16/30/30/30 - and a registration started while the tray was still counting down.
+    /// </summary>
+    [Fact]
+    public async Task Reconcile_mid_countdown_does_not_jump_the_queue()
+    {
+        Harness half = new();
+        half.Calls.ConnectResult = Refused;
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        half.Scheduler.Advance(Seconds(1));
+        await half.Half.ReconcileAsync(connectPermitted: true);
+
+        Assert.Single(half.Calls.ConnectCalls);
+        Assert.Equal(CallsState.Backoff, half.Half.State);
+        Assert.Equal(Seconds(1), half.Half.NextRetryIn);
+
+        // And the wait it did not jump is still armed, so nothing has been lost either.
+        Assert.Equal(1, half.Scheduler.PendingCount);
+        half.Scheduler.Advance(Seconds(1));
+        Assert.Equal(2, half.Calls.ConnectCalls.Count);
     }
 
     /// <summary>The auto-reconnect-off guard: the app may not start anything by itself.</summary>
@@ -664,10 +873,15 @@ public sealed class CallsHalfTests : IDisposable
         half.Calls.ConnectResult = Refused;
         await half.Half.OnLinkPresentAsync(connectPermitted: true);
 
+        // Overdue, so permission is the only thing left that could refuse.
+        half.Scheduler.Advance(Seconds(30));
+        Assert.Equal(TimeSpan.Zero, half.Half.NextRetryIn);
+        int before = half.Calls.ConnectCalls.Count;
+
         await half.Half.ReconcileAsync(connectPermitted: false);
 
         Assert.Equal(CallsState.Backoff, half.Half.State);
-        Assert.Single(half.Calls.ConnectCalls);
+        Assert.Equal(before, half.Calls.ConnectCalls.Count);
     }
 
     /// <summary>
@@ -825,6 +1039,96 @@ public sealed class CallsHalfTests : IDisposable
         // Not even asked. The guard catches this attempt at the first await, before the role could
         // be claimed a second time behind the teardown's back.
         Assert.Empty(half.Calls.ConnectCalls);
+        Assert.Equal(0, half.Scheduler.PendingCount);
+    }
+
+    /// <summary>
+    /// The in-flight flag is bookkeeping too, and it is subject to the same rule as the generation
+    /// counter: set it before the announce, not after. The announcement of <c>Registering</c> is one
+    /// keystroke from a handler that disconnects and lets the next level-triggered report straight
+    /// back in - and with the flag not yet set, that report starts the second registration this half
+    /// exists to prevent.
+    /// </summary>
+    [Fact]
+    public async Task A_teardown_and_retry_from_a_Changed_handler_does_not_start_a_second_registration()
+    {
+        Harness half = new();
+        half.Calls.DeferConnect = true;
+
+        bool reentered = false;
+        half.Half.Changed += (_, _) =>
+        {
+            if (half.Half.State != CallsState.Registering || reentered)
+            {
+                return;
+            }
+
+            reentered = true;
+            half.Half.OnDisabled();
+            _ = half.Half.OnLinkPresentAsync(connectPermitted: true);
+        };
+
+        // Held rather than awaited on the spot, for the same reason as the test above: everything
+        // asserted below is already true by the time this returns, and a registration that wrongly
+        // carried on would be parked on a deferred connect nothing answers - which must fail here,
+        // not hang the runner.
+        Task registering = half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.True(reentered);
+        Assert.Empty(half.Calls.ConnectCalls);
+        Assert.Equal(CallsState.Off, half.Half.State);
+        Assert.True(registering.IsCompleted);
+        await registering;
+    }
+
+    /// <summary>
+    /// And the phone id is captured with the rest of it, before the announce. Settings are written by
+    /// the tray, <c>Changed</c> fires on the calling thread, so a handler re-pointing them mid-flight
+    /// is one keystroke away - and an attempt that silently switched horses would announce itself for
+    /// one phone and claim the role on another. Capturing it keeps the change on the orderly route:
+    /// the drift check moves the role on the next tick, having released the old one first.
+    /// </summary>
+    [Fact]
+    public async Task A_Configure_from_a_Changed_handler_does_not_redirect_the_attempt_in_flight()
+    {
+        Harness half = new();
+        half.Calls.Transports = new[] { PhoneTransport, OtherTransport };
+        half.Half.Changed += (_, _) =>
+        {
+            if (half.Half.State == CallsState.Registering)
+            {
+                half.Half.Configure(enabled: true, OtherPhoneId);
+            }
+        };
+
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.Equal(new[] { TransportId }, half.Calls.ConnectCalls);
+        Assert.Equal(CallsState.Up, half.Half.State);
+    }
+
+    /// <summary>
+    /// The same rule for the phone the role was claimed on. A handler that reconciles the moment it
+    /// sees <c>Up</c> - the manager's own tick is one turn away from doing it - must not find a half
+    /// that is Up with no phone recorded against it, because the drift check reads that as the wrong
+    /// phone and releases a role that was claimed correctly a microsecond earlier.
+    /// </summary>
+    [Fact]
+    public async Task A_reconcile_from_a_Changed_handler_does_not_see_Up_without_its_phone()
+    {
+        Harness half = new();
+        half.Half.Changed += (_, _) =>
+        {
+            if (half.Half.State == CallsState.Up)
+            {
+                _ = half.Half.ReconcileAsync(connectPermitted: true);
+            }
+        };
+
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.Equal(CallsState.Up, half.Half.State);
+        Assert.Equal(0, half.Calls.DisconnectCount);
         Assert.Equal(0, half.Scheduler.PendingCount);
     }
 

@@ -780,6 +780,11 @@ public sealed class MusicHalfTests
         Assert.Equal(2, half.Router.StartCalls.Count);
     }
 
+    /// <summary>
+    /// The backstop for a retry that was never delivered - a suspended machine does not run its
+    /// timers, so the half can be found in <c>Backoff</c> long past its own deadline with a timer
+    /// armed that will never fire.
+    /// </summary>
     [Fact]
     public async Task Reconcile_reconnects_from_Backoff_when_permitted()
     {
@@ -787,12 +792,44 @@ public sealed class MusicHalfTests
         half.Sink.ConnectResult = false;
         await half.Half.OnLinkPresentAsync(connectPermitted: true);
 
+        // The suspend, reproduced: the 2 s retry fired, failed and armed a 4 s one, and the clock
+        // then ran straight past that without the timer being given a chance.
+        half.Scheduler.Advance(Seconds(30));
+        Assert.Equal(2, half.Sink.ConnectCalls.Count);
+        Assert.Equal(TimeSpan.Zero, half.Half.NextRetryIn);
+
         half.Sink.ConnectResult = true;
         await half.Half.ReconcileAsync(connectPermitted: true);
 
         Assert.Equal(MusicState.Linked, half.Half.State);
-        Assert.Equal(2, half.Sink.ConnectCalls.Count);
+        Assert.Equal(3, half.Sink.ConnectCalls.Count);
         Assert.Equal(0, half.Scheduler.PendingCount);
+    }
+
+    /// <summary>
+    /// The 30 s poll is a backstop for a retry that never fired, not a second retry schedule. Without
+    /// the due-ness gate every wait longer than the tick was unreachable - a half waiting 60 s was
+    /// connected at 30, so the sequence was really 2/4/8/16/30/30/30 - and a connect started while
+    /// the tray was still counting down to one.
+    /// </summary>
+    [Fact]
+    public async Task Reconcile_mid_countdown_does_not_jump_the_queue()
+    {
+        Harness half = new();
+        half.Sink.ConnectResult = false;
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        half.Scheduler.Advance(Seconds(1));
+        await half.Half.ReconcileAsync(connectPermitted: true);
+
+        Assert.Single(half.Sink.ConnectCalls);
+        Assert.Equal(MusicState.Backoff, half.Half.State);
+        Assert.Equal(Seconds(1), half.Half.NextRetryIn);
+
+        // And the wait it did not jump is still armed, so nothing has been lost either.
+        Assert.Equal(1, half.Scheduler.PendingCount);
+        half.Scheduler.Advance(Seconds(1));
+        Assert.Equal(2, half.Sink.ConnectCalls.Count);
     }
 
     [Fact]
@@ -802,10 +839,15 @@ public sealed class MusicHalfTests
         half.Sink.ConnectResult = false;
         await half.Half.OnLinkPresentAsync(connectPermitted: true);
 
+        // Overdue, so permission is the only thing left that could refuse.
+        half.Scheduler.Advance(Seconds(30));
+        Assert.Equal(TimeSpan.Zero, half.Half.NextRetryIn);
+        int before = half.Sink.ConnectCalls.Count;
+
         await half.Half.ReconcileAsync(connectPermitted: false);
 
         Assert.Equal(MusicState.Backoff, half.Half.State);
-        Assert.Single(half.Sink.ConnectCalls);
+        Assert.Equal(before, half.Sink.ConnectCalls.Count);
     }
 
     /// <summary>
