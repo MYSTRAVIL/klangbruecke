@@ -22,8 +22,30 @@ namespace Klangbruecke.Tests.Fakes;
 /// </summary>
 public sealed class FakeEndpointMonitor : IAudioEndpointMonitor
 {
+    private bool _present;
+
     /// <summary>Settable directly for the "it was already there" case, which needs no event.</summary>
-    public bool SinkCaptureEndpointPresent { get; set; }
+    public bool SinkCaptureEndpointPresent
+    {
+        get
+        {
+            PresenceReads++;
+            return _present;
+        }
+
+        set => _present = value;
+    }
+
+    /// <summary>
+    /// How many times <see cref="SinkCaptureEndpointPresent"/> has been read, ever.
+    ///
+    /// Counted because the read is expensive in a way its signature hides: the real one is a live
+    /// full endpoint enumeration, measured at 152-282 ms on this machine, and it runs on the UI
+    /// thread. A consumer that reads it three times in one pass has spent most of a second doing it,
+    /// and MMDevAPI's duplicate notifications multiply that by however many callbacks one cause
+    /// produced. Nothing else can tell a consumer's tests that it happened.
+    /// </summary>
+    public int PresenceReads { get; private set; }
 
     public event EventHandler? EndpointsChanged;
 
