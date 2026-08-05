@@ -20,12 +20,20 @@ namespace Klangbruecke.Bluetooth;
 /// status on every connect so the answer comes from the machine rather than from a forum thread.
 /// See docs/FINDINGS.md §2 and §12.
 /// </summary>
-public sealed class CallTransportService : IDisposable
+public sealed class CallTransportService : ICallTransportService
 {
     private PhoneLineTransportDevice? _device;
     private bool _disposed;
 
-    public bool IsConnected { get; private set; }
+    /// <summary>
+    /// Asked of the device every time, never cached. Catching the role going false - another app
+    /// claimed it, the phone re-paired, Windows dropped it - is the reconcile loop's whole job, and a
+    /// cached bool answers with the state at the moment of the last connect instead. Deliberately
+    /// unguarded: the two <c>IsRegistered()</c> calls in <see cref="ConnectAsync"/> are unguarded
+    /// too, and a read that throws is a fault the caller's guard should see rather than a role that
+    /// is absent.
+    /// </summary>
+    public bool IsRegistered => _device is not null && _device.IsRegistered();
 
     public event EventHandler<StatusMessage>? Status;
 
@@ -37,7 +45,7 @@ public sealed class CallTransportService : IDisposable
         Status?.Invoke(this, new StatusMessage(message, level));
 
     /// <summary>Paired devices offering a phone-line transport (i.e. phones).</summary>
-    public static async Task<IReadOnlyList<DeviceInformation>> FindDevicesAsync()
+    public async Task<IReadOnlyList<TransportCandidate>> FindTransportsAsync()
     {
         string selector = PhoneLineTransportDevice.GetDeviceSelector();
         DeviceInformationCollection devices = await DeviceInformation.FindAllAsync(selector);
@@ -46,25 +54,39 @@ public sealed class CallTransportService : IDisposable
         // whether the phone's transport is discoverable at all - the one calls-side fact a development
         // run can establish before the packaged build ever claims the hands-free role.
         Log.Info($"Phone-line selector matched {devices.Count} device(s).");
+
+        // Projected inside the same loop that logs, so the record and the line describing it are one
+        // read of one DeviceInformation - the same reason AudioSinkService.FindDevicesAsync does it
+        // this way. Two passes would let a caller compare a log line against a record that came from
+        // a different snapshot.
+        var candidates = new List<TransportCandidate>(devices.Count);
         foreach (DeviceInformation device in devices)
         {
             Log.Info($"  Transport candidate '{device.Name}' id={device.Id}");
+            candidates.Add(new TransportCandidate(device.Id, device.Name));
         }
 
-        return devices.ToList();
+        return candidates;
     }
 
-    public async Task<bool> ConnectAsync(string deviceId)
+    public async Task<CallTransportResult> ConnectAsync(string transportDeviceId)
     {
         Disconnect();
 
+        // Tracked across the try so the catch can tell a throw that left the role claimed from one
+        // that did not. Reporting Registered=false after a successful RegisterApp is the same defect
+        // this method exists to fix, arriving by the other door: the reconcile loop would re-run
+        // RequestAccessAsync/RegisterApp against a role this process already holds.
+        bool registered = false;
+
         try
         {
-            _device = PhoneLineTransportDevice.FromId(deviceId);
+            _device = PhoneLineTransportDevice.FromId(transportDeviceId);
             if (_device is null)
             {
-                Report("No phone-line transport for that device.");
-                return false;
+                const string missing = "No phone-line transport for that device.";
+                Report(missing);
+                return CallTransportResult.NotClaimed(missing);
             }
 
             // Registering claims the hands-free role for this app. If another app already
@@ -103,10 +125,16 @@ public sealed class CallTransportService : IDisposable
 
                 if (!nowRegistered)
                 {
-                    Report("RegisterApp did not throw but the role was not claimed.", LogLevel.Error);
-                    return false;
+                    const string unclaimed = "RegisterApp did not throw but the role was not claimed.";
+                    Report(unclaimed, LogLevel.Error);
+                    return CallTransportResult.NotClaimed(unclaimed);
                 }
             }
+
+            // Set on both branches - already registered, or registered just now - because both mean
+            // this process holds the role. Everything below is a fact about the transport and cannot
+            // change that.
+            registered = true;
 
             // Bracketed for the same reason, one call further on. This one is awaited, so a failure
             // can also arrive as a faulted task caught below - but it cannot do both, and only the
@@ -115,17 +143,12 @@ public sealed class CallTransportService : IDisposable
             bool connected = await _device.ConnectAsync();
             Log.Info($"PhoneLineTransportDevice.ConnectAsync returned {connected}.");
 
-            if (!connected)
-            {
-                Report("Call transport refused to connect. Check the pairing first - " +
-                       "BTHUSB events 35/16/24 in the System log indicate a stale pairing, " +
-                       "not an API problem. See docs/FINDINGS.md §3.");
-                return false;
-            }
-
-            IsConnected = true;
-            Report("Call transport connected.");
-            return true;
+            // Recorded, never graded on. This bool is False on every run on this machine, including
+            // the ones where real cellular calls routed both directions - see docs/FINDINGS.md §12
+            // and CallTransportResult.Claimed, which owns the rule.
+            CallTransportResult result = CallTransportResult.Claimed(connected);
+            Report(result.Reason);
+            return result;
         }
         catch (Exception ex)
         {
@@ -142,8 +165,13 @@ public sealed class CallTransportService : IDisposable
             Log.Error("The call transport connect path threw.", ex);
 
             // Error, matching the line above, so one throw is not described at two levels.
-            Report($"Call transport threw: {ex.Message}", LogLevel.Error);
-            return false;
+            string reason = $"Call transport threw: {ex.Message}";
+            Report(reason, LogLevel.Error);
+
+            // registered, not false: a throw from the transport connect below RegisterApp leaves the
+            // role claimed, and the caller must not be told to claim it again. TransportConnected is
+            // null because the call either never ran or never answered.
+            return new CallTransportResult(registered, null, reason);
         }
     }
 
@@ -205,10 +233,10 @@ public sealed class CallTransportService : IDisposable
                 },
                 "unregister the call transport's hands-free role");
 
+            // After the unregister, and unconditionally: IsRegistered reads through this field, so
+            // clearing it is what makes the live read answer false once the role has been let go.
             _device = null;
         }
-
-        IsConnected = false;
     }
 
     public void Dispose()

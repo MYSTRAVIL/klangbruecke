@@ -19,7 +19,13 @@ internal sealed class TrayContext : ApplicationContext
     // seam, and typing it here is what keeps that true - a member that drifts back onto the concrete
     // class stops compiling rather than quietly re-coupling the tray to WinRT.
     private readonly IAudioSinkService _sink = new AudioSinkService();
-    private readonly CallTransportService _calls = new();
+
+    // Held as the interface for the same reason as _sink above, and with one extra consequence: this
+    // seam is what finally takes the WinRT device-enumeration type out of this file. Transports
+    // arrive as TransportCandidate, so nothing here declares it - and the name is left unwritten even
+    // in comments, so that grepping this file for it stays a real check rather than one that always
+    // hits prose.
+    private readonly ICallTransportService _calls = new CallTransportService();
 
     // Field initializer, so the marshalling control is built on the thread that constructs this -
     // the UI thread, since Program.Main is what does it.
@@ -216,7 +222,11 @@ internal sealed class TrayContext : ApplicationContext
 
         menu.Items.Add(new ToolStripSeparator());
 
-        var disconnect = new ToolStripMenuItem("Disconnect") { Enabled = _sink.IsConnected || _calls.IsConnected };
+        // IsRegistered, not a connected flag. The old IsConnected was set only when
+        // PhoneLineTransportDevice.ConnectAsync returned true, which it never has on this machine -
+        // so the calls half could never enable this item even while it held the hands-free role, and
+        // the one action that releases the role was unreachable from the tray.
+        var disconnect = new ToolStripMenuItem("Disconnect") { Enabled = _sink.IsConnected || _calls.IsRegistered };
         disconnect.Click += (_, _) => Disconnect();
         menu.Items.Add(disconnect);
 
@@ -341,15 +351,12 @@ internal sealed class TrayContext : ApplicationContext
 
         try
         {
-            // Deliberately inferred rather than declared. The music half's whole point this task was
-            // to stop the tray naming WinRT enumeration types at all; the calls half gets its own
-            // record and its own seam in the next task, and until it does this is the one line that
-            // would put one back. Grep this file for the type name and there should be no hits.
-            var transports = await CallTransportService.FindDevicesAsync();
+            // Declared, at last. The calls seam now hands back the same record the matcher takes, so
+            // the projection that used to happen here - and the WinRT type name it forced this file
+            // to know - are both gone.
+            IReadOnlyList<TransportCandidate> transports = await _calls.FindTransportsAsync();
 
-            TransportMatchResult result = TransportMatcher.Match(
-                transports.Select(t => new TransportCandidate(t.Id, t.Name)).ToList(),
-                phoneDeviceId);
+            TransportMatchResult result = TransportMatcher.Match(transports, phoneDeviceId);
 
             // The level follows the outcome, which is what TransportMatchOutcome's own summary
             // promises. NoCandidates used to warn while the enum documented it as "Not an error" -
@@ -378,8 +385,20 @@ internal sealed class TrayContext : ApplicationContext
             // Symmetric with the music half's "A2DP connect ..." line. Discarding this left the
             // calls half with no single line saying whether it came up - the reader had to infer it
             // from which of the service's own messages happened to be last.
-            bool callsOk = await _calls.ConnectAsync(result.Match.Value.Id);
-            Log.Info($"Call transport connect {(callsOk ? "succeeded" : "failed")}.");
+            CallTransportResult connect = await _calls.ConnectAsync(result.Match.Value.Id);
+
+            // Registered, and only Registered. This line used to follow
+            // PhoneLineTransportDevice.ConnectAsync's bool, which is False on every run on this
+            // machine - so the one line a reader greps for said "failed" on the runs where calls
+            // demonstrably worked.
+            Log.Info($"Call transport connect {(connect.Registered ? "succeeded" : "failed")}.");
+
+            // Separate line, deliberately: the transport's own answer stays in the log as a fact to
+            // correlate against, and never as part of the verdict above. "not reached" rather than a
+            // bool when the call never ran, because false there would be a measurement nothing made.
+            Log.Info(
+                "Call transport reported TransportConnected="
+                + $"{connect.TransportConnected?.ToString() ?? "not reached"}. {connect.Reason}");
         }
         catch (Exception ex)
         {
