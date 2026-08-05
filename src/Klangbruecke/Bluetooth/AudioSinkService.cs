@@ -16,15 +16,22 @@ namespace Klangbruecke.Bluetooth;
 /// "Line (&lt;phone&gt; A2DP SNK)". If that endpoint is absent, nothing is holding a
 /// connection and the phone cannot see this PC as an output. See docs/FINDINGS.md §4.
 /// </summary>
-public sealed class AudioSinkService : IDisposable
+public sealed class AudioSinkService : IAudioSinkService
 {
     private AudioPlaybackConnection? _connection;
     private bool _disposed;
 
     public string? ConnectedDeviceId { get; private set; }
+
+    /// <summary>
+    /// The connection object, and nothing else. See <see cref="IAudioSinkService.IsConnected"/> for
+    /// why the capture endpoint is deliberately not part of this answer.
+    /// </summary>
     public bool IsConnected => _connection is not null && ConnectedDeviceId is not null;
 
     public event EventHandler<StatusMessage>? Status;
+
+    public event EventHandler<AudioSinkConnectionState>? StateChanged;
 
     /// <summary>
     /// Info unless said otherwise. The level travels with the message because this class is the only
@@ -34,7 +41,7 @@ public sealed class AudioSinkService : IDisposable
         Status?.Invoke(this, new StatusMessage(message, level));
 
     /// <summary>Paired devices that can act as an audio source for this PC.</summary>
-    public static async Task<IReadOnlyList<DeviceInformation>> FindDevicesAsync()
+    public async Task<IReadOnlyList<PhoneDevice>> FindDevicesAsync()
     {
         string selector = AudioPlaybackConnection.GetDeviceSelector();
         DeviceInformationCollection devices = await DeviceInformation.FindAllAsync(selector);
@@ -43,12 +50,18 @@ public sealed class AudioSinkService : IDisposable
         // and to the transport correlation built on it, so when either misbehaves the log has to carry
         // the exact text that produced it - a name and a count cannot be re-run against a regex.
         Log.Info($"A2DP selector matched {devices.Count} device(s).");
+
+        // Projected inside the same loop that logs, so the record and the line describing it are one
+        // read of one DeviceInformation. Two passes would let a caller compare a log line against a
+        // record that came from a different snapshot.
+        var phones = new List<PhoneDevice>(devices.Count);
         foreach (DeviceInformation device in devices)
         {
             Log.Info($"  A2DP candidate '{device.Name}' id={device.Id}");
+            phones.Add(new PhoneDevice(device.Id, device.Name));
         }
 
-        return devices.ToList();
+        return phones;
     }
 
     public async Task<bool> ConnectAsync(string deviceId)
@@ -134,12 +147,44 @@ public sealed class AudioSinkService : IDisposable
         }
     }
 
-    private void OnStateChanged(AudioPlaybackConnection sender, object args)
+    /// <summary>
+    /// The WinRT enum, translated. Pure and public so the mapping can be asserted: reading these
+    /// constants touches no ABI - the projection renders them as ordinary C# constants - which is
+    /// what makes this the one part of the connection path a test host can execute.
+    /// </summary>
+    public static AudioSinkConnectionState Translate(AudioPlaybackConnectionState state) =>
+        state == AudioPlaybackConnectionState.Opened
+            ? AudioSinkConnectionState.Opened
+            : AudioSinkConnectionState.Closed;
+
+    private void OnStateChanged(AudioPlaybackConnection sender, object args) => PublishState(sender.State);
+
+    /// <summary>
+    /// One read of the connection state, published to both audiences.
+    ///
+    /// Split out from <see cref="OnStateChanged"/> and public because
+    /// <see cref="AudioPlaybackConnection"/> cannot be constructed without a phone, and unpackaged it
+    /// cannot be constructed at all without killing the process. This signature is the only way the
+    /// "both, not either" rule below can be exercised by a test, and an unasserted rule is one
+    /// tidy-up away from becoming a one-line regression that nothing catches. Not on
+    /// <see cref="IAudioSinkService"/>: nothing above the seam may announce a state the connection
+    /// object never reported.
+    /// </summary>
+    public void PublishState(AudioPlaybackConnectionState state)
     {
-        // Reports state only. Acting on a drop is Stage 1's job; recording it is this stage's - and
-        // Report is already a recording: StatusPresenter writes every status to the log before it
-        // touches the tray, so a Log call beside this one would only double the entry.
-        Report($"A2DP sink state: {sender.State}");
+        // Both, from one read of sender.State. Two reads could disagree, which would put a status
+        // line in the log describing a state the event never carried - and the log is the only
+        // instrument this half has.
+        //
+        // Report first, and kept: Stage 1 acts on StateChanged, but StatusPresenter writes every
+        // status to the log before it touches the tray, so removing this call would delete the
+        // record of the drop as well as the announcement of it. A Log call beside it would instead
+        // double the entry.
+        Report($"A2DP sink state: {state}");
+
+        // Added, not substituted. This is the machine-readable half - a reconnect state machine
+        // cannot parse a tooltip.
+        StateChanged?.Invoke(this, Translate(state));
     }
 
     public void Disconnect()

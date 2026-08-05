@@ -4,7 +4,6 @@ using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
 using Klangbruecke.Diagnostics;
 using Klangbruecke.Platform;
-using Windows.Devices.Enumeration;
 
 namespace Klangbruecke;
 
@@ -16,7 +15,10 @@ internal sealed class TrayContext : ApplicationContext
 {
     private readonly NotifyIcon _icon;
     private readonly Settings _settings;
-    private readonly AudioSinkService _sink = new();
+    // Held as the interface, not the class: everything this view needs from the music half is on the
+    // seam, and typing it here is what keeps that true - a member that drifts back onto the concrete
+    // class stops compiling rather than quietly re-coupling the tray to WinRT.
+    private readonly IAudioSinkService _sink = new AudioSinkService();
     private readonly CallTransportService _calls = new();
 
     // Field initializer, so the marshalling control is built on the thread that constructs this -
@@ -145,13 +147,13 @@ internal sealed class TrayContext : ApplicationContext
         var phoneMenu = new ToolStripMenuItem("Phone");
         try
         {
-            IReadOnlyList<DeviceInformation> devices = await AudioSinkService.FindDevicesAsync();
+            IReadOnlyList<PhoneDevice> devices = await _sink.FindDevicesAsync();
             if (devices.Count == 0)
             {
                 phoneMenu.DropDownItems.Add(new ToolStripMenuItem("No paired devices found") { Enabled = false });
             }
 
-            foreach (DeviceInformation device in devices)
+            foreach (PhoneDevice device in devices)
             {
                 var item = new ToolStripMenuItem(device.Name)
                 {
@@ -339,7 +341,10 @@ internal sealed class TrayContext : ApplicationContext
 
         try
         {
-            IReadOnlyList<DeviceInformation> transports = await CallTransportService.FindDevicesAsync();
+            // Deliberately not naming the WinRT type. The calls half gets its own record and its own
+            // seam in the next task; until then this line is the last place DeviceInformation could
+            // leak into the tray, and the point of the music half's seam is that it does not.
+            var transports = await CallTransportService.FindDevicesAsync();
 
             TransportMatchResult result = TransportMatcher.Match(
                 transports.Select(t => new TransportCandidate(t.Id, t.Name)).ToList(),
