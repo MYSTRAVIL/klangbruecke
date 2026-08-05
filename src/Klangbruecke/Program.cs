@@ -102,9 +102,9 @@ internal static class Program
     /// It is also one of the two things that make every <c>await</c> in <c>ConnectionManager</c>
     /// resume on the UI thread, which is what lets four state machines share it with no lock. The
     /// other is that nothing on those paths calls <c>ConfigureAwait(false)</c> - a separate claim,
-    /// with its own six tests under "the captured context" in <c>ConnectionManagerTests</c>, covering
-    /// twelve of the fourteen await sites. Neither leg is evidence for the other, and neither is
-    /// complete on its own; the test section names the two sites it cannot reach.
+    /// with its own eight tests under "the captured context" in <c>ConnectionManagerTests</c>,
+    /// covering eleven of the fourteen await sites. Neither leg is evidence for the other, and neither
+    /// is complete on its own; the test section names the three sites it cannot reach.
     /// </para></item>
     /// <item>The status subscriptions come after the presenter is constructed, never before. They
     /// used to be taken first and were safe only because nothing raised a status until the end of the

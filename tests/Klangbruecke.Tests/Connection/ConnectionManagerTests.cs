@@ -1154,10 +1154,11 @@ public sealed class ConnectionManagerTests : IDisposable
     // an await on an already-completed task runs its continuation inline whether the context was
     // captured or not.
     //
-    // <b>There are fourteen awaits across the three classes, and the six tests below cover twelve of
-    // them.</b> The map is written out because a prohibition that names a test has to be checkable,
-    // and the first version of this section claimed one test covered "the pass end to end" when it
-    // deferred exactly one seam.
+    // <b>There are fourteen awaits across the three classes. The eight tests below cover eleven of
+    // them, one site each, and the remaining three are named at the bottom with the reason.</b> The
+    // map is written out and kept honest because a prohibition that names a test has to be checkable -
+    // an earlier version of this section claimed twelve on the strength of one aggregate mutant, and
+    // an earlier one than that claimed a single test covered "the pass end to end".
     //
     // Five await a seam - a task some other thread completes - and get a test each:
     //
@@ -1167,25 +1168,37 @@ public sealed class ConnectionManagerTests : IDisposable
     //   CallsHalf.RegisterAsync                     _calls.FindTransportsAsync()         test 4
     //   CallsHalf.RegisterAsync                     _calls.ConnectAsync(transport.Id)    test 5
     //
-    // Seven more await a Task produced by one of our own async methods, and they are covered too -
-    // MusicHalf.OnLinkPresentAsync's `await ConnectAsync()` and ConnectHalvesAsync's first await by
-    // test 3; StillOurs's `await step` and the four `await StillOurs(...)` call sites by test 6.
+    // Six more await a Task one of our own async methods produced:
+    //
+    //   MusicHalf.OnLinkPresentAsync   await ConnectAsync()                              test 3
+    //   ConnectHalvesAsync             first await (_music.OnLinkPresentAsync)           test 3
+    //   StillOurs                      await step                                        test 6
+    //   ReconcileAsync                 await StillOurs(_music.OnLinkPresentAsync ...)     test 6
+    //   ReconcileAsync                 await StillOurs(_music.ReconcileAsync ...)         test 7
+    //   ReconcileAsync                 await StillOurs(_calls.ReconcileAsync ...)         test 8
     //
     // <b>This was nearly got wrong in the obvious direction.</b> The intuition is that an inner await
     // returns to this thread first, so an outer one is awaiting a task that completes here and resumes
     // inline regardless. That is false under a custom SynchronizationContext:
     // AwaitTaskContinuation.IsValidLocationForInlining refuses to inline while one is installed, so a
-    // ConfigureAwait(false) continuation goes to the <em>threadpool</em> instead - which is the app's
-    // situation exactly, since WindowsFormsSynchronizationContext is installed. Measured by mutating
-    // all nine internal awaits at once and watching test 3 go red.
+    // ConfigureAwait(false) continuation goes to the threadpool instead - which is the app's situation
+    // exactly, since WindowsFormsSynchronizationContext is installed. Measured by mutating all nine
+    // internal awaits at once and watching test 3 go red.
     //
-    // <b>The two that no test can cover, named rather than glossed:</b> ConnectHalvesAsync's second
-    // await and RegisterCallsAsync's. Both are tails whose entire continuation is FinishTurn() -
-    // EnforceConnectPermission plus Publish - and FinishTurn's own summary establishes that as
-    // level-triggered and idempotent, recomputed from current state. So a mutant there changes no
-    // outcome in any reachable arrangement and nothing can assert on it. What it would still cost is
-    // real, and it is a data race rather than a wrong answer: those two reads would be happening on a
-    // threadpool thread beside a UI thread that holds no lock.
+    // <b>What each test has to arrange, and it is not only the park.</b> Suspending at a site is half
+    // of it; the other half is leaving the pass real work to do afterwards. A mutant moves only the
+    // continuation, so if everything after the park is the level-triggered tail, the mutant runs on the
+    // threadpool and changes nothing any assertion can reach. Tests 7 and 8 both had to be rebuilt for
+    // this - the first versions parked correctly, passed, and killed nothing.
+    //
+    // <b>The three no test can cover, named rather than glossed:</b> ReconcileAsync's fourth
+    // `await StillOurs(_calls.OnLinkPresentAsync ...)`, ConnectHalvesAsync's second await, and
+    // RegisterCallsAsync's. Each is the last await in its turn, so its whole continuation is that
+    // turn's tail - EnforceConnectPermission plus a Publish that recomputes from scratch, both
+    // level-triggered and idempotent by design, and by then the halves have already announced whatever
+    // they changed. So no deterministic assertion can see which thread ran it. That is a limit of the
+    // instrument, not a safety argument: the work is still unsynchronized, and EnforceConnectPermission
+    // can stand a half down and set the latch, which is a wrong answer and not merely a race.
 
     /// <summary>
     /// Drives the manager until a turn is parked on one seam await, answers that seam from a worker
@@ -1348,17 +1361,16 @@ public sealed class ConnectionManagerTests : IDisposable
     }
 
     /// <summary>
-    /// The four <c>await StillOurs(...)</c> call sites and <c>StillOurs</c>'s own <c>await step</c>,
-    /// which the five tests above cannot reach.
+    /// <c>StillOurs</c>'s own <c>await step</c>, and the third of the four call sites that awaits it -
+    /// the music half's link-present report.
     ///
-    /// They are only reached from a reconcile pass, and in every scenario above the halves answer that
-    /// pass with an already-completed task - <c>ReconcileAsync</c> from <c>Off</c> returns
-    /// <c>Task.CompletedTask</c> - so the awaiter never registers a continuation and
-    /// <c>ConfigureAwait</c> has nothing to configure. Measured, not assumed: mutating those five sites
-    /// left all 83 tests green until this one existed.
+    /// The five tests above cannot reach either. They are only reached from a reconcile pass, and in
+    /// every scenario above the halves answer that pass with an already-completed task, so the awaiter
+    /// never registers a continuation and <c>ConfigureAwait</c> has nothing to configure. Measured, not
+    /// assumed: mutating those five sites left all 83 tests green until this one existed.
     ///
     /// So this drives the connect from the <em>pass</em> rather than from a watcher edge, with the sink
-    /// held open. <c>StillOurs</c> then genuinely suspends, and so does the call site awaiting it.
+    /// held open.
     /// </summary>
     [Fact]
     public void A_reconcile_that_connects_a_half_resumes_on_the_context_that_started_it()
@@ -1374,6 +1386,84 @@ public sealed class ConnectionManagerTests : IDisposable
                 Assert.Equal(ConnectionState.Connecting, h.Manager.State);
             },
             h => h.Sink.CompleteConnect(connected: true),
+            h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
+    }
+
+    /// <summary>
+    /// Check 3's first call site: <c>await StillOurs(_music.ReconcileAsync(...))</c>, which suspends
+    /// only when the music half is in <see cref="MusicState.Backoff"/> with its retry overdue - the
+    /// backstop for a retry a suspended machine never delivered.
+    ///
+    /// <b>Getting there needs the retry timer out of the way, and the honest way to do that is to
+    /// reproduce the case the branch exists for.</b> An <c>Advance</c> long enough to fire the retry
+    /// once leaves the re-armed one sitting out the rest of that same drain - see
+    /// <c>FakeScheduler.Advance</c> - so the clock ends 29 s along with the half overdue and nothing
+    /// armed to fire. That is precisely a machine that was asleep through its own backoff. The pass is
+    /// then forced without advancing again, because any further advance would fire the retry first and
+    /// the half would be Connecting rather than Backoff.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_retrying_the_music_half_resumes_on_the_context_that_started_it()
+    {
+        AssertResumesOnTheStartingContext(
+            h =>
+            {
+                // Both halves fail once and back off. The calls half is the one that matters after
+                // the park: without work left for the pass to do, the mutated continuation would run
+                // on the threadpool and change nothing anyone could assert on - measured, the first
+                // version of this test had the calls half already Up and the mutant survived it.
+                h.Sink.ConnectResult = false;
+                h.Calls.Transports = Array.Empty<TransportCandidate>();
+                h.Link.RaiseAppeared();
+
+                h.Scheduler.Advance(Seconds(29));
+
+                h.Sink.ConnectResult = true;
+                h.Sink.DeferConnect = true;
+                h.Calls.Transports = new[] { PhoneTransport };
+
+                // A pass on demand. SetAutoReconnect runs one straight away rather than waiting for
+                // the tick, which is what keeps the armed retries from firing first.
+                h.Manager.SetAutoReconnect(true);
+
+                Assert.Equal(ConnectionState.Connecting, h.Manager.State);
+            },
+            h => h.Sink.CompleteConnect(connected: true),
+            h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
+    }
+
+    /// <summary>
+    /// Check 3's second call site: <c>await StillOurs(_calls.ReconcileAsync(...))</c>, the same
+    /// overdue-backoff backstop on the other half.
+    ///
+    /// The music half is deliberately left <see cref="MusicState.Off"/> across the park - the watcher
+    /// says the phone left, which tears music down and, by design, leaves the calls half's
+    /// registration and backoff alone. That is what gives the pass something to do <em>after</em> this
+    /// await: the link read below finds the phone present again and check 5 connects music. Without
+    /// it there is nothing after the park for a mutant to move onto the threadpool.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_retrying_the_calls_half_resumes_on_the_context_that_started_it()
+    {
+        AssertResumesOnTheStartingContext(
+            h =>
+            {
+                // Nothing to correlate against, so the registration finds no match and backs off.
+                h.Calls.Transports = Array.Empty<TransportCandidate>();
+                h.Link.RaiseAppeared();
+                h.Scheduler.Advance(Seconds(29));
+
+                // Music down, calls untouched - the asymmetry CallsHalf is built around.
+                h.Link.RaiseRemoved();
+
+                h.Calls.Transports = new[] { PhoneTransport };
+                h.Calls.DeferFind = true;
+
+                h.Manager.SetAutoReconnect(true);
+
+                Assert.Equal(ConnectionState.Connecting, h.Manager.State);
+            },
+            h => h.Calls.CompleteFind(),
             h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
     }
 

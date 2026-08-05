@@ -21,9 +21,11 @@ namespace Klangbruecke.Tests.Fakes;
 /// current), so that one goes to the threadpool. Both are off the turn's own thread, which is what the
 /// tests assert on.
 ///
-/// <b>What it does not cover:</b> two tail awaits whose whole continuation is
-/// <c>ConnectionManager.FinishTurn</c>, which is idempotent and level-triggered by design and so
-/// produces the same answer whichever thread runs it. See the map in <c>ConnectionManagerTests</c>.
+/// <b>What it does not cover:</b> three awaits that are the last one in their turn, so their whole
+/// continuation is that turn's tail - <c>EnforceConnectPermission</c> and a <c>Publish</c> that
+/// recomputes from scratch. Both are level-triggered and idempotent by design, and by the time the
+/// tail runs the halves have already announced whatever they changed. See the map in
+/// <c>ConnectionManagerTests</c>, which names all three.
 ///
 /// <b>Not thread-safe by accident.</b> <see cref="Post"/> is called from whichever thread completes
 /// the work, and <see cref="Drain"/> from the test thread, so the queue is locked. That is the one
@@ -36,9 +38,6 @@ public sealed class RecordingSynchronizationContext : SynchronizationContext
 {
     private readonly object _gate = new();
     private readonly Queue<Action> _queued = new();
-
-    /// <summary>How many callbacks have been posted here, ever. Never decremented by a drain.</summary>
-    public int PostCount { get; private set; }
 
     /// <summary>How many are queued and not yet run.</summary>
     public int PendingCount
@@ -56,7 +55,6 @@ public sealed class RecordingSynchronizationContext : SynchronizationContext
     {
         lock (_gate)
         {
-            PostCount++;
             _queued.Enqueue(() => d(state));
         }
     }

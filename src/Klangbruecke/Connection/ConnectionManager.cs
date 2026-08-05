@@ -29,15 +29,18 @@ namespace Klangbruecke.Connection;
 /// thread.
 ///
 /// <b>Never add <c>ConfigureAwait(false)</c> to anything in here or in the two halves.</b> It reads
-/// like a tidy-up and it is the one token that takes the whole design apart: the continuation leaves
-/// the UI thread - for the threadpool, not for the answering thread, because the runtime refuses to
-/// inline a suppressed continuation while a custom <c>SynchronizationContext</c> is installed - and
-/// four machines that hold no lock start sharing state across threads.
+/// like a tidy-up and it is the one token that takes the whole design apart: four machines that hold
+/// no lock start sharing state across threads. Which thread it leaks onto depends on the await, and
+/// both cases are real - the five that await a seam resume <em>on the answering thread</em>, because
+/// a radio's own thread carries no <c>SynchronizationContext</c> and the runtime inlines there; the
+/// nine that await one of our own methods resume <em>on the threadpool</em>, because the runtime
+/// refuses to inline while a custom context is installed, which is always the case on the UI thread.
 ///
-/// Twelve of the fourteen awaits in these three classes have a named test that goes red for it; the
-/// six are in <c>ConnectionManagerTests</c> under "the captured context", which maps every site to its
-/// test and names the two it cannot cover and why. Do not read the prohibition as covered by one test:
-/// an earlier version of this comment did, and it was true of one await out of fourteen.
+/// Eleven of the fourteen awaits in these three classes have a named test that goes red for that site
+/// alone; the eight are in <c>ConnectionManagerTests</c> under "the captured context", which maps
+/// every site to its test and names the three it cannot cover and why. Do not read the prohibition as
+/// covered by one test, and do not read an aggregate mutant as covering the sites inside it: earlier
+/// versions of this comment did both.
 ///
 /// <b>What it does not do.</b> It never reads <c>ICallTransportService.IsRegistered</c>: that is a
 /// live CsWinRT ABI call, and a throw out of a timer callback reaches
@@ -856,6 +859,9 @@ public sealed class ConnectionManager : IDisposable
                     return;
                 }
 
+                // The last await in the pass, so everything after it is the tail - which is why no
+                // test can catch a ConfigureAwait(false) here. See the map in ConnectionManagerTests
+                // under "the captured context"; the prohibition still applies, it just has no tripwire.
                 if (!await StillOurs(_calls.OnLinkPresentAsync(ConnectPermitted), startedAt))
                 {
                     return;
@@ -1089,6 +1095,9 @@ public sealed class ConnectionManager : IDisposable
             return;
         }
 
+        // The last await in this turn, so its continuation is only FinishTurn - which is why no test
+        // can catch a ConfigureAwait(false) here. See the map in ConnectionManagerTests under "the
+        // captured context"; the prohibition still applies, it just has no tripwire.
         await _calls.OnLinkPresentAsync(ConnectPermitted);
 
         FinishTurn();
@@ -1098,6 +1107,7 @@ public sealed class ConnectionManager : IDisposable
     {
         if (_linkMachine.State == LinkState.Present)
         {
+            // The other await with no tripwire, for the same reason as ConnectHalvesAsync's second.
             await _calls.OnLinkPresentAsync(ConnectPermitted);
         }
 
