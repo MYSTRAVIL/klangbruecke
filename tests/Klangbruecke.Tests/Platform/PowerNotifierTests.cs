@@ -53,6 +53,11 @@ public sealed class PowerNotifierTests : IDisposable
         // guard that at the call site is how teardown paths grow the conditionals that then get one
         // case wrong.
         Assert.Null(Record.Exception(notifier.Dispose));
+
+        // Guards the probe, not the subject. With no Start there is no subscription, so this reads 0
+        // whatever Dispose does or does not do - it cannot fail on the behaviour named in the test
+        // name. Kept only because it is the one place that pins "a never-started notifier really is
+        // absent from the list", which is the baseline every other count here is read against.
         Assert.Equal(0, PowerModeHandlerCount(notifier));
     }
 
@@ -82,27 +87,42 @@ public sealed class PowerNotifierTests : IDisposable
         // WeakReference, confirmed by reading the list below - so a notifier that never unsubscribes
         // is rooted for the life of the process and keeps being handed resumes long after the app
         // believes it is gone.
+        // try/finally rather than `using`, because the assertions have to run between the Starts and
+        // the Disposes. Without it, a failure at any assertion below would abort the test with one of
+        // these still subscribed - leaking a process-global subscription for the rest of the run,
+        // which is the exact hazard this test exists to catch. Owner-scoped counts keep that from
+        // reddening other tests, but not leaking it in the first place is better than relying on the
+        // containment.
         var first = new PowerNotifier();
-        first.Start();
-        Assert.Equal(1, PowerModeHandlerCount(first));
-
-        first.Dispose();
-        Assert.Equal(0, PowerModeHandlerCount(first));
-
-        // The brief's second half: a second instance over the same static event subscribes and
-        // unsubscribes cleanly, and the first one's handler does not come back. This is what says the
-        // leak is per-instance and actually released rather than merely masked by the next
-        // subscription overwriting it.
         var second = new PowerNotifier();
-        second.Start();
+        try
+        {
+            first.Start();
+            Assert.Equal(1, PowerModeHandlerCount(first));
 
-        Assert.Equal(1, PowerModeHandlerCount(second));
-        Assert.Equal(0, PowerModeHandlerCount(first));
+            first.Dispose();
+            Assert.Equal(0, PowerModeHandlerCount(first));
 
-        second.Dispose();
+            // The brief's second half: a second instance over the same static event subscribes and
+            // unsubscribes cleanly, and the first one's handler does not come back. This is what says
+            // the leak is per-instance and actually released rather than merely masked by the next
+            // subscription overwriting it.
+            second.Start();
 
-        Assert.Equal(0, PowerModeHandlerCount(second));
-        Assert.Equal(0, PowerModeHandlerCount(first));
+            Assert.Equal(1, PowerModeHandlerCount(second));
+            Assert.Equal(0, PowerModeHandlerCount(first));
+
+            second.Dispose();
+
+            Assert.Equal(0, PowerModeHandlerCount(second));
+            Assert.Equal(0, PowerModeHandlerCount(first));
+        }
+        finally
+        {
+            // Both are idempotent, so disposing again here is free.
+            first.Dispose();
+            second.Dispose();
+        }
     }
 
     [Fact]
@@ -280,9 +300,19 @@ public sealed class PowerNotifierTests : IDisposable
     /// <c>s_onPowerModeChangedEvent</c> sentinel, and each entry holds a plain
     /// <c>Delegate _delegate</c> (a strong reference, which is the leak this whole test exists for).
     ///
-    /// Every lookup that cannot be satisfied throws. A future .NET that renames any of these fields
-    /// must make this fail loudly, because the failure mode of the alternative is a permanently green
-    /// test asserting nothing.
+    /// Every <b>field</b> lookup that cannot be satisfied throws - the three below. Be precise about
+    /// what that does not cover: the two <c>is IDictionary</c> / <c>is IEnumerable</c> patterns return
+    /// 0 for anything that fails them, so a change to the <b>shape</b> of the containers (rather than
+    /// the names of the fields) would be swallowed as a zero rather than reported. No silent green is
+    /// reachable through that gap, because <see cref="Start_subscribes_to_SystemEvents"/> demands a
+    /// count of exactly one and would fail - but the gap is real and this comment used to overstate the
+    /// guarantee.
+    ///
+    /// A rename lands on 6 of the 15 tests here, not one: every test that counts handlers. That is
+    /// noisy but contained - the probe is <c>private static</c> to this class, so nothing else in the
+    /// suite can be affected - and each failure carries an explicit "must not be trusted" message, so
+    /// it reads as an instrument failure rather than a regression in <see cref="PowerNotifier"/>. Cost
+    /// noted here because it lands on whoever raises the TFM.
     ///
     /// Counts by owner rather than in total, and that is not fastidiousness. A test that fails partway
     /// through leaves its own notifier undisposed - and therefore subscribed - for the rest of the
@@ -310,7 +340,9 @@ public sealed class PowerNotifierTests : IDisposable
             ?? throw new InvalidOperationException("SystemEvents.s_onPowerModeChangedEvent is null.");
 
         // Null until something in the process subscribes to any SystemEvents event, and the key is
-        // absent until something subscribes to this one. Both are honest zeroes, not lookup failures.
+        // absent until something subscribes to this one. Those two are honest zeroes. A non-null value
+        // of some other shape would not be, and this pattern cannot tell the two apart - see the note
+        // on the summary above.
         if (handlersField.GetValue(null) is not IDictionary handlers)
         {
             return 0;

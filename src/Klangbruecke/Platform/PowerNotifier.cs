@@ -12,12 +12,38 @@ namespace Klangbruecke.Platform;
 /// settle before the forced reconcile lives in <c>ConnectionManager</c>, on <c>IScheduler</c>, where
 /// it can be tested on a hand-cranked clock. See <see cref="IPowerNotifier"/>.
 ///
-/// <b>Nothing here marshals.</b> <c>SystemEvents</c> raises on its own dedicated window thread - not
-/// the UI thread and not the managed threadpool - and <see cref="OnPowerModeChanged"/> re-raises on
-/// that same thread. <c>ConnectionManager</c> posts every inbound event through <c>IUiDispatcher</c>
-/// before touching state, which is what makes it single-threaded by contract. A second marshalling
-/// layer here would put an extra hop in front of every wake and buy nothing. <c>LinkMonitor</c> says
-/// the same thing about its watcher callbacks, for the same reason.
+/// <b>Nothing here marshals, because <c>SystemEvents</c> already did.</b> An earlier draft of this
+/// file claimed the handler arrives on a dedicated <c>SystemEvents</c> thread, never the UI thread.
+/// That is false, so the correction is stated with the measurement behind it.
+///
+/// <c>SystemEvents</c> does own a window thread, but it does not hand the handler to you on it. Each
+/// subscription captures the <see cref="System.Threading.SynchronizationContext"/> current on the
+/// thread that called <see cref="Start"/> - kept in the internal
+/// <c>SystemEventInvokeInfo._syncContext</c> - and dispatches through
+/// <c>SynchronizationContext.Send</c>. Measured on this machine, .NET 8 / SDK 8.0.417:
+///
+/// <list type="bullet">
+/// <item>Subscribing under a custom context and reading the private field back: the captured context
+/// <b>is</b> the one that was current at <c>+=</c> time.</item>
+/// <item>Driving the internal <c>Invoke</c> from a background thread: <b>one <c>Send</c>, zero
+/// <c>Post</c></b>. The dispatch blocks the raising thread until the handler returns, so under a
+/// WinForms context this is a blocking <c>Control.Invoke</c> and a slow <see cref="Resumed"/> handler
+/// stalls the OS notification thread. Keep this path short.</item>
+/// <item>Subscribing with no ambient context: a plain <c>SynchronizationContext</c> is captured, whose
+/// <c>Send</c> runs inline - i.e. on the <c>SystemEvents</c> window thread.</item>
+/// </list>
+///
+/// So the delivery thread is <b>whichever context was current when <see cref="Start"/> ran</b>, and
+/// since <see cref="Start"/> is deliberately not called from the constructor, that depends on where
+/// startup wires it: before <c>Application.Run</c> gives the <c>SystemEvents</c> thread, after gives
+/// the UI thread. <see cref="OnPowerModeChanged"/> re-raises on whatever thread it was entered on and
+/// adds nothing. <c>ConnectionManager</c> posts every inbound event through <c>IUiDispatcher</c>
+/// before touching state, which is what makes it single-threaded by contract either way - so a second
+/// marshalling layer here would add a hop and buy nothing. <c>LinkMonitor</c> reaches the same
+/// instruction by the opposite route: nothing has marshalled for it at all.
+///
+/// <see cref="Start"/> and <see cref="Dispose"/> must be called on the same thread. See
+/// <see cref="IPowerNotifier"/>, and the field comment below for what that buys.
 ///
 /// <b>The subscription is static, and that is the whole hazard.</b>
 /// <c>SystemEvents.PowerModeChanged</c> holds the handler in a plain field - not a weak reference -
@@ -35,9 +61,14 @@ public sealed class PowerNotifier : IPowerNotifier
     // subscription that a single Dispose could not give back - a permanent leak, and two Resumed per
     // wake in the meantime, which downstream becomes two settles and two forced reconciles.
     //
-    // Neither field is volatile, unlike LinkMonitor's. Both are written only by the thread that calls
-    // Start/Dispose - the UI thread - and neither is read on the SystemEvents thread: the callback
-    // does not consult them. See the note in Dispose on what that deliberately does not close.
+    // Neither field is volatile, unlike LinkMonitor's, and that rests entirely on the same-thread
+    // caller contract stated on IPowerNotifier: Start and Dispose are called on one thread, and
+    // OnPowerModeChanged never consults either field, so there is no cross-thread read to publish.
+    //
+    // If that contract is ever broken the failure is not a torn read, it is a missed unsubscribe - and
+    // because the subscription is static and strongly rooted, a missed unsubscribe leaks for the life
+    // of the process. Whoever wants to tear down off-thread must make these volatile (or lock) first.
+    // See the note in Dispose for the one race this deliberately does not close even so.
     private bool _subscribed;
     private bool _disposed;
 
@@ -92,8 +123,15 @@ public sealed class PowerNotifier : IPowerNotifier
         // nothing acted on it" - two different bugs, in two different components.
         Log.Info("The machine resumed from sleep.");
 
-        // Raised on the SystemEvents thread. ConnectionManager posts through IUiDispatcher; do not add
-        // a second marshalling layer here.
+        // Raised on whatever thread this method was entered on, which is whichever
+        // SynchronizationContext was current when Start() ran - the UI thread if Start came after the
+        // WinForms context was installed, the SystemEvents window thread if it came before. Not a
+        // fixed thread, and deliberately not re-marshalled: SystemEvents.Send has already made the
+        // hop, and ConnectionManager posts through IUiDispatcher regardless. Do not add a second
+        // marshalling layer here. See the class comment for the measurement.
+        //
+        // Keep whatever runs downstream of this short. The dispatch that got here is Send, not Post,
+        // so the OS notification thread is blocked until every handler returns.
         //
         // `this` as the sender, not whatever SystemEvents passed. Subscribers identify the source they
         // registered with, and a consumer holding more than one seam would otherwise have no way to

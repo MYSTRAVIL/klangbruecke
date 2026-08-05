@@ -14,12 +14,41 @@ namespace Klangbruecke.Platform;
 /// to <c>ConnectionManager</c> and <c>IScheduler</c>. This seam reports the wake, not what to do about
 /// it.
 ///
-/// <b>Nothing here marshals.</b> Implementations raise <see cref="Resumed"/> on whatever thread the OS
-/// notification arrived on - for <see cref="PowerNotifier"/> that is the dedicated <c>SystemEvents</c>
-/// window thread, never the UI thread. <c>ConnectionManager</c> posts every inbound event through
-/// <c>IUiDispatcher</c> before touching state, which is what makes it single-threaded by contract. Do
-/// not add a second marshalling layer here; <c>ILinkMonitor</c> states the same contract for the same
-/// reason.
+/// <b>Do not add a marshalling layer here</b> - but not for the reason <c>ILinkMonitor</c> gives.
+/// <c>ILinkMonitor</c> does not marshal because nothing does, and <c>ConnectionManager</c> is what
+/// makes the hop. <see cref="PowerNotifier"/> does not marshal because <c>SystemEvents</c>
+/// <b>already has</b>, before the handler is entered.
+///
+/// The real rule, measured rather than assumed: <c>SystemEvents</c> captures whatever
+/// <see cref="System.Threading.SynchronizationContext"/> was current on the thread that called
+/// <see cref="Start"/>, and dispatches through it. So <see cref="Resumed"/> arrives on <b>whichever
+/// context was current when <see cref="Start"/> ran</b> - not on a fixed thread. Three consequences,
+/// and the third is the one that bites:
+///
+/// <list type="number">
+/// <item>Called after the WinForms context is installed, <see cref="Resumed"/> lands on the <b>UI
+/// thread</b>.</item>
+/// <item>The dispatch is <c>Send</c>, not <c>Post</c> - measured: one <c>Send</c>, zero <c>Post</c>.
+/// Under WinForms that is a <b>blocking</b> cross-thread <c>Control.Invoke</c>, so the OS notification
+/// thread stalls behind a busy UI thread. Do not do slow work in a <see cref="Resumed"/> handler.</item>
+/// <item>With no context installed, <c>SystemEvents</c> captures a plain
+/// <see cref="System.Threading.SynchronizationContext"/> whose <c>Send</c> runs inline - i.e. on the
+/// <c>SystemEvents</c> window thread. Because <see cref="Start"/> is deliberately not called from the
+/// constructor, <b>the delivery thread depends on where startup calls it</b>: before
+/// <c>Application.Run</c> gives the <c>SystemEvents</c> thread, after gives the UI thread.</item>
+/// </list>
+///
+/// Either way <c>ConnectionManager</c> posts every inbound event through <c>IUiDispatcher</c> before
+/// touching state, which is what makes it single-threaded by contract regardless of which of the two
+/// it got. That is why the ambiguity above is tolerable rather than a bug - but do not write code here
+/// or downstream that assumes a particular one.
+///
+/// <b><see cref="Start"/> and <see cref="IDisposable.Dispose"/> must be called on the same thread</b>,
+/// and implementations are not required to be thread-safe across them. This is a real requirement, not
+/// a nicety: <see cref="PowerNotifier"/> tracks whether it is subscribed in ordinary non-volatile
+/// fields, so a <see cref="IDisposable.Dispose"/> raced from another thread can miss the unsubscribe -
+/// and because the underlying subscription is static and strongly rooted, a missed unsubscribe is a
+/// leak for the life of the process, not a transient glitch.
 /// </summary>
 public interface IPowerNotifier : IDisposable
 {
