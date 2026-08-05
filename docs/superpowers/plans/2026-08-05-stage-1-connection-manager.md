@@ -101,7 +101,9 @@ Wave C:  6  needs 4, 5       (projection over LinkState + SuppressionReason)
 Wave D:  14 needs 2, 3, 6, 7, 9, 13      (MusicHalf)
          15 needs 2, 3, 6, 10            (CallsHalf)
 
-Wave E:  16 needs 4, 5, 6, 11, 12, 14, 15
+Wave D': 19 needs 11          (debounce the link poll -- added mid-execution)
+
+Wave E:  16 needs 4, 5, 6, 11, 12, 14, 15, 19
 Wave F:  17 needs 16
 Wave G:  18 needs 17
 ```
@@ -1636,6 +1638,78 @@ class of finding, not a nuisance.
 ```bash
 git add src/Klangbruecke/Klangbruecke.csproj packaging/AppxManifest.xml docs/FINDINGS.md
 git commit -m "Stage 1 validated on hardware: version 0.2.0.0, FINDINGS updated"
+```
+
+---
+
+### Task 19: Debounce the link poll
+
+**Runs after Task 11, and must land before Task 16.** Numbered last only to keep the earlier
+numbering stable.
+
+**Files:**
+- Modify: `src/Klangbruecke/Connection/LinkMachine.cs`
+- Modify: `tests/Klangbruecke.Tests/Connection/LinkMachineTests.cs`
+
+**Interfaces:**
+- Consumes: `LinkState`, `BluetoothLinkStatus` (Task 4)
+- Produces: no signature change — `OnLinkStatusRead(BluetoothLinkStatus)` keeps its shape
+
+**Why.** `ILinkMonitor.ReadLinkStatusAsync` returns `Unknown` whenever a read fails — an
+unparseable address, a null WinRT result, a throw — and `LinkMachine` correctly treats `Unknown` as
+`Disconnected`, because guessing the other way produces silent permanent dormancy. But a single
+transient failure then looks exactly like the phone leaving the room, and two reviews found real
+consequences:
+
+1. The music half's `Absent` row calls `router.Stop()` and `sink.Disconnect()`, so one WinRT hiccup
+   tears down a working A2DP route mid-song.
+2. `SuppressionLatch` re-arms on `Present → Absent → Present`, so a failed poll followed by a good
+   one silently undoes a deliberate tray Disconnect roughly 60 seconds after the user asked for it.
+
+**The fix.** A **poll** must report non-`Connected` **twice consecutively** before `Present` becomes
+`Absent`. Watcher edges are unaffected — `OnDeviceRemoved` is a definite signal and still transitions
+immediately. Nothing else changes.
+
+This costs nothing on a real range exit: the music half tears down on its own evidence — the
+connection closes and the endpoint vanishes — so the debounce delays only the state *label*, never
+the teardown.
+
+- [ ] **Step 1: Write the failing tests**
+
+| Test | Asserts |
+|---|---|
+| `A_single_non_connected_poll_does_not_leave_Present` | one `Disconnected` read; still `Present`, returns false |
+| `Two_consecutive_non_connected_polls_move_Present_to_Absent` | second read transitions and returns true |
+| `A_Connected_poll_resets_the_debounce` | `Disconnected`, `Connected`, `Disconnected` leaves `Present` |
+| `Unknown_and_Disconnected_both_count_toward_the_debounce` | theory over the two, and mixed pairs, since both mean "not connected" |
+| `Device_removed_still_moves_Present_to_Absent_immediately` | a watcher edge is definite and is not debounced |
+| `The_debounce_is_reset_on_entering_Present` | `Disconnected`, `DeviceRemoved`, `DeviceAppeared`, `Disconnected` leaves `Present` |
+| `Polls_while_Absent_do_not_accumulate_toward_anything` | repeated `Disconnected` while `Absent` stay `Absent`, all returning false |
+
+`Link_status_Disconnected_moves_Present_to_Absent` and `Link_status_Unknown_is_treated_as_Disconnected`
+from Task 4 must be updated to perform two reads. That is the intended behaviour change, not
+breakage — but update them deliberately and say so in the commit message.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `dotnet test Klangbruecke.sln --filter "FullyQualifiedName~LinkMachineTests"`
+Expected: the new tests FAIL; the two updated ones FAIL until the debounce exists.
+
+- [ ] **Step 3: Implement the debounce**
+
+- [ ] **Step 4: Re-run the mutation checks from Task 4**
+
+Task 4 ran six mutations and killed all six. Re-run them against the amended machine and confirm
+they still fail a named test — a debounce counter is exactly the kind of addition that can make a
+previously-sharp test pass for a new reason. Then mutate the debounce itself: a threshold of 1 must
+redden `A_single_non_connected_poll_does_not_leave_Present`, and a counter that never resets must
+redden `A_Connected_poll_resets_the_debounce`.
+
+- [ ] **Step 5: Run the full suite and commit**
+
+```bash
+git add src/Klangbruecke/Connection/LinkMachine.cs tests/Klangbruecke.Tests/Connection/LinkMachineTests.cs
+git commit -m "Debounce the link poll: one failed read must not look like a range exit"
 ```
 
 ---
