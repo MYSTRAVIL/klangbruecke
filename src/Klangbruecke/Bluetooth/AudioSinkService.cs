@@ -12,9 +12,18 @@ namespace Klangbruecke.Bluetooth;
 ///   Start()     - begin advertising / listening. Does NOT connect.
 ///   OpenAsync() - actually open the connection to a specific device.
 ///
-/// While a connection is open Windows exposes a capture endpoint named
-/// "Line (&lt;phone&gt; A2DP SNK)". If that endpoint is absent, nothing is holding a
-/// connection and the phone cannot see this PC as an output. See docs/FINDINGS.md §4.
+/// While a connection is open Windows eventually exposes a capture endpoint named
+/// "Line (&lt;phone&gt; A2DP SNK)", and its presence is proof that something is holding a connection.
+///
+/// The converse does not hold, and assuming it did is a measured defect rather than a theoretical
+/// one: the endpoint is absent for an unbounded interval *after* the connection reports Opened, and
+/// in 5 of 8 recorded launches the app looked for it too early, found nothing, and silently never
+/// routed audio for the whole session. Endpoint presence is therefore sufficient evidence of a live
+/// connection, never necessary - absence proves nothing at all about the connection.
+///
+/// That is why <see cref="IsConnected"/> below answers only for the WinRT connection object and the
+/// endpoint half belongs to <c>IAudioEndpointMonitor</c>. Use the endpoint to verify a route; never
+/// to infer a disconnection. See docs/FINDINGS.md §4.
 /// </summary>
 public sealed class AudioSinkService : IAudioSinkService
 {

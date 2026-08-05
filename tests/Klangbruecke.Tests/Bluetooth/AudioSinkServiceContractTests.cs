@@ -88,6 +88,15 @@ public sealed class AudioSinkServiceContractTests : IDisposable
             e => e.Level == LogLevel.Warn && e.Message.Contains("AudioSinkPolicy"));
     }
 
+    // A contract marker, labelled as one because it cannot currently fail. Deleting the
+    // `if (_disposed) return;` guard from Dispose leaves every test in this class green: Disconnect()
+    // is itself idempotent, so a second pass through Dispose is observably a no-op either way. The
+    // toolchain does not catch it either - the deletion emits CS0414 (field assigned but never used),
+    // and there is no TreatWarningsAsErrors anywhere in this repo, so the build simply succeeds.
+    //
+    // So do not read a green run here as evidence that the guard is present. It becomes load-bearing,
+    // and this test becomes capable of failing, the moment Dispose does something Disconnect does
+    // not - and whoever makes that change owns the assertion for it.
     [Fact]
     public void Dispose_is_idempotent()
     {
@@ -100,6 +109,12 @@ public sealed class AudioSinkServiceContractTests : IDisposable
     [Fact]
     public void AudioSinkConnectionState_maps_both_WinRT_values()
     {
+        // The WinRT side first, or this test's name is only half true. Translate's else branch
+        // collapses everything that is not Opened to Closed, so a third value arriving in a future
+        // projection would be mapped silently rather than caught. This is the assertion that would
+        // catch it - verified live: expecting 3 fails with "Actual: 2".
+        Assert.Equal(2, Enum.GetValues<AudioPlaybackConnectionState>().Length);
+
         // Both values, in the WinRT order, and only those two.
         Assert.Equal(
             new[] { AudioSinkConnectionState.Closed, AudioSinkConnectionState.Opened },
