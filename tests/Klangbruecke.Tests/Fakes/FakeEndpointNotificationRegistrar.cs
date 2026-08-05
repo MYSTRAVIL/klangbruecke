@@ -47,11 +47,30 @@ public sealed class FakeEndpointNotificationRegistrar : IEndpointNotificationReg
     /// </summary>
     public bool UnregisteredTheClientItRegistered { get; private set; }
 
+    /// <summary>
+    /// Thrown out of <see cref="Register"/> when set. The real registrar constructs an
+    /// <c>MMDeviceEnumerator</c> before it can check any HRESULT, and that construction can fail while
+    /// the audio service restarts - so a throw out of this call is a reachable path, not a hypothetical
+    /// one, and it lands on the UI-thread startup path where nothing else would catch it.
+    /// </summary>
+    public Exception? RegisterThrows { get; set; }
+
+    /// <summary>
+    /// Thrown out of <see cref="Unregister"/> and <see cref="Dispose"/> when set. Teardown runs outside
+    /// the message loop's exception guard, so anything that escapes it is a WER dialog.
+    /// </summary>
+    public Exception? TeardownThrows { get; set; }
+
     public void Register(IMMNotificationClient client)
     {
         RegisterCount++;
         Operations.Add("register");
         Client = new WeakReference(client);
+
+        if (RegisterThrows is not null)
+        {
+            throw RegisterThrows;
+        }
     }
 
     public void Unregister(IMMNotificationClient client)
@@ -62,11 +81,21 @@ public sealed class FakeEndpointNotificationRegistrar : IEndpointNotificationReg
         // Target is read into a local that dies with this call, so nothing here outlives the method and
         // keeps the client alive past a later collection.
         UnregisteredTheClientItRegistered = ReferenceEquals(client, Client?.Target);
+
+        if (TeardownThrows is not null)
+        {
+            throw TeardownThrows;
+        }
     }
 
     public void Dispose()
     {
         DisposeCount++;
         Operations.Add("dispose");
+
+        if (TeardownThrows is not null)
+        {
+            throw TeardownThrows;
+        }
     }
 }

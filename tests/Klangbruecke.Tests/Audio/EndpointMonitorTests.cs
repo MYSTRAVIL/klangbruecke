@@ -253,7 +253,150 @@ public sealed class EndpointMonitorTests : IDisposable
         Assert.Equal(0, registrar.RegisterCount);
     }
 
+    // --- beyond the brief: Start cannot throw, and cannot be entered twice ------------------------
+
+    [Fact]
+    public void A_registrar_that_throws_does_not_escape_Start()
+    {
+        var registrar = new FakeEndpointNotificationRegistrar
+        {
+            RegisterThrows = new InvalidOperationException("the audio service is restarting"),
+        };
+        using var monitor = new EndpointMonitor(registrar, () => true);
+        int changes = 0;
+        monitor.EndpointsChanged += (_, _) => changes++;
+
+        // Reachable, not hypothetical: the real registrar constructs an MMDeviceEnumerator before it can
+        // check any HRESULT, and the property's own comment names that construction as a thing that
+        // fails while the audio service restarts. Start runs on the UI thread during startup, outside
+        // the message loop's exception guard - so an escape here is a WER dialog, a window, in an app
+        // whose whole premise is not to have one. Note the asymmetry this closes: a failed *HRESULT* was
+        // already only warned about, so the two failure modes of the same call used to be handled
+        // opposite ways.
+        Assert.Null(Record.Exception(monitor.Start));
+
+        (LogLevel Level, string Message, Exception? Exception) failure =
+            Assert.Single(_log.Entries, e => e.Level == LogLevel.Error);
+
+        // The consequence, not just the cause. A line that says only "it threw" leaves the reader to
+        // work out that the app is now deaf to endpoint arrivals and depends on the reconcile.
+        Assert.Contains("reconcile", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Same(registrar.RegisterThrows, failure.Exception);
+
+        // And the level-triggered half still ran. This is the whole reason the failure is survivable:
+        // the subscribe-time check does not need the registration, so an endpoint that is already there
+        // is still reported even when nothing will ever notify.
+        Assert.Equal(1, changes);
+    }
+
+    [Fact]
+    public void Concurrent_Starts_register_exactly_one_client()
+    {
+        // A plain `if (_started) return;` is check-then-act. Two threads that both pass it each build a
+        // client and register it, and the second overwrites the field holding the first - leaving a
+        // registered client rooted by nothing, one GC from the 0xC0000005. Interlocked is what makes the
+        // claim atomic.
+        //
+        // Repeated rather than run once, and read that honestly: this is a probabilistic detector, not a
+        // proof. The window is a couple of instructions wide, so a single race almost never lands in it -
+        // measured, while mutating this very guard. What makes the repetition worth its cost is that the
+        // mutation was caught here at these numbers; what the repetition cannot do is promise it always
+        // will be. The guarantee comes from the Interlocked pair itself, not from this loop.
+        for (int attempt = 0; attempt < 100; attempt++)
+        {
+            int rootedBefore = EndpointMonitor.LiveClientCount;
+            var registrar = new FakeEndpointNotificationRegistrar();
+            using var monitor = new EndpointMonitor(registrar, () => false);
+
+            RunConcurrently(4, monitor.Start);
+
+            Assert.Equal(1, registrar.RegisterCount);
+
+            // The same failure seen from the root side. This is what would still catch it if the static
+            // set were the only thing left holding the orphan up.
+            Assert.Equal(rootedBefore + 1, EndpointMonitor.LiveClientCount);
+        }
+    }
+
+    [Fact]
+    public void Start_racing_Dispose_never_leaves_a_client_registered_or_rooted()
+    {
+        int rootedBefore = EndpointMonitor.LiveClientCount;
+
+        // The interleaving this defends against cannot be forced from a test - it needs Start to be
+        // preempted between its disposal check and the publish of the client - so this drives the two
+        // methods at each other repeatedly and asserts the invariant that must hold whichever way they
+        // land. It is deterministic in green: with the Dekker pair in place no ordering can break it.
+        for (int attempt = 0; attempt < 50; attempt++)
+        {
+            var registrar = new FakeEndpointNotificationRegistrar();
+            var monitor = new EndpointMonitor(registrar, () => false);
+
+            RunConcurrently(
+                2,
+                index =>
+                {
+                    if (index == 0)
+                    {
+                        // Start after Dispose is a refusal by contract, and one of the orderings here.
+                        try
+                        {
+                            monitor.Start();
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                        }
+                    }
+                    else
+                    {
+                        monitor.Dispose();
+                    }
+                });
+
+            // Never registered without also being unregistered. The reverse is allowed and does happen:
+            // Dispose can see a published client that Start has not registered yet, unregister nothing,
+            // and Start then declines to register at all.
+            Assert.True(
+                registrar.RegisterCount <= registrar.UnregisterCount,
+                $"attempt {attempt}: registered {registrar.RegisterCount} time(s) but unregistered "
+                + $"{registrar.UnregisterCount}. A registration nothing gives back outlives the monitor, "
+                + "and the client it names is then rooted by nothing.");
+
+            // And nothing is left rooted. Whoever loses the race gives the root back.
+            Assert.Equal(rootedBefore, EndpointMonitor.LiveClientCount);
+        }
+    }
+
     // --- beyond the brief: the strong reference ----------------------------------------------------
+
+    [Fact]
+    public void Start_roots_the_client_independently_of_the_monitor()
+    {
+        // The second root, and the one that does not depend on the consumer. The field alone keeps the
+        // client alive only for as long as the *monitor* is alive - so a ConnectionManager that drops a
+        // started monitor without disposing it takes the client with it, the registration outlives both,
+        // and the next notification lands in a collected object. That is the same 0xC0000005, caused by
+        // somebody else's omission.
+        //
+        // Counted relative to a baseline rather than against zero: the count is process-wide, and an
+        // earlier test that failed partway through would otherwise turn one red into a cascade. Same
+        // reasoning as PowerNotifierTests counting handlers by owner.
+        int before = EndpointMonitor.LiveClientCount;
+        var registrar = new FakeEndpointNotificationRegistrar();
+        var monitor = new EndpointMonitor(registrar, () => false);
+
+        Assert.Equal(before, EndpointMonitor.LiveClientCount);
+
+        monitor.Start();
+
+        Assert.Equal(before + 1, EndpointMonitor.LiveClientCount);
+
+        monitor.Dispose();
+
+        // Given back on the ordinary path, so this roots nothing for the life of the process except in
+        // the misuse case it exists for.
+        Assert.Equal(before, EndpointMonitor.LiveClientCount);
+    }
 
     [Fact]
     public void The_notification_client_is_strongly_rooted_while_it_is_registered()
@@ -265,8 +408,12 @@ public sealed class EndpointMonitorTests : IDisposable
         // managed object.
         //
         // The double deliberately holds the client only weakly, which is what makes this test able to
-        // fail: turn EndpointMonitor's _client field into a local and nothing else in the process
-        // references the object.
+        // fail at all. Be precise about what it now pins, though: there are two independent roots - the
+        // monitor's own field and the static live-client set - so removing either one on its own leaves
+        // this green. It is the *union* that is asserted here. The two roots are pinned separately by
+        // Dispose_unregisters_the_client_it_registered_and_only_then_disposes_the_registrar (the field,
+        // via identity) and Start_roots_the_client_independently_of_the_monitor (the static set, via the
+        // count). Deleting both together reddens this one.
         var registrar = new FakeEndpointNotificationRegistrar();
         using var monitor = new EndpointMonitor(registrar, () => false);
 
@@ -325,6 +472,27 @@ public sealed class EndpointMonitorTests : IDisposable
         // client rather than on the enumerator instance, so unregistering some other client - or a
         // freshly built one - reports success for nothing and leaves the real registration in place.
         Assert.True(registrar.UnregisteredTheClientItRegistered);
+    }
+
+    [Fact]
+    public void A_registrar_that_throws_does_not_escape_Dispose()
+    {
+        var registrar = new FakeEndpointNotificationRegistrar
+        {
+            TeardownThrows = new InvalidOperationException("the enumerator is already gone"),
+        };
+        var monitor = new EndpointMonitor(registrar, () => false);
+        monitor.Start();
+
+        // The other end of the same rule as Start's. Teardown converges on TrayContext.Dispose, which
+        // runs during Application.Run's own unwind - outside the message loop's exception guard, so
+        // Application.ThreadException never sees it and Windows answers with a WER dialog.
+        Assert.Null(Record.Exception(monitor.Dispose));
+
+        // Absorbed per step, not around the sequence: the enumerator is still disposed even though the
+        // unregister threw. A single try around both would let one failure skip the other, which is the
+        // whole reason Teardown.Quietly exists.
+        Assert.Equal(new[] { "register", "unregister", "dispose" }, registrar.Operations);
     }
 
     // --- beyond the brief: the notification handler ------------------------------------------------
@@ -673,6 +841,34 @@ public sealed class EndpointMonitorTests : IDisposable
         Assert.True(monitor.SinkCaptureEndpointPresent);
     }
 
+    [Fact]
+    public void The_COM_client_carries_the_state_a_device_state_change_reports()
+    {
+        using EndpointMonitor monitor = Started(out _);
+        var client = new EndpointNotificationClient(monitor);
+
+        client.OnDeviceStateChanged("id-state", DeviceState.NotPresent);
+        client.OnDeviceAdded("id-added");
+
+        string[] logged = _log.Entries.Select(e => e.Message).ToArray();
+
+        // The datum Task 18 needs most, and the one the adapter used to drop on the floor. The probe
+        // measured the A2DP endpoint already existing and merely changing state, which makes
+        // OnDeviceStateChanged the likeliest carrier of its arrival - and a line reading
+        // "DeviceStateChanged id=..." without saying Active or NotPresent turns the smoke test's answer
+        // from conclusive into suggestive.
+        Assert.Contains(
+            logged,
+            m => m.Contains("id-state", StringComparison.Ordinal)
+                 && m.Contains(nameof(DeviceState.NotPresent), StringComparison.Ordinal));
+
+        // And the callbacks that carry no state say nothing about it rather than inventing a default.
+        Assert.DoesNotContain(
+            logged,
+            m => m.Contains("id-added", StringComparison.Ordinal)
+                 && m.Contains("state=", StringComparison.Ordinal));
+    }
+
     // --- helpers -----------------------------------------------------------------------------------
 
     /// <summary>A started monitor over a fake registrar, reporting no endpoint.</summary>
@@ -683,4 +879,64 @@ public sealed class EndpointMonitorTests : IDisposable
         monitor.Start();
         return monitor;
     }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> on <paramref name="threads"/> threads released as close to
+    /// simultaneously as the machine allows, then joined.
+    ///
+    /// The release is a busy spin on a counter rather than a <see cref="Barrier"/>, and that is not
+    /// premature cleverness - it was measured. With a barrier, none of the mutation runs below could
+    /// make the check-then-act guards fail: the wake-up skew coming out of a blocking wait is
+    /// microseconds and the window inside the guard is a couple of instructions, so the threads never
+    /// landed in it. Spinning cuts the skew to nanoseconds.
+    ///
+    /// No sleep, no timer, no poll of anything external: every thread is a dedicated
+    /// <see cref="Thread"/> that is guaranteed to reach the increment, and every one is joined before
+    /// the assertions run. Read the loop honestly all the same - see the note on
+    /// <see cref="Concurrent_Starts_register_exactly_one_client"/> about what a probabilistic test can
+    /// and cannot promise.
+    /// </summary>
+    private static void RunConcurrently(int threads, Action<int> body)
+    {
+        int ready = 0;
+        var running = new Thread[threads];
+        var failures = new Exception?[threads];
+
+        for (int i = 0; i < threads; i++)
+        {
+            int index = i;
+            running[i] = new Thread(() =>
+            {
+                Interlocked.Increment(ref ready);
+                while (Volatile.Read(ref ready) < threads)
+                {
+                }
+
+                // Captured rather than allowed to escape: an exception on one of these threads would
+                // otherwise take the whole test host down instead of failing this test.
+                try
+                {
+                    body(index);
+                }
+                catch (Exception ex)
+                {
+                    failures[index] = ex;
+                }
+            });
+        }
+
+        foreach (Thread thread in running)
+        {
+            thread.Start();
+        }
+
+        foreach (Thread thread in running)
+        {
+            thread.Join();
+        }
+
+        Assert.All(failures, failure => Assert.Null(failure));
+    }
+
+    private static void RunConcurrently(int threads, Action body) => RunConcurrently(threads, _ => body());
 }
