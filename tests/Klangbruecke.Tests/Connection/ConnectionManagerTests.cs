@@ -317,6 +317,76 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Discovering, h.Manager.State);
     }
 
+    /// <summary>
+    /// <b>A click must not cost the user the thing it was asking for.</b>
+    ///
+    /// <c>SelectPhone</c>'s repaint runs <c>Refresh</c>, which releases the click grant the moment
+    /// every enabled half looks satisfied - and on a same-phone re-pick that is true of both halves'
+    /// own beliefs, because neither <c>Configure</c> touches a half that is still on the same phone.
+    /// The half's belief can be stale: the hands-free role can go phone-side with nothing telling
+    /// this app, and only the reconcile's live <c>ReadRegistration</c> finds it.
+    ///
+    /// Released, the pass runs with <c>ConnectPermitted</c> false. The calls half discovers the lost
+    /// role, backs off, and <c>EnforceConnectPermission</c> then stands a backing-off half down -
+    /// unregistering, which is the one thing <see cref="CallsHalf"/> is built never to do
+    /// speculatively, and nothing re-arms it because <c>OnLinkPresentAsync</c> needs the permission
+    /// that has just gone. The PC drops out of the handset's call-audio picker as the direct result
+    /// of the user clicking their own phone.
+    /// </summary>
+    [Fact]
+    public void Re_picking_a_phone_does_not_release_the_role_the_click_asked_for()
+    {
+        using Harness h = new(phoneDeviceId: null, autoReconnect: false);
+        h.Manager.SelectPhone(PhoneId);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+        Assert.Single(h.Calls.ConnectCalls);
+
+        // Baseline-relative: the first selection is a phone *change*, and that release is the one
+        // OnPhoneDeselected is for.
+        int released = h.Calls.DisconnectCount;
+
+        h.Calls.Registration = RegistrationStatus.NotRegistered;
+
+        h.Manager.SelectPhone(PhoneId);
+
+        Assert.Equal(released, h.Calls.DisconnectCount);
+
+        h.Scheduler.Advance(Seconds(2));
+        Assert.Equal(2, h.Calls.ConnectCalls.Count);
+    }
+
+    /// <summary>
+    /// The same property with the link read <em>outstanding</em>, and it is the one that matters:
+    /// <b>this is the only shape the app itself ever takes.</b>
+    ///
+    /// <c>LinkMonitor.ReadLinkStatusAsync</c> awaits WinRT against a radio, so in the app the pass
+    /// suspends at its first line and everything after the <c>ReconcileAsync</c> call runs while the
+    /// halves are still exactly as the click found them. A fix that only moves the repaint below the
+    /// pass reads as though it had closed this, and closes only the inline case that no shipping
+    /// build produces - measured: with the move alone and the grant not put back, this test stays
+    /// red and its inline twin above goes green.
+    /// </summary>
+    [Fact]
+    public void Re_picking_a_phone_does_not_release_the_role_while_the_link_read_is_outstanding()
+    {
+        using Harness h = new(phoneDeviceId: null, autoReconnect: false);
+        h.Manager.SelectPhone(PhoneId);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        int released = h.Calls.DisconnectCount;
+
+        h.Calls.Registration = RegistrationStatus.NotRegistered;
+
+        h.Link.DeferRead = true;
+        h.Manager.SelectPhone(PhoneId);
+        h.Link.CompleteRead(BluetoothLinkStatus.Connected);
+
+        Assert.Equal(released, h.Calls.DisconnectCount);
+
+        h.Scheduler.Advance(Seconds(2));
+        Assert.Equal(2, h.Calls.ConnectCalls.Count);
+    }
+
     // --- the grace window ----------------------------------------------------------------------
 
     /// <summary>

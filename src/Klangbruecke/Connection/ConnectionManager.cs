@@ -373,17 +373,31 @@ public sealed class ConnectionManager : IDisposable
         _linkMachine.OnPhoneSelected();
         _linkMonitor.Watch(deviceId);
 
-        // The synchronous half of this click, repainted before anything is awaited. Handing off to
-        // the pass is not enough on its own: a pass that started under ReconcileStall ago returns
-        // without publishing, so reselecting the same phone while suppressed cleared the latch and
-        // repainted nothing. Refresh is idempotent and the pass publishes again at its end, so this
-        // costs one recompute and can announce nothing that is not already true.
-        Publish();
-
         // Through the reconcile rather than straight into a connect: the phone's presence is a
         // question only the radio can answer, the pass already asks it, and routing this through the
         // same five checks as everything else is what keeps one connect path in the class.
         _ = ReconcileAsync("phone selected", userAsked: true);
+
+        // The repaint this click owes the tray, because the pass above cannot be relied on for it: a
+        // pass that started under ReconcileStall ago returns at the defer check without publishing,
+        // so reselecting the same phone while suppressed cleared the latch and repainted nothing.
+        //
+        // <b>And it must not consume the click on the way past.</b> Refresh releases the grant when
+        // every enabled half looks satisfied, which on a same-phone re-pick is true of both halves'
+        // own beliefs before the pass has checked either of them. Released here, the pass runs with
+        // no permission, and a half that then fails - the hands-free role lost phone-side is the
+        // measured case - is stood down by EnforceConnectPermission instead of retried. That
+        // releases the role the user just asked for and nothing re-arms it, because
+        // OnLinkPresentAsync needs the permission that is now gone.
+        //
+        // So the grant is put back. Moving this call below the pass is not enough on its own and
+        // reads as though it were: in the app the link read is a real round trip that suspends, so
+        // this line runs while the pass is parked and the halves are still exactly as the click
+        // found them. Pinned from both sides - one test with the read answering inline and one with
+        // it outstanding, which is the only shape the app itself ever takes.
+        ClickGrant granted = _clickGrant;
+        Publish();
+        _clickGrant = granted;
     }
 
     public void DeselectPhone()
@@ -488,6 +502,10 @@ public sealed class ConnectionManager : IDisposable
             // The latch clearing is a reported change in its own right, and the pass below cannot be
             // relied on to say so: one that started under ReconcileStall ago returns without
             // publishing. See SelectPhone, which had the same hole for the same reason.
+            //
+            // No grant to protect here, unlike SelectPhone's: the setting this method has just turned
+            // on is itself what ConnectPermitted reads, so a release by this Publish cannot take the
+            // permission away from the pass below.
             Publish();
 
             // Straight into a pass rather than waiting for the next tick. The user has just said
