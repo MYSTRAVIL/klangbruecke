@@ -1,3 +1,4 @@
+using Klangbruecke.Bluetooth;
 using Klangbruecke.Connection;
 using Klangbruecke.Tests.Fakes;
 using Xunit;
@@ -556,6 +557,58 @@ public sealed class MusicHalfTests
     }
 
     /// <summary>
+    /// A preference is not a teardown. The output the route is already using is the one the user is
+    /// listening on, and restarting a working route to honour a dropdown they just changed would cut
+    /// the music off mid-song to move it to a device they may only have been browsing.
+    /// </summary>
+    [Fact]
+    public async Task Changing_the_output_device_does_not_interrupt_a_running_route()
+    {
+        Harness half = new();
+        await half.ReachUpAsync();
+
+        half.Half.Configure(enabled: true, PhoneId, outputDeviceId: "output-2");
+
+        Assert.Equal(MusicState.Up, half.Half.State);
+        Assert.Equal(0, half.Router.StopCount);
+        Assert.Single(half.Router.StartCalls);
+        Assert.Equal(0, half.Sink.DisconnectCount);
+
+        // It is not ignored either - the next route to start is the one that moves.
+        half.SetEndpoint(false);
+        half.SetEndpoint(true);
+
+        Assert.Equal(new string?[] { OutputId, "output-2" }, half.Router.StartCalls);
+    }
+
+    /// <summary>
+    /// The route gate belongs to the episode that armed it, and a teardown ends that episode. Left
+    /// standing, it meets the next connection and refuses to start audio over it for up to a minute
+    /// - with the endpoint sitting right there, and nothing armed to look again, because the
+    /// teardown disposed the wake-up that would have. That is finding #2's symptom rebuilt out of
+    /// two individually correct parts, on the reconnect path this project has already been bitten by.
+    /// </summary>
+    [Fact]
+    public async Task Reconnecting_after_a_teardown_does_not_inherit_the_route_gate()
+    {
+        Harness half = new();
+        half.Router.StartResult = false;
+        await half.ReachLinkedAsync();
+
+        half.SetEndpoint(true);
+        Assert.Equal(MusicState.Linked, half.Half.State);
+        Assert.Single(half.Router.StartCalls);
+
+        // The phone leaves the room inside the route backoff window, and comes straight back.
+        half.Half.OnLinkAbsent();
+        half.Router.StartResult = true;
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.Equal(MusicState.Up, half.Half.State);
+        Assert.Equal(2, half.Router.StartCalls.Count);
+    }
+
+    /// <summary>
     /// No <c>Disconnect</c> and no <c>Off</c>. The manager owns the 3 s grace window that decides
     /// whether a closed connection was the phone leaving the room or the audio profile being
     /// dropped, and reporting the half down before that answer arrives is a tray icon that flaps on
@@ -567,12 +620,31 @@ public sealed class MusicHalfTests
         Harness half = new();
         await half.ReachUpAsync();
 
-        half.Half.OnConnectionClosed();
+        half.Sink.PublishState(AudioSinkConnectionState.Closed);
 
         Assert.Equal(MusicState.Linked, half.Half.State);
         Assert.Equal(1, half.Router.StopCount);
         Assert.Equal(0, half.Sink.DisconnectCount);
         Assert.Equal(0, half.Scheduler.PendingCount);
+    }
+
+    /// <summary>
+    /// A connection that closes with the half already down is not news. The state translation is
+    /// level-triggered and the manager marshals it, so a queued Closed can arrive after a teardown
+    /// has already run - and stopping a route nobody started would put a line in the log describing
+    /// an event that did not happen.
+    /// </summary>
+    [Fact]
+    public void Connection_closed_while_Off_stops_nothing()
+    {
+        Harness half = new();
+
+        half.Sink.PublishState(AudioSinkConnectionState.Closed);
+
+        Assert.Equal(MusicState.Off, half.Half.State);
+        Assert.Equal(0, half.Router.StopCount);
+        Assert.Equal(0, half.Sink.DisconnectCount);
+        Assert.Equal(0, half.ChangedCount);
     }
 
     [Fact]
@@ -616,6 +688,61 @@ public sealed class MusicHalfTests
         half.Sink.CompleteConnect(false);
         await second;
         Assert.Equal(MusicState.Backoff, half.Half.State);
+    }
+
+    /// <summary>
+    /// <c>Changed</c> fires on the calling thread, so a handler may call straight back in - the
+    /// tray's Disconnect item is one keystroke from doing exactly that. This is the announcement of
+    /// <c>Backoff</c> being answered with a teardown, and the retry timer must be cancellable by the
+    /// time it is announced: armed afterwards, it would survive the cancellation and fire a connect
+    /// into a half the user had just switched off.
+    /// </summary>
+    [Fact]
+    public async Task A_teardown_from_a_Changed_handler_does_not_leave_a_connect_retry_armed()
+    {
+        Harness half = new();
+        half.Sink.ConnectResult = false;
+        half.Half.Changed += (_, _) =>
+        {
+            if (half.Half.State == MusicState.Backoff)
+            {
+                half.Half.OnSuppressed();
+            }
+        };
+
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.Equal(MusicState.Off, half.Half.State);
+        Assert.Equal(0, half.Scheduler.PendingCount);
+
+        half.Scheduler.Advance(Seconds(2));
+
+        Assert.Equal(MusicState.Off, half.Half.State);
+        Assert.Single(half.Sink.ConnectCalls);
+    }
+
+    /// <summary>
+    /// The same re-entrancy against the stale-answer guard. The generation has to be captured before
+    /// the connect announces itself, or the teardown's own bump lands first and the guard compares
+    /// two values the teardown wrote - agreeing, and letting the connect report <c>Linked</c> over a
+    /// sink that was disconnected while it was in flight.
+    /// </summary>
+    [Fact]
+    public async Task A_teardown_from_a_Changed_handler_discards_the_connect_it_interrupted()
+    {
+        Harness half = new();
+        half.Half.Changed += (_, _) =>
+        {
+            if (half.Half.State == MusicState.Connecting)
+            {
+                half.Half.OnSuppressed();
+            }
+        };
+
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.Equal(MusicState.Off, half.Half.State);
+        Assert.Equal(1, half.Sink.DisconnectCount);
     }
 
     // --- Reconcile ---------------------------------------------------------------------------
@@ -761,6 +888,26 @@ public sealed class MusicHalfTests
     }
 
     /// <summary>
+    /// A retry can come due with nothing there to fire it - timers do not run while the machine is
+    /// suspended - and the half is then found in <c>Backoff</c> past its own deadline. The fake
+    /// reproduces that exactly: work scheduled from inside a callback sits out the rest of the
+    /// <c>Advance</c> that is running, so the clock ends the window well beyond the retry's due time.
+    /// "Minus four seconds" is not a countdown, and the tray would have to invent a reading for it.
+    /// </summary>
+    [Fact]
+    public async Task NextRetryIn_never_reports_a_negative_wait()
+    {
+        Harness half = new();
+        half.Sink.ConnectResult = false;
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        half.Scheduler.Advance(Seconds(10));
+
+        Assert.Equal(MusicState.Backoff, half.Half.State);
+        Assert.Equal(TimeSpan.Zero, half.Half.NextRetryIn);
+    }
+
+    /// <summary>
     /// The route backoff is deliberately not reported. A route counting down happens in
     /// <c>Linked</c>, which the projection reports as <c>Connected</c> - "waiting for phone audio" -
     /// so the number would have no reader, and the one place the tray does print it
@@ -844,7 +991,15 @@ public sealed class MusicHalfTests
         {
             Half = new MusicHalf(Sink, Router, Endpoints, Scheduler);
             Half.Changed += (_, _) => ChangedCount++;
+
             Router.Stopped += (_, _) => Half.OnRouteStopped();
+            Sink.StateChanged += (_, state) =>
+            {
+                if (state == AudioSinkConnectionState.Closed)
+                {
+                    Half.OnConnectionClosed();
+                }
+            };
 
             Half.Configure(enabled, phoneDeviceId, outputDeviceId);
         }

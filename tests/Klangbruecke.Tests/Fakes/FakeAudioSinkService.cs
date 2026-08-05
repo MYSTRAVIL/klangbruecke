@@ -55,13 +55,19 @@ public sealed class FakeAudioSinkService : IAudioSinkService
     /// <summary>Connects asked for and not yet answered.</summary>
     public int PendingConnects => _pending.Count;
 
-    // Nothing above this seam subscribes to either: MusicHalf is driven entirely by method calls,
-    // and ConnectionManager is what turns a Closed state into OnConnectionClosed. Declared with
-    // discarding accessors rather than as fields, so the fake does not carry a subscriber list that
-    // nothing can ever invoke.
+    /// <summary>
+    /// Text for the tray and the log. Discarding accessors: this one carries no decision, and a
+    /// subscriber list nothing invokes is a fake promising a channel it does not have.
+    /// </summary>
     public event EventHandler<StatusMessage>? Status { add { } remove { } }
 
-    public event EventHandler<AudioSinkConnectionState>? StateChanged { add { } remove { } }
+    /// <summary>
+    /// Real, and raised by <see cref="PublishState"/>. <c>MusicHalf</c> subscribes to nothing itself,
+    /// but this is the event <c>ConnectionManager</c> turns into <c>OnConnectionClosed</c> - the
+    /// input behind the grace window - so a double that could not raise it would leave the one
+    /// transition the manager owns undrivable.
+    /// </summary>
+    public event EventHandler<AudioSinkConnectionState>? StateChanged;
 
     public Task<IReadOnlyList<PhoneDevice>> FindDevicesAsync() => Task.FromResult(Devices);
 
@@ -90,6 +96,14 @@ public sealed class FakeAudioSinkService : IAudioSinkService
         Pending pending = _pending.Dequeue();
         pending.Source.SetResult(Settle(pending.DeviceId, connected));
     }
+
+    /// <summary>
+    /// The connection object reporting a state, on its own. Does not touch
+    /// <see cref="IsConnected"/>: the real service publishes what WinRT told it, and a double that
+    /// tidied the two into agreement would hide the interval in which they disagree.
+    /// </summary>
+    public void PublishState(AudioSinkConnectionState state)
+        => StateChanged?.Invoke(this, state);
 
     public void Disconnect()
     {

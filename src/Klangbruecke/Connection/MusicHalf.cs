@@ -77,11 +77,20 @@ public sealed class MusicHalf
     private DateTimeOffset _routeRunningSince;
 
     /// <summary>
-    /// Bumped by every teardown and by every connect. A connect compares it after its await and
-    /// discards its own answer if it no longer matches: the connection it is describing is one that
-    /// nothing is holding any more, and reporting it would resurrect a half the user just
-    /// disconnected - or claim <see cref="MusicState.Linked"/> while a newer attempt is still in
-    /// flight.
+    /// Bumped by every teardown, and read - never written - by every connect.
+    ///
+    /// A connect captures it before it announces itself and compares it after its await, discarding
+    /// its own answer if it no longer matches: the connection that answer describes is one nothing
+    /// is holding any more, and reporting it would resurrect a half the user just disconnected - or
+    /// claim <see cref="MusicState.Linked"/> while a newer attempt is still in flight. The second
+    /// case needs no separate bump, because a second connect can only start from
+    /// <see cref="MusicState.Off"/> or <see cref="MusicState.Backoff"/>, and the only route to
+    /// either while a connect is in flight goes through <see cref="TearDown"/>.
+    ///
+    /// Captured <em>before</em> <see cref="SetState"/> announces <see cref="MusicState.Connecting"/>,
+    /// not after. A <see cref="Changed"/> handler that tears the half down re-entrantly bumps this,
+    /// and a capture taken afterwards would match the teardown's own value - the guard would pass
+    /// and the connect would land in <c>Linked</c> over a sink that had just been disconnected.
     /// </summary>
     private int _generation;
 
@@ -116,9 +125,25 @@ public sealed class MusicHalf
     /// which the projection reports as <c>Connected</c> - "waiting for phone audio" - so the number
     /// would have no reader; the one place the tray prints it is the <c>RetryBackoff</c> state, and
     /// that is reached only from <see cref="MusicState.Backoff"/>.
+    ///
+    /// Never negative. Timers do not run while the machine is suspended, so a retry can come due
+    /// while nothing is there to fire it and the half can be found in <c>Backoff</c> minutes past
+    /// its own deadline. "Overdue" is not something a countdown can say, and the tray would have to
+    /// invent a reading for it.
     /// </summary>
-    public TimeSpan? NextRetryIn =>
-        State == MusicState.Backoff && _connectRetryDueAt is { } due ? due - _scheduler.Now : null;
+    public TimeSpan? NextRetryIn
+    {
+        get
+        {
+            if (State != MusicState.Backoff || _connectRetryDueAt is not { } due)
+            {
+                return null;
+            }
+
+            TimeSpan remaining = due - _scheduler.Now;
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+        }
+    }
 
     /// <summary>
     /// The user's settings, as far as this half is concerned. Also the "phone deselected" input:
@@ -288,10 +313,14 @@ public sealed class MusicHalf
     {
         string deviceId = _phoneDeviceId!;
 
+        // Both captured before the state moves. SetState raises Changed, a handler is free to call
+        // straight back in, and everything this method needs from the half must therefore already be
+        // in hand - see the note on _generation for what a capture taken afterwards would let past.
+        int generation = _generation;
+
         CancelConnectRetry();
         SetState(MusicState.Connecting);
 
-        int generation = _generation;
         bool connected;
 
         try
@@ -341,23 +370,34 @@ public sealed class MusicHalf
         _connectBackoff.Advance();
 
         _connectRetryDueAt = _scheduler.Now + delay;
+
+        // These two lines, in this order, and the order is the whole of it. SetState raises Changed;
+        // a handler that tears the half down runs CancelConnectRetry, and with the handle not yet
+        // assigned that cancellation finds nothing - leaving the arming line to hand a live timer to
+        // a half that is already Off. It would fire a connect at a phone the user just disconnected,
+        // or at a null device id if the teardown came from a deselect.
+        _connectRetry = _scheduler.Schedule(delay, OnConnectRetryDue);
         SetState(MusicState.Backoff);
+    }
 
-        _connectRetry = _scheduler.Schedule(delay, () =>
-        {
-            _connectRetry = null;
-            _connectRetryDueAt = null;
+    /// <summary>
+    /// The connect backoff came due.
+    ///
+    /// Unguarded on purpose: reaching here means the half is still in <see cref="MusicState.Backoff"/>
+    /// with a phone picked, because Backoff is left only through <see cref="ConnectAsync"/> and
+    /// <see cref="TearDown"/> and both cancel this entry before they move. A "still in Backoff?"
+    /// check would be a condition no input can make false.
+    ///
+    /// Fire and forget, because <see cref="IScheduler"/> hands out an <see cref="Action"/> and the
+    /// connect is genuinely asynchronous. Safe only because <see cref="ConnectAsync"/> catches
+    /// everything it awaits: there is no path out of it that faults a task nobody is holding.
+    /// </summary>
+    private void OnConnectRetryDue()
+    {
+        _connectRetry = null;
+        _connectRetryDueAt = null;
 
-            // Unguarded on purpose. Reaching here means the half is still in Backoff with a phone
-            // picked: Backoff is left only through ConnectAsync and TearDown, and both cancel this
-            // entry before they move. A "still in Backoff?" check would be a condition no input can
-            // make false.
-            //
-            // Fire and forget, because IScheduler hands out an Action and the connect is genuinely
-            // asynchronous. Safe only because ConnectAsync catches everything it awaits: there is no
-            // path out of it that faults a task nobody is holding.
-            _ = ConnectAsync();
-        });
+        _ = ConnectAsync();
     }
 
     /// <summary>
@@ -448,9 +488,14 @@ public sealed class MusicHalf
     /// <summary>
     /// Everything off, back to <see cref="MusicState.Off"/>. The one exit that disconnects the sink.
     ///
-    /// Neither backoff is reset. The phone leaving the room is not evidence that connecting to it
-    /// will work next time, and this runs on every range exit - a schedule that reset here would
-    /// never get past its first step for a phone that flaps.
+    /// Every pending <em>wait</em> ends here; neither <em>schedule</em> is reset. The distinction is
+    /// the point. How many times connecting has failed is worth remembering - the phone leaving the
+    /// room is not evidence that the next attempt will work, and this runs on every range exit, so a
+    /// schedule that reset here would never get past its first step for a phone that flaps. But a
+    /// countdown belongs to the episode that started it, and that episode is over: a route gate left
+    /// standing would meet the next connection and refuse to start audio over it for up to a minute,
+    /// with the endpoint sitting right there and nothing armed to look again until the 30 s
+    /// reconcile - finding #2's symptom, rebuilt out of parts that are each individually correct.
     /// </summary>
     private void TearDown()
     {
@@ -460,6 +505,7 @@ public sealed class MusicHalf
 
         CancelConnectRetry();
         CancelRouteRetry();
+        _routeNotBefore = null;
 
         if (State != MusicState.Off)
         {
@@ -489,8 +535,15 @@ public sealed class MusicHalf
 
     /// <summary>
     /// The single place the state moves and the single place <see cref="Changed"/> is raised, so a
-    /// subscriber that redraws the tray cannot be woken by a transition that did not happen. The
-    /// event goes last: by the time it fires, everything the handler can read has settled.
+    /// subscriber that redraws the tray cannot be woken by a transition that did not happen.
+    ///
+    /// The event goes last within each transition, and "last" has to mean more than it sounds like.
+    /// A handler does not only read: <see cref="Changed"/> fires on the calling thread, so a handler
+    /// is free to call straight back into this half - the tray's Disconnect item is one keystroke
+    /// from doing exactly that. So a caller of this method must finish its bookkeeping <em>before</em>
+    /// the call, not after: anything it captures must be captured, and any timer it arms must be
+    /// armed and reachable for cancellation. Two callers get that wrong by one line if they are
+    /// rearranged - see <see cref="ConnectAsync"/> and <see cref="ScheduleConnectRetry"/>.
     /// </summary>
     private void SetState(MusicState next)
     {
