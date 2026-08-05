@@ -48,9 +48,15 @@ public sealed class LinkMachine
     private const int NonConnectedPollsBeforeAbsent = 2;
 
     /// <summary>
-    /// Length of the current run of non-Connected polls, counted only while
-    /// <see cref="LinkState.Present"/> - the one transition the debounce guards. Cleared by every
-    /// arrival in Present, so the run has to be consecutive.
+    /// Length of the current run of non-Connected polls. Only consulted while
+    /// <see cref="LinkState.Present"/> - the one transition the debounce guards - and cleared by
+    /// every arrival in Present, which is what makes the run consecutive rather than cumulative.
+    ///
+    /// It does keep counting while Absent, which is deliberate and unobservable: reaching the
+    /// threshold there calls <c>MoveTo(Absent)</c> from Absent, which moves nothing and reports no
+    /// change, and the count is erased on the next entry to Present regardless. An explicit
+    /// "only count while Present" guard was written and then deleted in review - it was dead code,
+    /// and dead code cannot be given an assertion.
     /// </summary>
     private int _nonConnectedPolls;
 
@@ -70,6 +76,12 @@ public sealed class LinkMachine
     /// The watcher saw the phone. Ignored with no phone selected: a <c>DeviceWatcher</c> can still
     /// deliver a queued event after it has been stopped, and a stale edge must not resurrect a phone
     /// the user just cleared.
+    ///
+    /// Note that this clears the poll debounce even when already Present, where it reports no change.
+    /// That is correct today because <c>LinkMonitor</c>'s selector is presence-scoped, so an Added
+    /// edge means the radio currently sees the phone. It is worth knowing that a watcher which
+    /// re-delivered Added more often than once per <see cref="NonConnectedPollsBeforeAbsent"/> polls
+    /// would hold Present against a real range exit, because the poll could never finish a run.
     /// </summary>
     public bool OnDeviceAppeared() => State != LinkState.NoPhone && MoveTo(LinkState.Present);
 
@@ -99,14 +111,6 @@ public sealed class LinkMachine
         if (status == BluetoothLinkStatus.Connected)
         {
             return MoveTo(LinkState.Present);
-        }
-
-        if (State != LinkState.Present)
-        {
-            // Already Absent: there is nothing to debounce, and nothing to bank either. Counting
-            // here would let a phone switched off for an hour spend the next Present's whole
-            // allowance before the first poll of that visit arrives.
-            return false;
         }
 
         _nonConnectedPolls++;

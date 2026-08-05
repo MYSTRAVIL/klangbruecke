@@ -152,7 +152,7 @@ public sealed class LinkMachineTests
     {
         LinkMachine machine = InState(LinkState.Present);
 
-        machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected);
+        Assert.False(machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected));
         bool changed = machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected);
 
         Assert.True(changed);
@@ -175,7 +175,7 @@ public sealed class LinkMachineTests
     {
         LinkMachine present = InState(LinkState.Present);
 
-        present.OnLinkStatusRead(BluetoothLinkStatus.Unknown);
+        Assert.False(present.OnLinkStatusRead(BluetoothLinkStatus.Unknown));
         bool changed = present.OnLinkStatusRead(BluetoothLinkStatus.Unknown);
 
         Assert.True(changed);
@@ -307,7 +307,11 @@ public sealed class LinkMachineTests
     }
 
     // Absent is where a phone that is switched off sits for hours, so the poll says "not connected"
-    // there indefinitely. That must stay inert - and must not bank anything for later either.
+    // there indefinitely. That must stay inert, and none of it may reach the *next* visit.
+    //
+    // The counter does keep ticking while Absent - an "only count while Present" guard was written
+    // and deleted in review as dead code. What makes that unobservable is the reset on entering
+    // Present, which this test is the Absent-side proof of: it fails if that reset is removed.
     [Fact]
     public void Polls_while_Absent_do_not_accumulate_toward_anything()
     {
@@ -337,6 +341,15 @@ public sealed class LinkMachineTests
         bool changed = machine.OnLinkStatusRead(status);
 
         Assert.False(changed);
+        Assert.Equal(LinkState.NoPhone, machine.State);
+
+        // Read twice since Task 19. One read can no longer distinguish a working NoPhone guard from
+        // a missing one: without the guard, a single non-Connected read only reaches 1 on the
+        // debounce counter, which is below the threshold, so it returns false and looks correct. It
+        // is the *second* consecutive read that would trip the threshold and drag a machine with no
+        // phone selected into Absent - reporting "discovering" with nothing to discover. The
+        // debounce must not be able to accumulate its way past the guard.
+        Assert.False(machine.OnLinkStatusRead(status));
         Assert.Equal(LinkState.NoPhone, machine.State);
     }
 
@@ -436,7 +449,7 @@ public sealed class LinkMachineTests
     {
         LinkMachine machine = InState(LinkState.Present);
 
-        machine.OnLinkStatusRead((BluetoothLinkStatus)99);
+        Assert.False(machine.OnLinkStatusRead((BluetoothLinkStatus)99));
         bool changed = machine.OnLinkStatusRead((BluetoothLinkStatus)99);
 
         Assert.True(changed);
