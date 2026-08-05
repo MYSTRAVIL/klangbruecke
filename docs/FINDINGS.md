@@ -140,8 +140,27 @@ It lied twice in one session. Verify against the OS instead:
 Get-PnpDevice -Class AudioEndpoint | Where-Object { $_.FriendlyName -match 'SNK|A2DP' }
 ```
 
-If that endpoint is absent, **nothing** is holding an `AudioPlaybackConnection` open, and the phone
-physically cannot offer the PC as an audio output. That is not a bug — it is the expected state.
+**Endpoint presence is *sufficient* evidence of a live connection, never *necessary*.** This section
+used to say that if the endpoint is absent then **nothing** is holding an `AudioPlaybackConnection`
+open. That is too strong, and it was wrong in five of eight recorded runs: the connection reported
+`Opened` and the endpoint did not appear until an unbounded interval later. Absence proves nothing
+at all about the connection — use the endpoint to verify a *route*, never to infer a
+*disconnection*. `AudioSinkService.IsConnected` answers only for the WinRT connection object for
+exactly this reason, and `IAudioEndpointMonitor` owns the endpoint half separately.
+
+Presence is the stronger direction but it is not proof either, measured once on 2026-08-05: with the
+phone disconnected — `IsConnected` False on both its `BTHENUM` and `BTHLE` nodes, its two
+`Hands-Free HF Audio` endpoints gone (`Present=False`), and three consecutive
+`AudioPlaybackConnection` opens returning `UnknownFailure` — `Line (MYSTRAPIX9 A2DP SNK)` still
+enumerated `Present=True, Status=OK` with MMDevice `DeviceState=1` (Active). One observation, cause
+not isolated; the likeliest reading is an endpoint leaked by a process that exited while holding the
+capture. So when the answer matters, check the radio too:
+
+```powershell
+Get-PnpDevice -Class Bluetooth | Where-Object { $_.FriendlyName -eq '<phone>' } | ForEach-Object {
+  Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName '{83DA6326-97A6-4088-9453-A1923F573B29} 15'
+}
+```
 
 ## 5. Things deliberately NOT done, and why
 
