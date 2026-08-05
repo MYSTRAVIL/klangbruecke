@@ -626,9 +626,25 @@ The full Stage 2 matrix is unchanged and stays in the previous design document.
 1. **`IMMNotificationClient` threading and lifetime.** Callbacks arrive on a COM/MTA thread and the
    `MMDeviceEnumerator` must stay alive for the registration to hold. Not identity-gated, so this is
    cheap to probe with `dotnet run` before committing to it — do that first.
-2. **`BluetoothDevice.FromBluetoothAddressAsync` unpackaged is unverified.** `FINDINGS.md` §2
-   verified discovery unpackaged for the A2DP and phone-line selectors, not this call.
-   `BluetoothDeviceId.TryExtractAddress` returns a 12-char hex string; the API wants a `ulong`.
+2. ~~**`BluetoothDevice.FromBluetoothAddressAsync` unpackaged is unverified.**~~ **RESOLVED during
+   Task 11, on hardware.** A `dotnet run` harness reporting `IsPackaged = False` read the paired,
+   connected phone `MYSTRAPIX9` (`C01C6A90E174`) as `Connected`, a paired-but-powered-off Pro
+   Controller as `Disconnected`, and an Xbox controller as `Disconnected` — no throw, no access
+   violation, no process death. The `DeviceWatcher` half works unpackaged too: `Added` arrived for
+   the phone's real device id. No fallback is needed and the deliberate-disconnect-versus-range-exit
+   distinction stands as designed.
+
+   Two things the probe turned up that the design did not anticipate:
+
+   - **An address this machine has never paired with returns a live object reporting
+     `Disconnected`, not null.** So a stale or wrong device id reads as "out of range" forever
+     rather than as a failed read. No consequence today, but it means a misconfigured phone id is
+     indistinguishable from a phone that is simply absent.
+   - **A `DeviceWatcher` does not need an `Updated` handler before `Start`.** That claim is widely
+     repeated and is false on this selector, measured both ways. The empty handler was removed.
+
+   `BluetoothDeviceId.TryExtractAddress` returns a 12-char hex string and the API wants a `ulong`;
+   parse with `NumberStyles.HexNumber` and `CultureInfo.InvariantCulture`.
 3. **Music-half validation still costs a full MSIX cycle.** `TryCreateFromId` kills an unpackaged
    process (`FINDINGS.md` §8) and `AudioSinkPolicy` gates it in two places — neither gate is removed.
 4. **Finding #3 is confirmed only for the first 30 s of a call.** What happens at call *end* is the
