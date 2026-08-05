@@ -423,6 +423,77 @@ public sealed class ConnectionManagerTests : IDisposable
     }
 
     /// <summary>
+    /// A window's question is about the phone that was selected when it opened. Picking a phone -
+    /// even the same one - is the most explicit "connect to this" the app has, and a window that
+    /// opened a moment earlier must not come back three seconds later and suppress it.
+    /// </summary>
+    [Fact]
+    public void Picking_a_phone_voids_a_grace_window_that_is_already_open()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Seconds(1));
+
+        h.Manager.SelectPhone(PhoneId);
+
+        // The window would have fired here, read a link that is still up, and called it deliberate.
+        h.Scheduler.Advance(Seconds(2));
+
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    /// <summary>
+    /// Voiding it means cancelling the wait, not only disowning the answer. A window whose handle is
+    /// left armed goes on blocking the next one - <c>OnConnectionClosed</c> declines to arm while one
+    /// is armed - so the next real disconnect would get no decision at all until the reconcile
+    /// noticed, which is the drift the grace window exists to answer promptly.
+    /// </summary>
+    [Fact]
+    public void A_disconnect_after_picking_a_phone_still_gets_its_own_window()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Seconds(1));
+
+        h.Manager.SelectPhone(PhoneId);
+
+        // A second disconnect, while the first window's original deadline has still not arrived.
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+    }
+
+    /// <summary>
+    /// And a window that has already asked - fired, and waiting on the radio - is past the reach of
+    /// any timer. Only the generation can stop that one coming back and suppressing the selection the
+    /// user made while it was waiting.
+    /// </summary>
+    [Fact]
+    public void Picking_a_phone_voids_a_grace_window_that_has_already_asked()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        h.Link.DeferRead = true;
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+        Assert.Equal(1, h.Link.ReadCount);
+
+        h.Link.DeferRead = false;
+        h.Manager.SelectPhone(PhoneId);
+
+        // The window's read answers at last, with a link that is up - which it would call deliberate.
+        h.Link.CompleteRead(BluetoothLinkStatus.Connected);
+
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    /// <summary>
     /// The single most important transition in the app: a call takes the capture endpoint away while
     /// the A2DP connection stays open, and reconnecting there is the predecessor app's defining bug -
     /// the phone had to be re-picked from the tray after every call.
@@ -1034,6 +1105,38 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
     }
 
+    /// <summary>
+    /// And it takes back only what it granted. A user who picks a phone and then decides they only
+    /// want music has made two decisions, and the second does not revoke the first - but a single
+    /// bool cannot tell one grant from the other, so revoking on the calls switch would stand the
+    /// music half down mid-retry and latch <c>AutoReconnectOff</c> against a connect the user
+    /// explicitly asked for.
+    /// </summary>
+    [Fact]
+    public void Turning_calls_off_does_not_revoke_what_the_phone_selection_granted()
+    {
+        using Harness h = new(phoneDeviceId: null, autoReconnect: false);
+        h.Sink.ConnectResult = false;
+
+        h.Manager.SelectPhone(PhoneId);
+        Assert.Single(h.Sink.ConnectCalls);
+
+        // Flipped off, on, and off again, because the switch must add its own ask to the phone's
+        // rather than replace it - and only a round trip through "on" can tell those two apart.
+        h.Manager.SetCallsEnabled(false);
+        h.Manager.SetCallsEnabled(true);
+        h.Manager.SetCallsEnabled(false);
+
+        Assert.NotEqual(ConnectionState.Suppressed, h.Manager.State);
+
+        // The music half's own retry, still permitted, still counting down.
+        h.Sink.ConnectResult = true;
+        h.Scheduler.Advance(Seconds(2));
+
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
     // --- what the tray is told -----------------------------------------------------------------
 
     /// <summary>
@@ -1411,6 +1514,66 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Sink.CompleteConnect(true);
 
         Assert.Equal(reported, h.States.Count);
+
+        // And it stops before the second half, not after it. The double goes on answering once
+        // disposed - as the real transport does, which has no disposed guard on its enumerate or its
+        // connect - so a turn that carried on here would claim the hands-free role on a service that
+        // has been let go of, and leave this PC advertised in the phone's own picker after the
+        // process is gone. A failed attempt would be no better: it arms a retry on a manager whose
+        // seams are all disposed.
+        Assert.Empty(h.Calls.ConnectCalls);
+        Assert.Equal(0, h.Scheduler.PendingCount);
+    }
+
+    /// <summary>
+    /// The same shutdown race on the other turn that awaits. The calls switch has one await and no
+    /// guard between it and the tail, so the tail's own disposal check is the only thing standing
+    /// between a registration that answers late and a tray that has already gone.
+    /// </summary>
+    [Fact]
+    public void A_calls_registration_that_answered_after_Dispose_announces_nothing()
+    {
+        Harness h = new(enableCalls: false);
+        h.Link.RaiseAppeared();
+
+        h.Calls.DeferConnect = true;
+        h.Manager.SetCallsEnabled(true);
+        Assert.Equal(new[] { TransportId }, h.Calls.ConnectCalls);
+
+        h.Manager.Dispose();
+        int reported = h.States.Count;
+
+        h.Calls.CompleteConnect(CallTransportResult.Claimed(true));
+
+        Assert.Equal(reported, h.States.Count);
+        Assert.Equal(0, h.Scheduler.PendingCount);
+    }
+
+    /// <summary>
+    /// The tray's Disconnect is one keystroke away during a connect, and a connect is a real
+    /// <c>OpenAsync</c> round trip to a radio. Permission read once before both halves is permission
+    /// from before the user said no - and the calls half would then claim the hands-free role seconds
+    /// after they disconnected, putting this PC back in the phone's picker.
+    ///
+    /// Nothing downstream repairs it: <c>EnforceConnectPermission</c> stands down precisely when the
+    /// latch is <em>not</em> set, so the one state that would need repairing is the one it skips.
+    /// </summary>
+    [Fact]
+    public void A_disconnect_during_a_connect_stops_the_other_half_registering()
+    {
+        using Harness h = new();
+        h.Sink.DeferConnect = true;
+
+        h.Link.RaiseAppeared();
+        Assert.Equal(1, h.Sink.PendingConnects);
+        Assert.Empty(h.Calls.ConnectCalls);
+
+        h.Manager.RequestDisconnect();
+
+        h.Sink.CompleteConnect(true);
+
+        Assert.Empty(h.Calls.ConnectCalls);
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
     }
 
     /// <summary>
@@ -1551,6 +1714,20 @@ public sealed class ConnectionManagerTests : IDisposable
         ///
         /// Everything the manager does with the answer still runs on this thread, in
         /// <see cref="MarshallingUiDispatcher.Drain"/>.
+        ///
+        /// <b>One trap, latent today, that will bite whoever removes the condition keeping it
+        /// latent.</b> The manager's probe gate shuts synchronously and reopens only when the answer
+        /// is applied - which under this dispatcher means only when a test drains. A reconcile tick
+        /// taken while the music half is <c>Linked</c> or <c>Up</c> kicks a probe of its own and
+        /// leaves that answer undrained, so the gate stays shut. Call this method after such a tick
+        /// and the raise lands on a shut gate: no read happens, and the first wait below burns the
+        /// whole budget before failing. Worse, there is a narrow interleaving in which the leftover
+        /// probe's read lands between <c>readsBefore</c> being captured and the level being set,
+        /// which satisfies the wait with the value from before the change and silently drops the
+        /// notification - a one-in-many failure no budget size can fix.
+        ///
+        /// No current test does it: none of the call sites is preceded in its own test by a
+        /// reconcile that could have kicked a probe. If you need one that is, drain first.
         /// </summary>
         public void SetEndpointPresent(bool present)
         {

@@ -135,6 +135,12 @@ public sealed class ConnectionManager : IDisposable
     /// setting. Released the moment every enabled half is up, in <see cref="Publish"/>, because from
     /// there on the setting is what the user meant.
     ///
+    /// <b>Flags rather than a bool, because a grant has to be withdrawable by whoever gave it.</b>
+    /// The calls switch going off takes back what the calls switch granted - and a bool made that
+    /// take back a phone selection's grant too, so a user who picked a phone and then decided they
+    /// only wanted music had the music half's own click-initiated attempt stood down and latched
+    /// against them.
+    ///
     /// <b>It is released by success, not by time, and that is the one shape of "auto-reconnect off
     /// still reconnects".</b> A click whose halves never come up keeps its permission and goes on
     /// retrying on the backoff - one attempt a minute at the ceiling - until the user disconnects,
@@ -142,7 +148,20 @@ public sealed class ConnectionManager : IDisposable
     /// defensible half of the trade: the failure mode is an app that keeps trying to do what it was
     /// asked, and the alternative failure mode is the predecessor's.
     /// </summary>
-    private bool _clickGrant;
+    private ClickGrant _clickGrant;
+
+    /// <summary>Which explicit user action is still owed something. See <see cref="_clickGrant"/>.</summary>
+    [Flags]
+    private enum ClickGrant
+    {
+        None = 0,
+
+        /// <summary>A phone was picked and what it was picked for is not yet delivering.</summary>
+        Phone = 1,
+
+        /// <summary>The calls switch was turned on and the role is not yet held.</summary>
+        Calls = 2,
+    }
 
     /// <summary>
     /// Shut while a level read of the endpoint monitor is on its way back to this thread.
@@ -296,7 +315,8 @@ public sealed class ConnectionManager : IDisposable
         _settings.Save();
 
         _latch.OnPhoneSelectionChanged();
-        _clickGrant = true;
+        _clickGrant = ClickGrant.Phone;
+        CancelGraceWindow();
 
         if (phoneChanged)
         {
@@ -329,7 +349,8 @@ public sealed class ConnectionManager : IDisposable
         _settings.Save();
 
         _latch.OnPhoneSelectionChanged();
-        _clickGrant = false;
+        _clickGrant = ClickGrant.None;
+        CancelGraceWindow();
 
         _calls.OnPhoneDeselected();
         ApplySettingsToHalves();
@@ -375,11 +396,13 @@ public sealed class ConnectionManager : IDisposable
             // more here than it does for music.
             _calls.OnDisabled();
 
-            // And the grant the switch handed out below goes back with it. Without this, turning
-            // calls on and straight off again with auto-reconnect off leaves permission standing -
-            // and the next reconcile connects the *music* half on the strength of a switch the user
-            // reverted.
-            _clickGrant = false;
+            // And the switch takes back what the switch granted - only that. Without any revocation,
+            // turning calls on and straight off again with auto-reconnect off leaves permission
+            // standing and the next reconcile connects the *music* half on the strength of a switch
+            // the user reverted. Revoking everything is the opposite error and just as real: a user
+            // who picks a phone and then decides they only want music would have the music half's own
+            // click-initiated attempt stood down and latched against them.
+            _clickGrant &= ~ClickGrant.Calls;
 
             Publish();
             return;
@@ -390,10 +413,12 @@ public sealed class ConnectionManager : IDisposable
         // item that visibly does nothing. It is a grant rather than a one-off attempt because
         // registration is a two-step round trip that can legitimately need a retry.
         //
-        // It does also let the music half finish coming up, since one grant covers both halves. That
-        // is the intended reading of "finishing what the user started" - the user asked for the phone
-        // to be usable, not for half of it.
-        _clickGrant = true;
+        // It does also let the music half finish coming up, since permission is not per half. That is
+        // the intended reading of "finishing what the user started" - the user asked for the phone to
+        // be usable, not for half of it. What the flag records is which action is still owed
+        // something, so that the switch going off again can withdraw its own ask without withdrawing
+        // a phone selection's.
+        _clickGrant |= ClickGrant.Calls;
 
         _ = RegisterCallsAsync();
     }
@@ -789,9 +814,10 @@ public sealed class ConnectionManager : IDisposable
     ///
     /// A generation rather than a timestamp, because the two guards are answering different
     /// questions. The reconcile also needs to know when to <em>stop waiting</em> for a pass that has
-    /// wedged - hence a time it can compare against. A window needs no such rule: it is superseded
-    /// only by another window being armed, which is an event, and one is armed whenever the
-    /// connection reports Closed again.
+    /// wedged - hence a time it can compare against. A window needs no such rule: it is superseded by
+    /// events, and there are exactly two - another window being armed, which happens whenever the
+    /// connection reports Closed again, and the phone selection changing, which voids the question
+    /// rather than re-asking it. See <see cref="CancelGraceWindow"/> for the second.
     /// </summary>
     private bool Superseded(int graceGeneration) => _disposed || _graceGeneration != graceGeneration;
 
@@ -856,7 +882,7 @@ public sealed class ConnectionManager : IDisposable
     /// answer to "come and get it". <see cref="_clickGrant"/> is the carve-out: an attempt that
     /// descends from a phone the user just picked runs to completion whatever the setting says.
     /// </summary>
-    private bool ConnectPermitted => !_latch.IsSet && (_settings.AutoReconnect || _clickGrant);
+    private bool ConnectPermitted => !_latch.IsSet && (_settings.AutoReconnect || _clickGrant != ClickGrant.None);
 
     private bool AnyHalfDelivering =>
         (_music.Enabled && _music.State is MusicState.Linked or MusicState.Up)
@@ -904,10 +930,30 @@ public sealed class ConnectionManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Voids an outstanding grace window, because the question it is going to answer is about a phone
+    /// the user has just changed their mind about.
+    ///
+    /// Both halves matter. Bumping the generation alone would leave the armed timer standing, and
+    /// <see cref="OnConnectionClosed"/> declines to arm a window while one is armed - so the next
+    /// Closed would get no window at all. Disposing alone would leave a window that has already fired
+    /// and is waiting on its read free to come back and decide.
+    ///
+    /// The decision it would otherwise reach is not harmless: a window that opened before the
+    /// selection and answers Connected afterwards calls <see cref="SuppressDeliberately"/>, which
+    /// latches, drops the grant and tears down both halves - defeating the click the user just made.
+    /// </summary>
+    private void CancelGraceWindow()
+    {
+        _graceTimer?.Dispose();
+        _graceTimer = null;
+        _graceGeneration++;
+    }
+
     private void SuppressDeliberately(string status)
     {
         _latch.SuppressDeliberate();
-        _clickGrant = false;
+        _clickGrant = ClickGrant.None;
 
         _music.OnSuppressed();
         _calls.OnDisabled();
@@ -934,10 +980,25 @@ public sealed class ConnectionManager : IDisposable
 
     private async Task ConnectHalvesAsync()
     {
-        bool permitted = ConnectPermitted;
+        // Read per half, never hoisted into a local above the awaits. The first of these is a real
+        // OpenAsync round trip to a radio, and the tray's Disconnect is one keystroke away during it:
+        // hoisted, the calls half would be handed a permission flag from before the user said no, and
+        // it would pass its own gates and claim the hands-free role seconds after they disconnected.
+        // Nothing downstream repairs that - EnforceConnectPermission returns early precisely because
+        // the latch it would be repairing against is set.
+        await _music.OnLinkPresentAsync(ConnectPermitted);
 
-        await _music.OnLinkPresentAsync(permitted);
-        await _calls.OnLinkPresentAsync(permitted);
+        if (_disposed)
+        {
+            // Between the two, not only after them. A re-read answers "may this still be started";
+            // it cannot answer "does anything still exist to start it on", because permission stays
+            // true through a teardown. Left to the tail check, this turn would register the role on a
+            // disposed transport - leaving the PC advertised in the phone's picker after the process
+            // is gone - or arm a retry on a manager whose seams have all been let go of.
+            return;
+        }
+
+        await _calls.OnLinkPresentAsync(ConnectPermitted);
 
         FinishTurn();
     }
@@ -957,16 +1018,23 @@ public sealed class ConnectionManager : IDisposable
     /// with it.
     ///
     /// These two turns deliberately do <em>not</em> take the reconcile's supersession guard, and the
-    /// difference is worth stating rather than leaving as an omission: what they do after their
-    /// awaits is level-triggered and idempotent. <see cref="EnforceConnectPermission"/> reads the
-    /// halves' current states and <see cref="Publish"/> recomputes from scratch, so a pass
-    /// interleaving with them changes what they compute, never whether what they compute is correct.
-    /// The reconcile needs the guard because it carries a value across its await - a link status, and
-    /// a "before" snapshot - and both go stale; nothing is carried across these.
+    /// difference is worth stating precisely, because an earlier version of this comment stated it
+    /// wrongly - it claimed nothing was carried across their awaits while a hoisted permission flag
+    /// was being carried across two of them.
     ///
-    /// Disposal is different, because it is not about staleness: the tray can be gone by the time an
-    /// await returns, and raising <c>StateChanged</c> into it - or standing a half down after
-    /// everything under it has been disposed - is work on an object that no longer exists.
+    /// What is true is that everything these turns need after an await can be <em>re-derived</em>,
+    /// and now is: permission is read per half at the call site, and what this tail does is
+    /// level-triggered and idempotent - <see cref="EnforceConnectPermission"/> reads the halves'
+    /// current states, <see cref="Publish"/> recomputes from scratch. A pass interleaving with them
+    /// changes what they compute, never whether it is correct. The reconcile cannot do the same:
+    /// it carries a link status that no longer exists to be re-read and a "before" snapshot that is
+    /// the whole point of the pass, so it needs a guard rather than a re-read.
+    ///
+    /// Disposal is a different question from staleness, and re-reading cannot answer it: permission
+    /// stays true through a teardown. The tray can be gone by the time an await returns, and raising
+    /// <c>StateChanged</c> into it - or standing a half down after everything under it has been
+    /// disposed - is work on an object that no longer exists. Hence a check here, and another between
+    /// <see cref="ConnectHalvesAsync"/>'s two awaits, where the damage is bigger than an announcement.
     /// </summary>
     private void FinishTurn()
     {
@@ -1163,7 +1231,7 @@ public sealed class ConnectionManager : IDisposable
     /// </summary>
     private void ReleaseClickGrantIfDelivering()
     {
-        if (!_clickGrant)
+        if (_clickGrant == ClickGrant.None)
         {
             return;
         }
@@ -1176,7 +1244,7 @@ public sealed class ConnectionManager : IDisposable
         // without it the grant would be released before the halves had been configured at all.
         if (anyEnabled && musicSatisfied && callsSatisfied)
         {
-            _clickGrant = false;
+            _clickGrant = ClickGrant.None;
         }
     }
 
