@@ -28,6 +28,32 @@ public enum LinkState
 /// </summary>
 public sealed class LinkMachine
 {
+    /// <summary>
+    /// How many consecutive non-Connected <em>polls</em> it takes to give up on a Present link.
+    ///
+    /// Two, not one. <c>ILinkMonitor.ReadLinkStatusAsync</c> collapses every failed read to
+    /// <see cref="BluetoothLinkStatus.Unknown"/> - an address that would not parse, a null from
+    /// WinRT, a throw - and <see cref="OnLinkStatusRead"/> is right to treat that as disconnected,
+    /// because the other guess is silent permanent dormancy. But it makes one transient hiccup look
+    /// exactly like the phone leaving the room, and consumers act on that: the music half's Absent
+    /// row stops the router and disconnects the sink, tearing down a working A2DP route mid-song,
+    /// and the suppression latch re-arms on Present -> Absent -> Present, undoing a deliberate tray
+    /// Disconnect about a minute after the user asked for it.
+    ///
+    /// Requiring a second sample costs nothing on a real range exit: the halves tear down on their
+    /// own evidence - the connection closes, the endpoint vanishes - so this delays only the state
+    /// label, never the teardown. It is deliberately not applied to watcher edges: a removal is a
+    /// definite observation, and delaying it would have the app claim a phone that is provably gone.
+    /// </summary>
+    private const int NonConnectedPollsBeforeAbsent = 2;
+
+    /// <summary>
+    /// Length of the current run of non-Connected polls, counted only while
+    /// <see cref="LinkState.Present"/> - the one transition the debounce guards. Cleared by every
+    /// arrival in Present, so the run has to be consecutive.
+    /// </summary>
+    private int _nonConnectedPolls;
+
     public LinkState State { get; private set; } = LinkState.NoPhone;
 
     /// <summary>
@@ -58,6 +84,10 @@ public sealed class LinkMachine
     /// value the enum does not define - means Absent. Guessing the other way would make a read that
     /// could not answer look exactly like a healthy link, and the app would sit in Present and never
     /// rediscover the phone.
+    ///
+    /// Leaving Present is debounced: it takes <see cref="NonConnectedPollsBeforeAbsent"/> consecutive
+    /// non-Connected reads, because one of them is indistinguishable from a failed read. Everything
+    /// else about the rule is unchanged, including which values count as "not connected".
     /// </summary>
     public bool OnLinkStatusRead(BluetoothLinkStatus status)
     {
@@ -66,16 +96,42 @@ public sealed class LinkMachine
             return false;
         }
 
-        return MoveTo(status == BluetoothLinkStatus.Connected ? LinkState.Present : LinkState.Absent);
+        if (status == BluetoothLinkStatus.Connected)
+        {
+            return MoveTo(LinkState.Present);
+        }
+
+        if (State != LinkState.Present)
+        {
+            // Already Absent: there is nothing to debounce, and nothing to bank either. Counting
+            // here would let a phone switched off for an hour spend the next Present's whole
+            // allowance before the first poll of that visit arrives.
+            return false;
+        }
+
+        _nonConnectedPolls++;
+        return _nonConnectedPolls >= NonConnectedPollsBeforeAbsent && MoveTo(LinkState.Absent);
     }
 
     /// <summary>
     /// The single place the state moves, and the single source of the returned flag: true only when
     /// something actually changed. Callers log on that flag, so a method that always said "changed"
     /// would write a reconcile line every 30 seconds for as long as the app runs.
+    ///
+    /// It is also the single place the poll debounce is cleared, for the same reason - every route
+    /// into Present passes through here, so no caller can add one and forget.
     /// </summary>
     private bool MoveTo(LinkState next)
     {
+        if (next == LinkState.Present)
+        {
+            // Every arrival in Present - watcher edge or Connected poll - starts the debounce over,
+            // which is what makes the run consecutive rather than cumulative. Deliberately above the
+            // no-change return: a Connected poll while already Present moves nothing but is still
+            // evidence the link is up, and it is the only thing that can clear a half-finished run.
+            _nonConnectedPolls = 0;
+        }
+
         if (State == next)
         {
             return false;

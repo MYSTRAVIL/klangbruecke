@@ -144,11 +144,15 @@ public sealed class LinkMachineTests
         Assert.Equal(LinkState.Present, machine.State);
     }
 
+    // Two reads, deliberately: since Task 19 the poll is debounced, so it takes two consecutive
+    // non-Connected reads to give up on a Present link. The rule this test exists for is unchanged -
+    // a poll that says "not connected" does reach Absent - it just no longer does so on one sample.
     [Fact]
     public void Link_status_Disconnected_moves_Present_to_Absent()
     {
         LinkMachine machine = InState(LinkState.Present);
 
+        machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected);
         bool changed = machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected);
 
         Assert.True(changed);
@@ -163,11 +167,15 @@ public sealed class LinkMachineTests
     // Asserted from Present, where the two readings differ: Unknown-as-connected leaves Present and
     // returns false, and both assertions below catch it. The Absent half then pins that it is inert
     // in exactly the way Disconnected is.
+    //
+    // Two reads from Present, deliberately, for the same Task 19 reason as the test above: the rule
+    // is still "Unknown means not connected", it just takes the same two samples Disconnected does.
     [Fact]
     public void Link_status_Unknown_is_treated_as_Disconnected()
     {
         LinkMachine present = InState(LinkState.Present);
 
+        present.OnLinkStatusRead(BluetoothLinkStatus.Unknown);
         bool changed = present.OnLinkStatusRead(BluetoothLinkStatus.Unknown);
 
         Assert.True(changed);
@@ -177,6 +185,145 @@ public sealed class LinkMachineTests
 
         Assert.False(absent.OnLinkStatusRead(BluetoothLinkStatus.Unknown));
         Assert.Equal(LinkState.Absent, absent.State);
+    }
+
+    // --- the poll debounce ---
+    //
+    // The Unknown rule above is right and stays: a read that could not answer must never look like a
+    // healthy link. But it makes one transient WinRT hiccup look exactly like the phone leaving the
+    // room, and two consumers act on that. The music half's Absent row calls router.Stop() and
+    // sink.Disconnect(), so a single failed read tears down a working A2DP route mid-song; and
+    // SuppressionLatch re-arms on Present -> Absent -> Present, so a failed poll followed by a good
+    // one silently undoes a deliberate tray Disconnect about 60 s after the user asked for it.
+    //
+    // So a *poll* needs two consecutive non-Connected reads before Present becomes Absent. Watcher
+    // edges are definite observations and are not debounced. This costs nothing on a real range
+    // exit, because the halves tear down on their own evidence - the connection closes and the
+    // endpoint vanishes - so the debounce delays only the state label, never the teardown.
+
+    [Fact]
+    public void A_single_non_connected_poll_does_not_leave_Present()
+    {
+        LinkMachine machine = InState(LinkState.Present);
+
+        bool changed = machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected);
+
+        Assert.False(changed);
+        Assert.Equal(LinkState.Present, machine.State);
+    }
+
+    [Fact]
+    public void Two_consecutive_non_connected_polls_move_Present_to_Absent()
+    {
+        LinkMachine machine = InState(LinkState.Present);
+
+        Assert.False(machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected));
+        Assert.Equal(LinkState.Present, machine.State);
+
+        bool changed = machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected);
+
+        Assert.True(changed);
+        Assert.Equal(LinkState.Absent, machine.State);
+    }
+
+    // Consecutive, not cumulative. A phone at the edge of range that reads badly once an hour must
+    // never accumulate its way to Absent while the link is in fact up the whole time.
+    [Fact]
+    public void A_Connected_poll_resets_the_debounce()
+    {
+        LinkMachine machine = InState(LinkState.Present);
+
+        Assert.False(machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected));
+        Assert.False(machine.OnLinkStatusRead(BluetoothLinkStatus.Connected));
+
+        bool changed = machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected);
+
+        Assert.False(changed);
+        Assert.Equal(LinkState.Present, machine.State);
+
+        // Reset, not switched off: the run starts again from that read, so the next one still lands.
+        Assert.True(machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected));
+        Assert.Equal(LinkState.Absent, machine.State);
+    }
+
+    // Unknown is a failed read and Disconnected is a successful read of a dead link; the debounce
+    // exists for the first and has to tolerate the second, so both count, and a mixed pair counts
+    // too. Anything else would let an alternating Unknown/Disconnected sequence hold Present forever.
+    [Theory]
+    [InlineData(BluetoothLinkStatus.Disconnected, BluetoothLinkStatus.Disconnected)]
+    [InlineData(BluetoothLinkStatus.Disconnected, BluetoothLinkStatus.Unknown)]
+    [InlineData(BluetoothLinkStatus.Unknown, BluetoothLinkStatus.Disconnected)]
+    [InlineData(BluetoothLinkStatus.Unknown, BluetoothLinkStatus.Unknown)]
+    public void Unknown_and_Disconnected_both_count_toward_the_debounce(
+        BluetoothLinkStatus first,
+        BluetoothLinkStatus second)
+    {
+        LinkMachine machine = InState(LinkState.Present);
+
+        Assert.False(machine.OnLinkStatusRead(first));
+        Assert.Equal(LinkState.Present, machine.State);
+
+        Assert.True(machine.OnLinkStatusRead(second));
+        Assert.Equal(LinkState.Absent, machine.State);
+    }
+
+    // The debounce is for the poll only. A watcher removal is a definite observation - the radio said
+    // the device went away - so delaying it would make the app claim a phone that is provably gone.
+    [Fact]
+    public void Device_removed_still_moves_Present_to_Absent_immediately()
+    {
+        LinkMachine machine = InState(LinkState.Present);
+
+        bool changed = machine.OnDeviceRemoved();
+
+        Assert.True(changed);
+        Assert.Equal(LinkState.Absent, machine.State);
+
+        // And an edge arriving mid-run is not swallowed by the counter either.
+        LinkMachine midRun = InState(LinkState.Present);
+        Assert.False(midRun.OnLinkStatusRead(BluetoothLinkStatus.Disconnected));
+
+        Assert.True(midRun.OnDeviceRemoved());
+        Assert.Equal(LinkState.Absent, midRun.State);
+    }
+
+    // A counter that only ever cleared on a Connected read would let a bad poll from a *previous*
+    // visit shorten the next one to a single sample. Every arrival in Present starts the count over,
+    // whichever signal did the arriving - here the watcher edge, which never touches the poll path.
+    [Fact]
+    public void The_debounce_is_reset_on_entering_Present()
+    {
+        LinkMachine machine = InState(LinkState.Present);
+
+        Assert.False(machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected));
+        Assert.True(machine.OnDeviceRemoved());
+        Assert.True(machine.OnDeviceAppeared());
+        Assert.Equal(LinkState.Present, machine.State);
+
+        bool changed = machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected);
+
+        Assert.False(changed);
+        Assert.Equal(LinkState.Present, machine.State);
+    }
+
+    // Absent is where a phone that is switched off sits for hours, so the poll says "not connected"
+    // there indefinitely. That must stay inert - and must not bank anything for later either.
+    [Fact]
+    public void Polls_while_Absent_do_not_accumulate_toward_anything()
+    {
+        LinkMachine machine = InState(LinkState.Absent);
+
+        for (int i = 0; i < 5; i++)
+        {
+            Assert.False(machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected));
+            Assert.Equal(LinkState.Absent, machine.State);
+        }
+
+        // "toward anything": the phone coming back and then glitching once still leaves it Present,
+        // so none of those five shortened the next debounce.
+        Assert.True(machine.OnLinkStatusRead(BluetoothLinkStatus.Connected));
+        Assert.False(machine.OnLinkStatusRead(BluetoothLinkStatus.Disconnected));
+        Assert.Equal(LinkState.Present, machine.State);
     }
 
     // Every status, enumerated: a read that arrives after the user cleared their phone must not drag
@@ -209,6 +356,12 @@ public sealed class LinkMachineTests
     // returned true would put a reconcile line in the log every 30 seconds for as long as the app
     // runs. Each row also asserts the state stayed put, so the theory cannot pass by accident against
     // an implementation that moved and reported no change.
+    //
+    // These two rows and the other theory's rows together are the whole 3 x 7 table, once each. The
+    // last two rows here moved over from that theory in Task 19: one non-Connected *poll* no longer
+    // leaves Present, so from a fresh Present a single such signal now changes nothing. The pair of
+    // them still reaches Absent - see Two_consecutive_non_connected_polls_move_Present_to_Absent -
+    // and the watcher's Removed edge, one row below in the other theory, is not debounced at all.
     [Theory]
     [InlineData(LinkState.NoPhone, Signal.Deselect)]
     [InlineData(LinkState.NoPhone, Signal.Appeared)]
@@ -222,6 +375,8 @@ public sealed class LinkMachineTests
     [InlineData(LinkState.Absent, Signal.ReadUnknown)]
     [InlineData(LinkState.Present, Signal.Appeared)]
     [InlineData(LinkState.Present, Signal.ReadConnected)]
+    [InlineData(LinkState.Present, Signal.ReadDisconnected)]
+    [InlineData(LinkState.Present, Signal.ReadUnknown)]
     public void Transitions_that_change_nothing_return_false(LinkState from, Signal signal)
     {
         LinkMachine machine = InState(from);
@@ -243,8 +398,6 @@ public sealed class LinkMachineTests
     [InlineData(LinkState.Present, Signal.Deselect, LinkState.NoPhone)]
     [InlineData(LinkState.Present, Signal.Select, LinkState.Absent)]
     [InlineData(LinkState.Present, Signal.Removed, LinkState.Absent)]
-    [InlineData(LinkState.Present, Signal.ReadDisconnected, LinkState.Absent)]
-    [InlineData(LinkState.Present, Signal.ReadUnknown, LinkState.Absent)]
     public void Transitions_that_change_something_return_true(LinkState from, Signal signal, LinkState expected)
     {
         LinkMachine machine = InState(from);
@@ -275,11 +428,15 @@ public sealed class LinkMachineTests
     // The same instinct as the Unknown rule, one step further out: only Connected means connected.
     // A value the enum does not define - a future member, or a cast gone wrong - must not be able to
     // hold the machine in Present, because that is the failure mode with no recovery.
+    //
+    // Two reads since Task 19, for the same reason as the two named tests above: an undefined value
+    // counts toward the debounce exactly as Unknown does, and still cannot hold Present forever.
     [Fact]
     public void An_unrecognised_link_status_is_not_treated_as_Connected()
     {
         LinkMachine machine = InState(LinkState.Present);
 
+        machine.OnLinkStatusRead((BluetoothLinkStatus)99);
         bool changed = machine.OnLinkStatusRead((BluetoothLinkStatus)99);
 
         Assert.True(changed);
