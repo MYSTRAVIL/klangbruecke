@@ -1133,6 +1133,44 @@ public sealed class CallsHalfTests : IDisposable
     }
 
     /// <summary>
+    /// A <c>Changed</c> subscriber throws on the Registering announcement, which is raised before the
+    /// first await and therefore before any try placed after it.
+    ///
+    /// The flag that stops two overlapping registrations is set on the same three lines. Wedged true,
+    /// it is never cleared again - neither <c>OnDisabled</c> nor <c>OnPhoneDeselected</c> touches it,
+    /// they reset the state and bump the generation - so every later attempt returns at the door and
+    /// calls never register again for the life of the process, silently, with the tray showing Off.
+    /// </summary>
+    [Fact]
+    public async Task A_Changed_subscriber_that_throws_does_not_wedge_the_half()
+    {
+        Harness half = new();
+
+        bool thrown = false;
+        half.Half.Changed += (_, _) =>
+        {
+            if (thrown || half.Half.State != CallsState.Registering)
+            {
+                return;
+            }
+
+            thrown = true;
+            throw new InvalidOperationException("the tray blew up redrawing itself");
+        };
+
+        await half.Half.OnLinkPresentAsync(connectPermitted: true);
+
+        Assert.True(thrown);
+        Assert.Equal(CallsState.Backoff, half.Half.State);
+
+        // The retry the failed attempt armed, which is the first thing the wedged flag would block.
+        half.Scheduler.Advance(Seconds(2));
+
+        Assert.Equal(CallsState.Up, half.Half.State);
+        Assert.Equal(new[] { TransportId }, half.Calls.ConnectCalls);
+    }
+
+    /// <summary>
     /// The half plus its two doubles, wired the way <c>ConnectionManager</c> will wire them.
     ///
     /// <see cref="CallsHalf"/> subscribes to nothing itself: every inbound event reaches it as a

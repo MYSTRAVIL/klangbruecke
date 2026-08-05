@@ -30,4 +30,14 @@ public interface IAudioRouter : IDisposable
 
     bool Start(string? preferredOutputDeviceId);
     void Stop();
+
+    /// <summary>
+    /// The render endpoints the tray's Output menu offers, from the same factory the route itself
+    /// opens them with.
+    ///
+    /// Here rather than on a factory the caller holds separately so that nothing above this seam ever
+    /// names <c>MMDevice</c>: every property on a live endpoint is a COM call that starts throwing the
+    /// moment the device is unplugged, and the menu outlives the enumeration that built it.
+    /// </summary>
+    IReadOnlyList<AudioOutputDevice> ListOutputs();
 }

@@ -23,8 +23,9 @@ public sealed class ConnectionStateProjectionTests
         MusicState music = MusicState.Up,
         bool callsEnabled = true,
         CallsState calls = CallsState.Up,
-        TimeSpan? nextRetryIn = null) =>
-        new(phoneSelected, suppression, link, musicEnabled, music, callsEnabled, calls, nextRetryIn);
+        TimeSpan? nextRetryIn = null,
+        bool connectPermitted = true) =>
+        new(phoneSelected, suppression, link, musicEnabled, music, callsEnabled, calls, nextRetryIn, connectPermitted);
 
     // Enumerated rather than listed. The manager hands this function whatever its three machines
     // happen to hold at the instant the tray asks, so every combination is reachable - and a
@@ -45,8 +46,11 @@ public sealed class ConnectionStateProjectionTests
         select new object[] { phoneSelected, suppression, link, musicEnabled, music, callsEnabled, calls };
 
     // The same cross-product as values, for the assertions that do not need a row each in the runner.
+    // Both connect-permission values per row, because a ninth field in the theory data would double
+    // 1440 runner rows to buy two answers that every consumer below already loops over.
     private static IEnumerable<ConnectionSnapshot> EverySnapshotValue(TimeSpan? nextRetryIn) =>
         from row in EverySnapshot()
+        from connectPermitted in Bools
         select Snapshot(
             phoneSelected: (bool)row[0],
             suppression: (SuppressionReason)row[1],
@@ -55,7 +59,8 @@ public sealed class ConnectionStateProjectionTests
             music: (MusicState)row[4],
             callsEnabled: (bool)row[5],
             calls: (CallsState)row[6],
-            nextRetryIn: nextRetryIn);
+            nextRetryIn: nextRetryIn,
+            connectPermitted: connectPermitted);
 
     // The same cross-product with the phone left out, for the rule that is supposed to dominate all
     // of it.
@@ -305,16 +310,20 @@ public sealed class ConnectionStateProjectionTests
         bool callsEnabled,
         CallsState calls)
     {
-        ConnectionState state = ConnectionStateProjection.Project(Snapshot(
-            phoneSelected: phoneSelected,
-            suppression: suppression,
-            link: link,
-            musicEnabled: musicEnabled,
-            music: music,
-            callsEnabled: callsEnabled,
-            calls: calls));
+        foreach (bool connectPermitted in Bools)
+        {
+            ConnectionState state = ConnectionStateProjection.Project(Snapshot(
+                phoneSelected: phoneSelected,
+                suppression: suppression,
+                link: link,
+                musicEnabled: musicEnabled,
+                music: music,
+                callsEnabled: callsEnabled,
+                calls: calls,
+                connectPermitted: connectPermitted));
 
-        Assert.True(Enum.IsDefined(state), $"Project returned the undefined ConnectionState {(int)state}.");
+            Assert.True(Enum.IsDefined(state), $"Project returned the undefined ConnectionState {(int)state}.");
+        }
     }
 
     // Both retry intervals per row: null is what the manager hands over whenever nothing is scheduled,
@@ -332,17 +341,21 @@ public sealed class ConnectionStateProjectionTests
     {
         foreach (TimeSpan? nextRetryIn in new TimeSpan?[] { null, TimeSpan.FromSeconds(8) })
         {
-            ConnectionSnapshot snapshot = Snapshot(
-                phoneSelected: phoneSelected,
-                suppression: suppression,
-                link: link,
-                musicEnabled: musicEnabled,
-                music: music,
-                callsEnabled: callsEnabled,
-                calls: calls,
-                nextRetryIn: nextRetryIn);
+            foreach (bool connectPermitted in Bools)
+            {
+                ConnectionSnapshot snapshot = Snapshot(
+                    phoneSelected: phoneSelected,
+                    suppression: suppression,
+                    link: link,
+                    musicEnabled: musicEnabled,
+                    music: music,
+                    callsEnabled: callsEnabled,
+                    calls: calls,
+                    nextRetryIn: nextRetryIn,
+                    connectPermitted: connectPermitted);
 
-            Assert.False(string.IsNullOrWhiteSpace(ConnectionStateProjection.DetailFor(snapshot)));
+                Assert.False(string.IsNullOrWhiteSpace(ConnectionStateProjection.DetailFor(snapshot)));
+            }
         }
     }
 
@@ -596,6 +609,151 @@ public sealed class ConnectionStateProjectionTests
                 music: MusicState.Backoff,
                 calls: CallsState.Backoff,
                 nextRetryIn: TimeSpan.FromSeconds(-5))));
+    }
+
+    // --- rule 2b: nothing may be initiated ---
+
+    // The rule this field exists for. The latch is set by a drop, so between it clearing and the next
+    // drop there is a whole window in which auto-reconnect is off, nothing will be attempted, and the
+    // three machines look exactly like an app that is about to try. Both of these are promises the
+    // user waits on: "waiting for the phone to appear", and a countdown.
+    [Fact]
+    public void Connect_not_permitted_with_nothing_running_is_Suppressed()
+    {
+        // Would be Discovering.
+        Assert.Equal(
+            ConnectionState.Suppressed,
+            ConnectionStateProjection.Project(Snapshot(
+                link: LinkState.Absent,
+                music: MusicState.Off,
+                calls: CallsState.Off,
+                connectPermitted: false)));
+
+        // Would be RetryBackoff.
+        Assert.Equal(
+            ConnectionState.Suppressed,
+            ConnectionStateProjection.Project(Snapshot(
+                music: MusicState.Backoff,
+                calls: CallsState.Backoff,
+                connectPermitted: false)));
+
+        // Would be Idle, whose detail reads "nothing is running yet" - and the "yet" is the lie.
+        Assert.Equal(
+            ConnectionState.Suppressed,
+            ConnectionStateProjection.Project(Snapshot(
+                music: MusicState.Off,
+                calls: CallsState.Off,
+                connectPermitted: false)));
+    }
+
+    // Connect permission is withheld for exactly one reason, and the phrase has to name it: the user
+    // cannot act on "not reconnecting", and it is the same words an unrecognised reason gets.
+    [Fact]
+    public void Detail_for_rule_2b_names_auto_reconnect()
+    {
+        string detail = ConnectionStateProjection.DetailFor(
+            Snapshot(music: MusicState.Off, calls: CallsState.Off, connectPermitted: false));
+
+        Assert.Equal("auto-reconnect is off", detail);
+    }
+
+    // The half of the rule that stops it eating the tray. A working half is news that outranks a
+    // setting, and an attempt already in flight is going to finish whatever the setting says - that
+    // is the click-initiated carve-out, arriving here as a snapshot.
+    [Fact]
+    public void Connect_not_permitted_does_not_hide_a_half_that_is_working()
+    {
+        Assert.Equal(
+            ConnectionState.Connected,
+            ConnectionStateProjection.Project(Snapshot(connectPermitted: false)));
+
+        Assert.Equal(
+            ConnectionState.Degraded,
+            ConnectionStateProjection.Project(Snapshot(
+                music: MusicState.Up,
+                calls: CallsState.Off,
+                connectPermitted: false)));
+
+        Assert.Equal(
+            ConnectionState.Connecting,
+            ConnectionStateProjection.Project(Snapshot(
+                music: MusicState.Connecting,
+                calls: CallsState.Off,
+                connectPermitted: false)));
+    }
+
+    // Rules 2b and 3 have to agree about what an absent phone means, or they contradict each other on
+    // the same snapshot: rule 3 already says no half can be delivering whatever it believes, so a
+    // stale Up must not keep 2b from firing.
+    [Fact]
+    public void Connect_not_permitted_beats_a_half_that_only_thinks_it_is_up()
+    {
+        Assert.Equal(
+            ConnectionState.Suppressed,
+            ConnectionStateProjection.Project(Snapshot(
+                link: LinkState.Absent,
+                music: MusicState.Off,
+                calls: CallsState.Up,
+                connectPermitted: false)));
+    }
+
+    // A user who has switched both halves off is not waiting for a reconnect, and telling them about
+    // a setting they did not touch sends them to the wrong switch. The detail keeps naming the two.
+    [Fact]
+    public void Connect_not_permitted_with_no_half_enabled_stays_Idle()
+    {
+        ConnectionSnapshot snapshot = Snapshot(
+            musicEnabled: false,
+            music: MusicState.Off,
+            callsEnabled: false,
+            calls: CallsState.Off,
+            connectPermitted: false);
+
+        Assert.Equal(ConnectionState.Idle, ConnectionStateProjection.Project(snapshot));
+        Assert.Equal("music and calls are both off", ConnectionStateProjection.DetailFor(snapshot));
+    }
+
+    // The latch outranks it, because both report Suppressed and only the latch's detail can say how
+    // the dormancy ends - a deliberate disconnect expires when the phone leaves and comes back, and
+    // "auto-reconnect is off" would send the user to a switch that will not help.
+    [Fact]
+    public void A_latched_reason_outranks_rule_2b()
+    {
+        Assert.Equal(
+            "disconnected until the phone leaves and returns",
+            ConnectionStateProjection.DetailFor(Snapshot(
+                suppression: SuppressionReason.Deliberate,
+                music: MusicState.Off,
+                calls: CallsState.Off,
+                connectPermitted: false)));
+    }
+
+    // The one read in DetailFor with no Enabled guard beside it. It is unreachable - Degraded needs an
+    // enabled half up, and with calls disabled that forces every other read to agree the app is
+    // Connected - but "unreachable" is a property of the rules above it, and rule 2b is a new rule
+    // above it. This sweeps every snapshot rather than trusting the argument twice.
+    [Fact]
+    public void The_degraded_detail_never_describes_a_disabled_half()
+    {
+        foreach (ConnectionSnapshot snapshot in EverySnapshotValue(TimeSpan.FromSeconds(8)))
+        {
+            if (ConnectionStateProjection.Project(snapshot) != ConnectionState.Degraded)
+            {
+                continue;
+            }
+
+            string detail = ConnectionStateProjection.DetailFor(snapshot);
+
+            if (!snapshot.CallsEnabled)
+            {
+                Assert.DoesNotContain("calls", detail, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (!snapshot.MusicEnabled)
+            {
+                Assert.DoesNotContain("music", detail, StringComparison.OrdinalIgnoreCase);
+            }
+        }
     }
 
     // StatusPresenter composes "Klangbruecke: <message>" and truncates the result at 96 characters

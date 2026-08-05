@@ -68,6 +68,16 @@ public enum CallsState
 /// How long until the soonest scheduled attempt, or null when nothing is scheduled yet. Presentation
 /// only - <see cref="ConnectionStateProjection.Project"/> ignores it.
 /// </param>
+/// <param name="ConnectPermitted">
+/// May the manager <em>initiate</em> a connect right now?
+///
+/// Not the same question as the suppression latch, and that is exactly why it is here. The latch is
+/// set by a drop; between it clearing and the next drop re-setting it there is a whole window in
+/// which auto-reconnect is off, nothing will be attempted, and the three machines look identical to
+/// an app that is about to try - so the tray reported <c>Discovering</c> ("waiting for the phone to
+/// appear") or <c>RetryBackoff</c> ("retrying in 8s") for a phone nobody was going to fetch. Both are
+/// promises, and the user waits on them.
+/// </param>
 public readonly record struct ConnectionSnapshot(
     bool PhoneSelected,
     SuppressionReason Suppression,
@@ -76,7 +86,8 @@ public readonly record struct ConnectionSnapshot(
     MusicState Music,
     bool CallsEnabled,
     CallsState Calls,
-    TimeSpan? NextRetryIn);
+    TimeSpan? NextRetryIn,
+    bool ConnectPermitted);
 
 /// <summary>
 /// The seven reported states, derived from the three machines rather than stored beside them.
@@ -114,15 +125,6 @@ public static class ConnectionStateProjection
             return ConnectionState.Suppressed;
         }
 
-        // 3. The phone is not in the room. Only Absent: NoPhone means the link machine has not been
-        // asked yet, and a value the enum does not define is not evidence the phone has left - in
-        // both cases the halves' own observations are the better witness. LinkMachine already
-        // collapses a failed status read to Absent, so this rule sees a real answer.
-        if (snapshot.Link == LinkState.Absent)
-        {
-            return ConnectionState.Discovering;
-        }
-
         // A disabled half is not attempted, so it can neither be up nor be failing. Every question
         // below is asked of the enabled halves only - that is what keeps "calls switched off" and
         // "no MSIX package identity" out of Degraded, and an unpackaged development run out of a
@@ -137,6 +139,35 @@ public static class ConnectionStateProjection
 
         bool musicBackoff = snapshot.MusicEnabled && snapshot.Music == MusicState.Backoff;
         bool callsBackoff = snapshot.CallsEnabled && snapshot.Calls == CallsState.Backoff;
+
+        // Nothing a half believes about itself counts while the phone is out of the room - that is
+        // rule 3's claim, and rules 2b and 3 have to agree about it or the pair contradict each
+        // other on the same snapshot.
+        bool anythingLive =
+            snapshot.Link != LinkState.Absent
+            && (musicUp || callsUp || musicConnecting || callsConnecting);
+
+        // 2b. Nothing is delivering, nothing is on its way, and nothing may be started. The app is
+        // dormant because of a setting, and the three states this would otherwise report -
+        // Discovering, RetryBackoff, and the Idle whose detail reads "nothing is running yet" - are
+        // each a promise that something is about to happen. A user who is told the app is looking for
+        // their phone waits; a user who is told auto-reconnect is off goes and turns it on.
+        //
+        // Below the latch, not above it: a deliberate Disconnect also fails this test, and its detail
+        // says how it ends, which this one cannot.
+        if (anyEnabled && !snapshot.ConnectPermitted && !anythingLive)
+        {
+            return ConnectionState.Suppressed;
+        }
+
+        // 3. The phone is not in the room. Only Absent: NoPhone means the link machine has not been
+        // asked yet, and a value the enum does not define is not evidence the phone has left - in
+        // both cases the halves' own observations are the better witness. LinkMachine already
+        // collapses a failed status read to Absent, so this rule sees a real answer.
+        if (snapshot.Link == LinkState.Absent)
+        {
+            return ConnectionState.Discovering;
+        }
 
         // 4. Something is on its way up.
         if (musicConnecting || callsConnecting)
@@ -193,7 +224,7 @@ public static class ConnectionStateProjection
         ConnectionState.Connecting => ConnectingDetail(snapshot),
         ConnectionState.Connected => ConnectedDetail(snapshot),
         ConnectionState.Degraded => DegradedDetail(snapshot),
-        ConnectionState.Suppressed => SuppressedDetail(snapshot.Suppression),
+        ConnectionState.Suppressed => SuppressedDetail(snapshot),
         ConnectionState.RetryBackoff => RetryPhrase(snapshot.NextRetryIn),
 
         // Unreachable while Project returns one of the seven, and required anyway: a switch
@@ -271,13 +302,18 @@ public static class ConnectionStateProjection
             : "calls are not running";
     }
 
-    private static string SuppressedDetail(SuppressionReason reason) => reason switch
+    private static string SuppressedDetail(ConnectionSnapshot snapshot) => snapshot.Suppression switch
     {
         // Says what ends it. A deliberate disconnect expires when the phone leaves and comes back,
         // which is the one thing the user would otherwise have no way of learning.
         SuppressionReason.Deliberate => "disconnected until the phone leaves and returns",
 
         SuppressionReason.AutoReconnectOff => "auto-reconnect is off",
+
+        // Rule 2b, which is the only way Suppressed is reached with nothing latched. Connect
+        // permission is withheld for exactly one reason, so naming it is a statement of fact rather
+        // than the guess the default arm below refuses to make.
+        SuppressionReason.None => "auto-reconnect is off",
 
         // Covers None, which cannot reach here, and any reason added later. Deliberately borrows
         // neither phrase above: both are claims about how the dormancy ends, and guessing wrong sends

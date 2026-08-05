@@ -37,6 +37,9 @@ public sealed class FakeAudioRouter : IAudioRouter
     /// <summary>What <see cref="Start"/> returns.</summary>
     public bool StartResult { get; set; } = true;
 
+    /// <summary>What <see cref="ListOutputs"/> reports. Empty is a real answer: no usable endpoint.</summary>
+    public IReadOnlyList<AudioOutputDevice> Outputs { get; set; } = Array.Empty<AudioOutputDevice>();
+
     /// <summary>
     /// Whether a <see cref="Start"/> that returned true leaves the route actually running. False is
     /// the measured lie described on the class.
@@ -53,6 +56,8 @@ public sealed class FakeAudioRouter : IAudioRouter
         IsRunning = StartResult && StartLeavesItRunning;
         return StartResult;
     }
+
+    public IReadOnlyList<AudioOutputDevice> ListOutputs() => Outputs;
 
     public void Stop()
     {

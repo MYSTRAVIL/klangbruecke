@@ -13,7 +13,7 @@ namespace Klangbruecke.Config;
 /// above - which matters because deleting this file by hand is the documented recovery from a
 /// bricked auto-connect. See docs/FINDINGS.md §9.
 /// </summary>
-public sealed class Settings
+public class Settings
 {
     /// <summary>Bluetooth device id to auto-connect the A2DP sink to.</summary>
     public string? PhoneDeviceId { get; set; }
@@ -55,7 +55,15 @@ public sealed class Settings
         return new Settings();
     }
 
-    public void Save()
+    /// <summary>
+    /// Writes the file. Virtual, and the class is open, for one reason: this path is the real
+    /// %LOCALAPPDATA% file that the installed app on this machine reads at startup, so a suite that
+    /// let it run would overwrite the developer's own saved phone with whatever a test constructed -
+    /// and the damage would surface hours later as "the app forgot my phone", which reads as a
+    /// Bluetooth fault. <c>ConnectionManager</c> saves on four separate setters; there is no test of
+    /// any of them that does not go through here.
+    /// </summary>
+    public virtual void Save()
     {
         try
         {

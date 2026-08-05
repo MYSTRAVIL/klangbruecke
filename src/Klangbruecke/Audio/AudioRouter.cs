@@ -390,6 +390,13 @@ public sealed class AudioRouter : IAudioRouter
         });
     }
 
+    /// <summary>
+    /// Straight through to the factory, which is the whole point: the tray asks the router rather
+    /// than holding an <see cref="IAudioDeviceFactory"/> of its own, so no caller above this class
+    /// ever names a WASAPI type. See <see cref="IAudioRouter.ListOutputs"/>.
+    /// </summary>
+    public IReadOnlyList<AudioOutputDevice> ListOutputs() => _devices.ListOutputs();
+
     public void Stop()
     {
         // First, and this ordering is load-bearing twice over. It makes a stopped event racing this

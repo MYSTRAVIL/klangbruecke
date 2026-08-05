@@ -312,22 +312,28 @@ public sealed class CallsHalf
             return;
         }
 
-        // All three captured before the state moves. SetState raises Changed, a handler is free to
-        // call straight back in, and everything this method needs from the half must therefore
-        // already be in hand - see the note on _generation for what a capture taken afterwards would
-        // let past, and _inFlight for what a flag set afterwards would.
+        // Both captured before the state moves. SetState raises Changed, a handler is free to call
+        // straight back in, and everything this method needs from the half must therefore already be
+        // in hand - see the note on _generation for what a capture taken afterwards would let past.
         string? phoneDeviceId = _phoneDeviceId;
         int generation = _generation;
-
-        _inFlight = true;
-
-        CancelRetry();
-        SetState(CallsState.Registering);
 
         bool registered;
 
         try
         {
+            // Inside the try, all three of them, and this is the whole of what the finally below is
+            // worth. SetState raises Changed on the calling thread; a subscriber that throws would
+            // propagate out of this method without ever entering a try placed after these lines, and
+            // the flag would be wedged true for the life of the process. Neither OnDisabled nor
+            // OnPhoneDeselected clears it - they reset the state and bump the generation - so every
+            // later attempt would return at the door, silently, with the tray reporting Off and calls
+            // never registering again.
+            _inFlight = true;
+
+            CancelRetry();
+            SetState(CallsState.Registering);
+
             IReadOnlyList<TransportCandidate> candidates = await _calls.FindTransportsAsync();
 
             if (generation != _generation)
@@ -381,7 +387,9 @@ public sealed class CallsHalf
         {
             // In a finally, not on the way out: a throw the catch above did not expect - one raised
             // by the catch's own logging, say - would otherwise wedge the flag true and leave the
-            // half unable to register again for the life of the process.
+            // half unable to register again for the life of the process. The catch does not cover a
+            // throwing Changed subscriber either, because SetState runs before the first await and
+            // the catch is entered by the awaits' failures; the finally covers both.
             _inFlight = false;
         }
 

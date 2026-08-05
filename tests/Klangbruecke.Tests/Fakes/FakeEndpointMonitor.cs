@@ -23,13 +23,21 @@ namespace Klangbruecke.Tests.Fakes;
 public sealed class FakeEndpointMonitor : IAudioEndpointMonitor
 {
     private bool _present;
+    private int _presenceReads;
+    private int _lastReadThreadId;
 
     /// <summary>Settable directly for the "it was already there" case, which needs no event.</summary>
     public bool SinkCaptureEndpointPresent
     {
         get
         {
-            PresenceReads++;
+            // Interlocked and Volatile, not ++ and a field. A consumer that keeps its promise to
+            // enumerate off the UI thread reads this from a threadpool thread, so an ordinary
+            // increment could lose a read and an ordinary write could stay invisible to the test
+            // thread - which would make the count that pins the cost either flaky or silently
+            // generous.
+            Interlocked.Increment(ref _presenceReads);
+            Volatile.Write(ref _lastReadThreadId, Environment.CurrentManagedThreadId);
             return _present;
         }
 
@@ -45,7 +53,16 @@ public sealed class FakeEndpointMonitor : IAudioEndpointMonitor
     /// and MMDevAPI's duplicate notifications multiply that by however many callbacks one cause
     /// produced. Nothing else can tell a consumer's tests that it happened.
     /// </summary>
-    public int PresenceReads { get; private set; }
+    public int PresenceReads => Volatile.Read(ref _presenceReads);
+
+    /// <summary>
+    /// The managed thread the last read ran on, or 0 if there has not been one.
+    ///
+    /// The only way a test can check the half of the cost rule that a count cannot express: the read
+    /// must not happen on the UI thread. A consumer that cached correctly but still enumerated on the
+    /// message-loop thread would satisfy every count in the suite and still freeze the tray.
+    /// </summary>
+    public int LastReadThreadId => Volatile.Read(ref _lastReadThreadId);
 
     public event EventHandler? EndpointsChanged;
 
