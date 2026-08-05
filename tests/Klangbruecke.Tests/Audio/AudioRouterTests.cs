@@ -299,6 +299,47 @@ public sealed class AudioRouterTests : IDisposable
         Assert.Empty(reported);
     }
 
+    // ---- The trap that replaced the sender contract ----------------------------------------------
+    //
+    // Beyond the seventeen the plan names, and the reason the two above can exist at all. The router
+    // used to identify the endpoint by the event's own sender, which made the adapters' re-raises a
+    // contract no compiler checked: turning `(_, e) => X?.Invoke(this, e)` into
+    // `(s, e) => X?.Invoke(s, e)` compiled, kept every test green, and disabled teardown on hardware,
+    // because the guard would then be comparing a WasapiCapture against the adapter holding it. No
+    // fake could catch that - a fake replaces the adapter wholesale and raises with `this` by
+    // construction - so the contract was deleted rather than tested. These two are what stop it
+    // coming back: read the sender again and they go red.
+
+    [Fact]
+    public void A_capture_stopped_event_tears_down_whatever_sender_it_carries()
+    {
+        var ui = new DeferringUiDispatcher();
+        var factory = new FakeAudioDeviceFactory();
+        using var router = new AudioRouter(ui, factory);
+        (FakeCaptureSource capture, _) = Start(router, factory);
+
+        capture.RaiseRecordingStopped(new InvalidOperationException("capture died"), sender: new object());
+
+        Assert.Single(ui.Captured);
+        Assert.Equal(1, ui.Drain());
+        Assert.False(router.IsRunning);
+    }
+
+    [Fact]
+    public void A_playback_stopped_event_tears_down_whatever_sender_it_carries()
+    {
+        var ui = new DeferringUiDispatcher();
+        var factory = new FakeAudioDeviceFactory();
+        using var router = new AudioRouter(ui, factory);
+        (_, FakeRenderSink sink) = Start(router, factory);
+
+        sink.RaisePlaybackStopped(new InvalidOperationException("output died"), sender: new object());
+
+        Assert.Single(ui.Captured);
+        Assert.Equal(1, ui.Drain());
+        Assert.False(router.IsRunning);
+    }
+
     // ---- Properties 3 and 4 together: one death, or two, is still one teardown -------------------
 
     [Fact]

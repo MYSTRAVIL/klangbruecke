@@ -83,9 +83,13 @@ public sealed class FakeCaptureSource : ICaptureSource
     public void RaiseDataAvailable(byte[] buffer)
         => DataAvailable?.Invoke(this, new WaveInEventArgs(buffer, buffer.Length));
 
-    /// <summary>Sender is <c>this</c>, and nothing reads it. See <see cref="ICaptureSource"/>.</summary>
-    public void RaiseRecordingStopped(Exception? exception = null)
-        => (_held ?? RecordingStopped)?.Invoke(this, new StoppedEventArgs(exception));
+    /// <summary>
+    /// Raises the stopped event. <paramref name="sender"/> defaults to <c>this</c>, which is what a
+    /// well-behaved implementation would pass - and it can be overridden precisely because nothing
+    /// downstream is allowed to depend on it. See <see cref="ICaptureSource"/>.
+    /// </summary>
+    public void RaiseRecordingStopped(Exception? exception = null, object? sender = null)
+        => (_held ?? RecordingStopped)?.Invoke(sender ?? this, new StoppedEventArgs(exception));
 }
 
 /// <summary>
@@ -155,8 +159,9 @@ public sealed class FakeRenderSink : IRenderSink
         }
     }
 
-    public void RaisePlaybackStopped(Exception? exception = null)
-        => (_held ?? PlaybackStopped)?.Invoke(this, new StoppedEventArgs(exception));
+    /// <summary>See <see cref="FakeCaptureSource.RaiseRecordingStopped"/> on the sender.</summary>
+    public void RaisePlaybackStopped(Exception? exception = null, object? sender = null)
+        => (_held ?? PlaybackStopped)?.Invoke(sender ?? this, new StoppedEventArgs(exception));
 }
 
 /// <summary>
