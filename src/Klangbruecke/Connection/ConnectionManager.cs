@@ -29,9 +29,15 @@ namespace Klangbruecke.Connection;
 /// thread.
 ///
 /// <b>Never add <c>ConfigureAwait(false)</c> to anything in here or in the two halves.</b> It reads
-/// like a tidy-up and it is the one token that takes the whole design apart: the continuation moves
-/// to whichever thread answered the radio, and four machines that hold no lock start sharing state
-/// across threads. <c>A_reconcile_resumes_on_the_context_that_started_it</c> is what goes red.
+/// like a tidy-up and it is the one token that takes the whole design apart: the continuation leaves
+/// the UI thread - for the threadpool, not for the answering thread, because the runtime refuses to
+/// inline a suppressed continuation while a custom <c>SynchronizationContext</c> is installed - and
+/// four machines that hold no lock start sharing state across threads.
+///
+/// Twelve of the fourteen awaits in these three classes have a named test that goes red for it; the
+/// six are in <c>ConnectionManagerTests</c> under "the captured context", which maps every site to its
+/// test and names the two it cannot cover and why. Do not read the prohibition as covered by one test:
+/// an earlier version of this comment did, and it was true of one await out of fourteen.
 ///
 /// <b>What it does not do.</b> It never reads <c>ICallTransportService.IsRegistered</c>: that is a
 /// live CsWinRT ABI call, and a throw out of a timer callback reaches

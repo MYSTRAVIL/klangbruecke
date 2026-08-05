@@ -13,8 +13,17 @@ namespace Klangbruecke.Tests.Fakes;
 /// <see cref="SynchronizationContext"/> the continuation runs inline on the test thread either way and
 /// no assertion can tell the two apart.
 ///
-/// Installing this makes them tell apart. A read completed from another thread posts its continuation
-/// here when the context was captured, and runs it on the completing thread when it was not.
+/// Installing this makes them tell apart, and in two different ways depending on the await. A seam
+/// answered from another thread posts its continuation here when the context was captured and runs it
+/// on the answering thread when it was not. An await further up the chain has nothing to answer it
+/// from another thread - but installing a custom context also stops the runtime inlining a suppressed
+/// continuation at all (<c>AwaitTaskContinuation.IsValidLocationForInlining</c> refuses while one is
+/// current), so that one goes to the threadpool. Both are off the turn's own thread, which is what the
+/// tests assert on.
+///
+/// <b>What it does not cover:</b> two tail awaits whose whole continuation is
+/// <c>ConnectionManager.FinishTurn</c>, which is idempotent and level-triggered by design and so
+/// produces the same answer whichever thread runs it. See the map in <c>ConnectionManagerTests</c>.
 ///
 /// <b>Not thread-safe by accident.</b> <see cref="Post"/> is called from whichever thread completes
 /// the work, and <see cref="Drain"/> from the test thread, so the queue is locked. That is the one
@@ -56,6 +65,14 @@ public sealed class RecordingSynchronizationContext : SynchronizationContext
     /// <see cref="Post"/>'s blocking twin, and it queues rather than running inline for the same
     /// reason: a continuation that reached this object at all is the fact being measured, and running
     /// one here on the caller's thread would be the very thing the assertion is looking for.
+    ///
+    /// <b>That breaks <see cref="SynchronizationContext.Send"/>'s contract, which is to have completed
+    /// the callback by the time it returns</b>, and it is deliberate rather than an oversight - but a
+    /// caller cannot tell. Nothing on the paths these tests drive uses <c>Send</c>: an <c>await</c>
+    /// continuation is always <c>Post</c>, and the app's own marshalling goes through
+    /// <c>IUiDispatcher</c>. A future test that does use <c>Send</c> and expects the work to have
+    /// happened will get silently deferred work rather than a failure, so give this an override that
+    /// runs inline - or a separate double - before reaching for it.
     /// </summary>
     public override void Send(SendOrPostCallback d, object? state) => Post(d, state);
 

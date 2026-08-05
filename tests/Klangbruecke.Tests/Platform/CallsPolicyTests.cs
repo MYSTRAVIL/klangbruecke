@@ -81,6 +81,17 @@ public sealed class CallsPolicyTests
     }
 
     // --- how far a verdict lets a run go (was CallTransportPlan, folded in here) ---
+    //
+    // <b>ShouldEnumerate and ShouldRegister have had no caller since Task 17.</b> Their only one was
+    // TrayContext.ConnectCallsAsync, and the connect path is CallsHalf's now - which asks neither. The
+    // tests below still pin the rule and are worth keeping for that, because the rule is what the fix
+    // needs; but read every "does", "costs" and "still enumerates" in them as a description of the
+    // rule, not of the running app.
+    //
+    // What the app actually does today: an unpackaged run attempts RegisterApp, fails, backs off and
+    // retries at the 60 s ceiling for the life of the process, because ShouldRegister is exactly the
+    // gate that used to stop it. The banner on CallsPolicy.ShouldEnumerate carries the whole story and
+    // the fix; this note exists because a reader who lands here first would otherwise get the old one.
 
     [Fact]
     public void Enabled_DoesBothSteps()
@@ -91,8 +102,10 @@ public sealed class CallsPolicyTests
 
     // The departure from the plan text, pinned because reverting it is a one-line change that looks
     // like a tidy-up. Discovery was verified to work with no package identity; only RegisterApp needs
-    // the restricted capability. Skipping enumeration as well would cost every development run the one
+    // the restricted capability. Skipping enumeration as well would cost a development run the one
     // calls-side fact it can establish - whether the phone's transport is discoverable at all.
+    //
+    // Conditional, not current: nothing consults either verdict today. See the note above.
     [Fact]
     public void NoPackageIdentity_StillEnumerates_ButDoesNotRegister()
     {

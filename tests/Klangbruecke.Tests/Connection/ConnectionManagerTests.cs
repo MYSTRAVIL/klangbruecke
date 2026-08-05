@@ -1137,26 +1137,76 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
     }
 
+    // --- the captured context: one test per await a foreign thread can complete ------------------
+    //
+    // <b>What makes four state machines correct with no lock between them is that every await in
+    // ConnectionManager, MusicHalf and CallsHalf resumes on the thread the turn started on.</b> Two
+    // independent things have to hold for that.
+    //
+    // The first is that the UI thread carries a SynchronizationContext at all. In the app that is the
+    // WinForms one, installed by ControlUiDispatcher's marshalling control, and
+    // UiDispatcherTests.Control_InstallsTheWinFormsSynchronizationContextOnTheThreadThatBuildsIt pins
+    // it. Nothing here covers that leg.
+    //
+    // The second is that nothing on these paths calls ConfigureAwait(false) - one token that looks
+    // like a tidy-up and silently moves the continuation onto whichever thread answered the radio.
+    // Until these tests existed the whole suite was blind to it: every double answered instantly, and
+    // an await on an already-completed task runs its continuation inline whether the context was
+    // captured or not.
+    //
+    // <b>There are fourteen awaits across the three classes, and the six tests below cover twelve of
+    // them.</b> The map is written out because a prohibition that names a test has to be checkable,
+    // and the first version of this section claimed one test covered "the pass end to end" when it
+    // deferred exactly one seam.
+    //
+    // Five await a seam - a task some other thread completes - and get a test each:
+    //
+    //   ConnectionManager.ReconcileAsync            _linkMonitor.ReadLinkStatusAsync()   test 1
+    //   ConnectionManager.OnGraceWindowElapsedAsync _linkMonitor.ReadLinkStatusAsync()   test 2
+    //   MusicHalf.ConnectAsync                      _sink.ConnectAsync(deviceId)         test 3
+    //   CallsHalf.RegisterAsync                     _calls.FindTransportsAsync()         test 4
+    //   CallsHalf.RegisterAsync                     _calls.ConnectAsync(transport.Id)    test 5
+    //
+    // Seven more await a Task produced by one of our own async methods, and they are covered too -
+    // MusicHalf.OnLinkPresentAsync's `await ConnectAsync()` and ConnectHalvesAsync's first await by
+    // test 3; StillOurs's `await step` and the four `await StillOurs(...)` call sites by test 6.
+    //
+    // <b>This was nearly got wrong in the obvious direction.</b> The intuition is that an inner await
+    // returns to this thread first, so an outer one is awaiting a task that completes here and resumes
+    // inline regardless. That is false under a custom SynchronizationContext:
+    // AwaitTaskContinuation.IsValidLocationForInlining refuses to inline while one is installed, so a
+    // ConfigureAwait(false) continuation goes to the <em>threadpool</em> instead - which is the app's
+    // situation exactly, since WindowsFormsSynchronizationContext is installed. Measured by mutating
+    // all nine internal awaits at once and watching test 3 go red.
+    //
+    // <b>The two that no test can cover, named rather than glossed:</b> ConnectHalvesAsync's second
+    // await and RegisterCallsAsync's. Both are tails whose entire continuation is FinishTurn() -
+    // EnforceConnectPermission plus Publish - and FinishTurn's own summary establishes that as
+    // level-triggered and idempotent, recomputed from current state. So a mutant there changes no
+    // outcome in any reachable arrangement and nothing can assert on it. What it would still cost is
+    // real, and it is a data race rather than a wrong answer: those two reads would be happening on a
+    // threadpool thread beside a UI thread that holds no lock.
+
     /// <summary>
-    /// <b>Every await in a pass resumes on the thread the pass started on</b> - which is the whole of
-    /// what makes four state machines with no lock between them correct.
+    /// Drives the manager until a turn is parked on one seam await, answers that seam from a worker
+    /// thread, and asserts that nothing the turn did afterwards happened on that worker.
     ///
-    /// Two things have to be true for that, and only one of them had anything going red. The first is
-    /// that the UI thread carries a <see cref="SynchronizationContext"/> at all; in the app that is
-    /// the WinForms one, installed by <c>ControlUiDispatcher</c>'s marshalling control, and
-    /// <c>UiDispatcherTests</c> pins it. The second is that <b>nothing on these paths calls
-    /// <c>ConfigureAwait(false)</c></b> - a one-token change that looks like a tidy-up and silently
-    /// moves the continuation onto whichever thread answered. Nothing in the suite could see it: every
-    /// double answers instantly, so the continuation runs inline on the test thread with or without a
-    /// captured context.
+    /// <b>The assertion is the thread every announcement was raised on, and getting there took a
+    /// surviving mutant.</b> The obvious measure - "was the continuation posted back to this
+    /// context?" - is not sufficient, because a <c>ConfigureAwait(false)</c> deep inside a half lets
+    /// the half's own continuation run on the completing thread and the <em>next</em> await up the
+    /// chain marshals back anyway. The post arrives; the state was still mutated on the worker on the
+    /// way there. So this measures where the work ran, not where it ended up.
     ///
-    /// This makes the difference observable. The link read is held open, answered from a worker
-    /// thread, and the continuation is then either posted back here - captured - or run on the worker.
-    /// The reconcile's link read is the deepest await in the class and the four below it are reached
-    /// only through it, so this covers the pass end to end.
+    /// The join is what makes it deterministic: by the time <c>SetResult</c> has returned, the
+    /// continuation has either been queued here or been run on the worker, and the two are
+    /// distinguishable without waiting for anything.
     /// </summary>
-    [Fact]
-    public void A_reconcile_resumes_on_the_context_that_started_it()
+    private static void AssertResumesOnTheStartingContext(
+        Action<Harness> parkOnTheSeam,
+        Action<Harness> answerFromAnotherThread,
+        Action<Harness> assertTheTurnFinished,
+        Func<Harness>? build = null)
     {
         SynchronizationContext? original = SynchronizationContext.Current;
         var context = new RecordingSynchronizationContext();
@@ -1164,40 +1214,169 @@ public sealed class ConnectionManagerTests : IDisposable
 
         try
         {
-            using Harness h = new();
+            int startingThread = Environment.CurrentManagedThreadId;
 
-            // The pass starts on this thread, with this context current, and parks on the link read.
-            h.Link.DeferRead = true;
-            h.Scheduler.Advance(Seconds(30));
+            // Built inside the context, so the manager's own turns capture it from the start.
+            using Harness h = build is null ? new Harness() : build();
 
-            int posts = context.PostCount;
+            parkOnTheSeam(h);
+
+            // Nothing queued yet, so the drain below can only be running the continuation this test
+            // is about.
             Assert.Equal(0, context.PendingCount);
+            int announced = h.AnnouncedOn.Count;
 
-            // Answered from somewhere else entirely. Joined, so the assertion below cannot race: the
-            // continuation is either posted or run by the time SetResult returns.
-            var worker = new Thread(() => h.Link.CompleteRead(BluetoothLinkStatus.Connected));
+            var worker = new Thread(() => answerFromAnotherThread(h));
             worker.Start();
             worker.Join();
 
-            // Posted, not run. A ConfigureAwait(false) anywhere above leaves this at zero, because the
-            // worker thread would have carried the rest of the pass itself.
-            Assert.Equal(posts + 1, context.PostCount);
-
-            // And the state has not moved yet, which is the other half of "not run": the pass is
-            // sitting in this queue, not finished on the worker.
-            Assert.Equal(ConnectionState.Discovering, h.Manager.State);
-
-            // Draining is the message loop's job, and doing it here carries the rest of the pass -
-            // four more awaits, all on completed tasks - through to the end on this thread.
+            // Draining is the message loop's job. Doing it here carries the rest of the turn through
+            // on this thread.
             context.Drain();
 
-            Assert.Equal(ConnectionState.Connected, h.Manager.State);
+            assertTheTurnFinished(h);
+
+            // Non-vacuity first: the turn has to have got far enough to announce something, or the
+            // check below is quantifying over an empty set.
+            Assert.True(
+                h.AnnouncedOn.Count > announced,
+                "the parked turn announced nothing after being answered, so this test proves nothing");
+
+            // And every one of them on this thread. A ConfigureAwait(false) at the seam puts the
+            // worker's id in here, because the half carries on there and raises Changed from it.
+            Assert.All(h.AnnouncedOn, id => Assert.Equal(startingThread, id));
         }
         finally
         {
             SynchronizationContext.SetSynchronizationContext(original);
         }
     }
+
+    /// <summary>Seam await 1: the reconcile's link status read, the deepest await in the class.</summary>
+    [Fact]
+    public void A_reconcile_resumes_on_the_context_that_started_it()
+    {
+        AssertResumesOnTheStartingContext(
+            h =>
+            {
+                h.Link.DeferRead = true;
+                h.Scheduler.Advance(Seconds(30));
+
+                // Parked: the pass has asked the radio and gone no further.
+                Assert.Equal(ConnectionState.Discovering, h.Manager.State);
+            },
+            h => h.Link.CompleteRead(BluetoothLinkStatus.Connected),
+            h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
+    }
+
+    /// <summary>
+    /// Seam await 2: the grace window's own link read.
+    ///
+    /// Separate from the reconcile's, and not covered by it: it is a different <c>await</c> in a
+    /// different method, reached from a scheduler callback rather than from a pass. It is also the one
+    /// read in the class whose answer decides deliberate-versus-out-of-range, so a continuation that
+    /// wandered onto a worker thread would drive the suppression latch from off the UI thread.
+    /// </summary>
+    [Fact]
+    public void A_grace_window_resumes_on_the_context_that_started_it()
+    {
+        AssertResumesOnTheStartingContext(
+            h =>
+            {
+                h.ReachRouting();
+
+                h.Link.DeferRead = true;
+                h.Sink.PublishState(AudioSinkConnectionState.Closed);
+                h.Scheduler.Advance(Grace);
+
+                // Parked: the window has fired and is waiting on the radio, so nothing is decided.
+                Assert.Equal(ConnectionState.Connected, h.Manager.State);
+            },
+            h => h.Link.CompleteRead(BluetoothLinkStatus.Connected),
+
+            // The link was up, so the phone dropped the audio profile deliberately.
+            h => Assert.Equal(ConnectionState.Suppressed, h.Manager.State));
+    }
+
+    /// <summary>Seam await 3: <c>MusicHalf</c>'s connect, which awaits a radio round trip.</summary>
+    [Fact]
+    public void The_music_halfs_connect_resumes_on_the_context_that_started_it()
+    {
+        AssertResumesOnTheStartingContext(
+            h =>
+            {
+                h.Sink.DeferConnect = true;
+                h.Link.RaiseAppeared();
+
+                Assert.Equal(ConnectionState.Connecting, h.Manager.State);
+            },
+            h => h.Sink.CompleteConnect(connected: true),
+            h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
+    }
+
+    /// <summary>Seam await 4: <c>CallsHalf</c>'s transport enumeration.</summary>
+    [Fact]
+    public void The_calls_halfs_enumeration_resumes_on_the_context_that_started_it()
+    {
+        AssertResumesOnTheStartingContext(
+            h =>
+            {
+                h.Calls.DeferFind = true;
+                h.Link.RaiseAppeared();
+
+                // Music is already up; the calls half is parked mid-enumeration.
+                Assert.Equal(ConnectionState.Connecting, h.Manager.State);
+            },
+            h => h.Calls.CompleteFind(),
+            h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
+    }
+
+    /// <summary>Seam await 5: <c>CallsHalf</c>'s registration, the call that claims the role.</summary>
+    [Fact]
+    public void The_calls_halfs_registration_resumes_on_the_context_that_started_it()
+    {
+        AssertResumesOnTheStartingContext(
+            h =>
+            {
+                h.Calls.DeferConnect = true;
+                h.Link.RaiseAppeared();
+
+                Assert.Equal(ConnectionState.Connecting, h.Manager.State);
+            },
+            h => h.Calls.CompleteConnect(CallTransportResult.Claimed(true)),
+            h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
+    }
+
+    /// <summary>
+    /// The four <c>await StillOurs(...)</c> call sites and <c>StillOurs</c>'s own <c>await step</c>,
+    /// which the five tests above cannot reach.
+    ///
+    /// They are only reached from a reconcile pass, and in every scenario above the halves answer that
+    /// pass with an already-completed task - <c>ReconcileAsync</c> from <c>Off</c> returns
+    /// <c>Task.CompletedTask</c> - so the awaiter never registers a continuation and
+    /// <c>ConfigureAwait</c> has nothing to configure. Measured, not assumed: mutating those five sites
+    /// left all 83 tests green until this one existed.
+    ///
+    /// So this drives the connect from the <em>pass</em> rather than from a watcher edge, with the sink
+    /// held open. <c>StillOurs</c> then genuinely suspends, and so does the call site awaiting it.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_that_connects_a_half_resumes_on_the_context_that_started_it()
+    {
+        AssertResumesOnTheStartingContext(
+            h =>
+            {
+                // No watcher edge. The pass reads the link itself, finds the phone present, and is
+                // what calls into the half - so the connect is awaited through StillOurs.
+                h.Sink.DeferConnect = true;
+                h.Scheduler.Advance(Seconds(30));
+
+                Assert.Equal(ConnectionState.Connecting, h.Manager.State);
+            },
+            h => h.Sink.CompleteConnect(connected: true),
+            h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
+    }
+
 
     // --- what the tray is told -----------------------------------------------------------------
 
@@ -1877,9 +2056,23 @@ public sealed class ConnectionManagerTests : IDisposable
             Ui = ui ?? Marshaller!;
 
             Manager = new ConnectionManager(Settings, Sink, Calls, Router, Endpoints, Link, Scheduler, Power, Ui);
-            Manager.StateChanged += (_, state) => States.Add(state);
-            Manager.DetailChanged += (_, _) => Details.Add(Manager.Detail);
-            Manager.Status += (_, message) => Status.Add(message);
+            Manager.StateChanged += (_, state) =>
+            {
+                States.Add(state);
+                AnnouncedOn.Add(Environment.CurrentManagedThreadId);
+            };
+
+            Manager.DetailChanged += (_, _) =>
+            {
+                Details.Add(Manager.Detail);
+                AnnouncedOn.Add(Environment.CurrentManagedThreadId);
+            };
+
+            Manager.Status += (_, message) =>
+            {
+                Status.Add(message);
+                AnnouncedOn.Add(Environment.CurrentManagedThreadId);
+            };
 
             Manager.Start();
         }
@@ -1919,6 +2112,23 @@ public sealed class ConnectionManagerTests : IDisposable
         public List<string> Details { get; } = new();
 
         public List<StatusMessage> Status { get; } = new();
+
+        /// <summary>
+        /// The thread every announcement above was raised on, oldest first.
+        ///
+        /// The manager's contract is that <em>all</em> of them arrive on the one thread its turns run
+        /// on, and an announcement is the cheapest proof that state was touched: it is raised from
+        /// <c>Publish</c>, which recomputes from all four machines. So a foreign id in here is a turn
+        /// that carried on somewhere it should not have.
+        ///
+        /// This is what the captured-context tests assert on, and it replaced counting posts. Counting
+        /// posts cannot see the case that matters: a <c>ConfigureAwait(false)</c> deep in a half lets
+        /// the half's own continuation run on the completing thread, and the <em>next</em> await up the
+        /// chain then marshals back anyway - so the post arrives, and the state was still mutated off
+        /// the UI thread on the way there. Measured, not reasoned: that mutant survived the post-count
+        /// assertion.
+        /// </summary>
+        public List<int> AnnouncedOn { get; } = new();
 
         /// <summary>
         /// The phone walks into the room and both halves come up. The capture endpoint is not there

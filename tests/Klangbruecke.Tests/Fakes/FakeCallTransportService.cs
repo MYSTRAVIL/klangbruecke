@@ -27,6 +27,7 @@ namespace Klangbruecke.Tests.Fakes;
 public sealed class FakeCallTransportService : ICallTransportService
 {
     private readonly Queue<TaskCompletionSource<CallTransportResult>> _pending = new();
+    private readonly Queue<TaskCompletionSource<IReadOnlyList<TransportCandidate>>> _pendingFinds = new();
 
     /// <summary>Every transport id <see cref="ConnectAsync"/> was asked for, oldest first.</summary>
     public List<string> ConnectCalls { get; } = new();
@@ -45,6 +46,16 @@ public sealed class FakeCallTransportService : ICallTransportService
 
     /// <summary>When set, <see cref="FindTransportsAsync"/> throws it instead of answering.</summary>
     public Exception? FindThrows { get; set; }
+
+    /// <summary>
+    /// Holds every enumeration open until <see cref="CompleteFind"/> answers it.
+    ///
+    /// The real call is <c>DeviceInformation.FindAllAsync</c> against the radio, so this await is one
+    /// of the five in the connection layer that a foreign thread genuinely completes - and therefore
+    /// one of the five where whether the continuation comes back to the UI thread is decided rather
+    /// than inherited. See <c>ConnectionManagerTests</c>'s captured-context tests.
+    /// </summary>
+    public bool DeferFind { get; set; }
 
     /// <summary>
     /// What a connect that answers immediately reports. Defaults to the textbook success rather than
@@ -98,8 +109,18 @@ public sealed class FakeCallTransportService : ICallTransportService
             throw thrown;
         }
 
-        return Task.FromResult(Transports);
+        if (!DeferFind)
+        {
+            return Task.FromResult(Transports);
+        }
+
+        TaskCompletionSource<IReadOnlyList<TransportCandidate>> source = new();
+        _pendingFinds.Enqueue(source);
+        return source.Task;
     }
+
+    /// <summary>Answers the oldest enumeration still waiting. Throws if none is.</summary>
+    public void CompleteFind() => _pendingFinds.Dequeue().SetResult(Transports);
 
     public Task<CallTransportResult> ConnectAsync(string transportDeviceId)
     {

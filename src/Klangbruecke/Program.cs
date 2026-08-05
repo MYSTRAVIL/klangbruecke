@@ -89,7 +89,7 @@ internal static class Program
     /// Builds the seams, hands them to the one object that owns the connection lifecycle, and hands
     /// that to the tray.
     ///
-    /// <b>The order of these lines is behaviour, not style.</b> Three of them in particular:
+    /// <b>The order of these lines is behaviour, not style.</b> Four of them in particular:
     ///
     /// <list type="number">
     /// <item>The dispatcher is first. Constructing it creates a <c>Control</c>, and a Control's
@@ -101,10 +101,10 @@ internal static class Program
     /// <para>
     /// It is also one of the two things that make every <c>await</c> in <c>ConnectionManager</c>
     /// resume on the UI thread, which is what lets four state machines share it with no lock. The
-    /// other is that nothing on those paths calls <c>ConfigureAwait(false)</c>, and that is a separate
-    /// claim with a separate test -
-    /// <c>ConnectionManagerTests.A_reconcile_resumes_on_the_context_that_started_it</c>. Neither test
-    /// covers the other's leg; do not read one as evidence for both.
+    /// other is that nothing on those paths calls <c>ConfigureAwait(false)</c> - a separate claim,
+    /// with its own six tests under "the captured context" in <c>ConnectionManagerTests</c>, covering
+    /// twelve of the fourteen await sites. Neither leg is evidence for the other, and neither is
+    /// complete on its own; the test section names the two sites it cannot reach.
     /// </para></item>
     /// <item>The status subscriptions come after the presenter is constructed, never before. They
     /// used to be taken first and were safe only because nothing raised a status until the end of the
