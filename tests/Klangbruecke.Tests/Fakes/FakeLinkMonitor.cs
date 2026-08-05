@@ -21,6 +21,8 @@ namespace Klangbruecke.Tests.Fakes;
 /// </summary>
 public sealed class FakeLinkMonitor : ILinkMonitor
 {
+    private readonly Queue<TaskCompletionSource<BluetoothLinkStatus>> _pending = new();
+
     /// <summary>Every device id <see cref="Watch"/> was asked for, oldest first.</summary>
     public List<string> WatchCalls { get; } = new();
 
@@ -60,11 +62,32 @@ public sealed class FakeLinkMonitor : ILinkMonitor
         DevicePresent = false;
     }
 
+    /// <summary>
+    /// Holds every read open until <see cref="CompleteRead"/> answers it.
+    ///
+    /// The real read awaits WinRT against a radio, and the window between asking and being answered
+    /// is the only one in which a second reconcile - a phone picked, a resume, the 30 s tick - can
+    /// land on top of the first. A double that always answered before it returned would make that
+    /// window unrepresentable.
+    /// </summary>
+    public bool DeferRead { get; set; }
+
     public Task<BluetoothLinkStatus> ReadLinkStatusAsync()
     {
         ReadCount++;
-        return Task.FromResult(Status);
+
+        if (!DeferRead)
+        {
+            return Task.FromResult(Status);
+        }
+
+        TaskCompletionSource<BluetoothLinkStatus> source = new();
+        _pending.Enqueue(source);
+        return source.Task;
     }
+
+    /// <summary>Answers the oldest read still waiting. Throws if none is.</summary>
+    public void CompleteRead(BluetoothLinkStatus status) => _pending.Dequeue().SetResult(status);
 
     /// <summary>The watcher saw the phone.</summary>
     public void RaiseAppeared()

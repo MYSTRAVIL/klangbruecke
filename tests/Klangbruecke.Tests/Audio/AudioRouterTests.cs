@@ -59,6 +59,27 @@ public sealed class AudioRouterTests : IDisposable
             .Select(e => e.Message)
             .ToList();
 
+    // The tray's Output menu asks the router rather than holding a factory of its own, so that
+    // nothing above this class ever names a WASAPI type. A pass-through, and it still needs an
+    // assertion: returned empty instead, the menu would silently offer nothing but "System default"
+    // and the user would have no way to tell that from a machine with one sound card.
+    [Fact]
+    public void ListOutputs_comes_from_the_factory()
+    {
+        var factory = new FakeAudioDeviceFactory
+        {
+            Outputs = new[]
+            {
+                new AudioOutputDevice("{0.0.0.00000000}.{aaaa}", "Speakers"),
+                new AudioOutputDevice("{0.0.0.00000000}.{bbbb}", "Headset"),
+            },
+        };
+
+        using var router = new AudioRouter(Inline(), factory);
+
+        Assert.Equal(factory.Outputs, router.ListOutputs());
+    }
+
     // ---- Property 1: the session is published before StartRecording and Play ---------------------
 
     [Fact]

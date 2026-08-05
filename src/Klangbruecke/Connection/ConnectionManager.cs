@@ -86,11 +86,20 @@ public sealed class ConnectionManager : IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// True for the duration of a reconcile pass. A forced pass - a phone picked, a resume, the
-    /// setting coming back on - can land on top of the periodic one, and the second would read a link
-    /// status the first is still acting on.
+    /// When the pass currently running started, or null when none is.
+    ///
+    /// A pass has four awaits in it and the link read is a real round trip to a radio, so a forced
+    /// pass - a phone picked, a resume, the setting coming back on - can land on top of the periodic
+    /// one. Two interleaved passes would each decide against a link status the other is still acting
+    /// on, and both would open a grace window against the same closed connection.
+    ///
+    /// A time rather than a bool, and the difference is the whole reason this app exists. A read that
+    /// never completes would leave a bool set for the life of the process and silently stop the only
+    /// backstop the app has - an app that is wrong forever with nothing to correct it, which is the
+    /// predecessor's defining bug rebuilt out of a mutex. A pass that has been running longer than
+    /// the interval between passes has stopped being one to defer to.
     /// </summary>
-    private bool _reconciling;
+    private DateTimeOffset? _reconcilingSince;
 
     /// <summary>
     /// The user picked a phone and what they picked is not yet delivering.
@@ -490,8 +499,15 @@ public sealed class ConnectionManager : IDisposable
     ///
     /// The one handler that does not post first, and the exception is the point. What must reach the
     /// UI thread is a bool; what must never run on it is the read that produces one. So the read
-    /// happens here, on whichever thread the OS raised this on, and only its answer is posted -
-    /// which is also why the gate is <see cref="Interlocked"/> rather than a plain flag.
+    /// happens here, on whichever thread the OS raised this on - measured as MMDevAPI's own worker
+    /// threads, never the registering one - and only its answer is posted. That is also why the gate
+    /// is <see cref="Interlocked"/> rather than a plain flag.
+    ///
+    /// One raise is on the UI thread, and it is worth naming rather than glossing:
+    /// <c>EndpointMonitor.Start</c> reports an already-present endpoint by raising this from inside
+    /// itself, on the thread that called it. That costs one enumeration on the startup path - where
+    /// that class has just done the identical read, one line earlier, on the same thread - before the
+    /// tray icon has a menu to freeze. Every later read is off this thread.
     /// </summary>
     private void OnEndpointsChanged(object? sender, EventArgs e)
     {
@@ -581,12 +597,18 @@ public sealed class ConnectionManager : IDisposable
 
     private async Task ReconcileAsync(string trigger)
     {
-        if (_disposed || _reconciling)
+        if (_disposed)
         {
             return;
         }
 
-        _reconciling = true;
+        if (_reconcilingSince is { } running && _scheduler.Now - running < ReconcilePeriod)
+        {
+            return;
+        }
+
+        DateTimeOffset startedAt = _scheduler.Now;
+        _reconcilingSince = startedAt;
 
         try
         {
@@ -638,10 +660,25 @@ public sealed class ConnectionManager : IDisposable
 
             EnforceConnectPermission();
             ReportDrift(before, trigger);
+
+            // Deliberately no timeout on a half stuck in Connecting or Registering, and CallsHalf's
+            // note about "a reconcile-side timeout question" is answered here: no. The only lever
+            // this class has is a teardown, and a teardown disposes the WinRT connection object
+            // underneath an OpenAsync that has not returned - which is the class of call that takes
+            // the process out rather than failing (FINDINGS.md section 8). Both seams' shipping
+            // implementations catch their own throws and always complete, so "never completes" means
+            // the radio stack is wedged, and the honest report for that is a tray that goes on saying
+            // "connecting music" - visible, diagnosable, and not a crash.
         }
         finally
         {
-            _reconciling = false;
+            if (_reconcilingSince == startedAt)
+            {
+                // Only if it is still ours. A pass that was given up on and has now finally answered
+                // must not clear the marker of the one that replaced it - the same reason the halves
+                // capture a generation before their own awaits.
+                _reconcilingSince = null;
+            }
         }
     }
 

@@ -220,15 +220,25 @@ public sealed class ConnectionManagerTests : IDisposable
     /// over a route that is not running. Without this the tray reads "music and calls up" over
     /// silence until the reconcile notices, up to 30 s later.
     /// </summary>
-    [Fact]
-    public void Selecting_an_output_that_cannot_start_returns_the_half_to_waiting()
+    /// <param name="startResult">
+    /// Both ways a start can fail, because they are not the same failure. The false is the ordinary
+    /// one; the true is the measured lie - <c>AudioRouter.Start</c> returns true for a capture that
+    /// died inside <c>StartRecording</c>, because the capture thread dies asynchronously - and a
+    /// caller that believed the bool would leave the half claiming Up over silence.
+    /// </param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Selecting_an_output_that_cannot_start_returns_the_half_to_waiting(bool startResult)
     {
         using Harness h = new();
         h.ReachRouting();
-        h.Router.StartResult = false;
+        h.Router.StartResult = startResult;
+        h.Router.StartLeavesItRunning = false;
 
         h.Manager.SelectOutput(OtherOutputId);
 
+        Assert.False(h.Router.IsRunning);
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
         Assert.Equal("waiting for phone audio", h.Manager.Detail);
     }
@@ -362,6 +372,63 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal("waiting for phone audio", h.Manager.Detail);
     }
 
+    /// <summary>
+    /// The other half of the same asymmetry: music goes, registration stays. Holding the hands-free
+    /// role is what puts this PC in the phone's own call-audio picker, so it has to survive the phone
+    /// walking out - releasing it here costs the user the entry on a screen this app cannot see.
+    /// </summary>
+    [Fact]
+    public void The_phone_leaving_the_room_tears_music_down_and_leaves_calls_registered()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        h.Link.RaiseRemoved();
+
+        Assert.Equal(1, h.Sink.DisconnectCount);
+        Assert.False(h.Router.IsRunning);
+        Assert.Equal(0, h.Calls.DisconnectCount);
+        Assert.Equal(ConnectionState.Discovering, h.Manager.State);
+    }
+
+    /// <summary>
+    /// Finding #2, and the case that produced it: the capture endpoint tracks the phone's own A2DP
+    /// link and was measured Active before this app opened a connection at all. One route, not two -
+    /// a second start would tear the first down and restart it, which is a gap in the audio for
+    /// exactly the users whose endpoint was already there.
+    /// </summary>
+    [Fact]
+    public void An_endpoint_that_is_already_present_starts_exactly_one_route()
+    {
+        using Harness h = new();
+        h.Endpoints.SetPresent(true);
+
+        h.Link.RaiseAppeared();
+
+        Assert.Equal(new string?[] { OutputId }, h.Router.StartCalls);
+        Assert.True(h.Router.IsRunning);
+    }
+
+    /// <summary>
+    /// The preference has to reach the half as well as the live route, or the next start after any
+    /// drop - a call ending, a range exit and return - goes back to the output the user changed away
+    /// from, with nothing to say why.
+    /// </summary>
+    [Fact]
+    public void The_chosen_output_is_used_by_the_next_route_start_too()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+        h.Manager.SelectOutput(OtherOutputId);
+
+        // The route dies and the half brings it back on its own backoff. The manager is not involved.
+        h.Router.Die();
+        h.Scheduler.Advance(Seconds(2));
+
+        Assert.Equal(OtherOutputId, h.Router.StartCalls[^1]);
+        Assert.True(h.Router.IsRunning);
+    }
+
     // --- suppression ---------------------------------------------------------------------------
 
     [Fact]
@@ -408,6 +475,28 @@ public sealed class ConnectionManagerTests : IDisposable
 
         Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
         Assert.Single(h.Sink.ConnectCalls);
+    }
+
+    /// <summary>
+    /// A deliberate disconnect expires when the phone leaves and returns. The click grant must not
+    /// outlive it, or auto-reconnect off would be undone by a selection the user made minutes ago and
+    /// a Disconnect they made since.
+    /// </summary>
+    [Fact]
+    public void A_tray_disconnect_ends_a_click_initiated_grant()
+    {
+        using Harness h = new(phoneDeviceId: null, autoReconnect: false);
+        h.Sink.ConnectResult = false;
+        h.Manager.SelectPhone(PhoneId);
+        Assert.Single(h.Sink.ConnectCalls);
+
+        h.Manager.RequestDisconnect();
+
+        h.Link.RaiseRemoved();
+        h.Link.RaiseAppeared();
+
+        Assert.Single(h.Sink.ConnectCalls);
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
     }
 
     // --- the reconcile -------------------------------------------------------------------------
@@ -471,6 +560,79 @@ public sealed class ConnectionManagerTests : IDisposable
 
         h.Scheduler.Advance(Grace);
         Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+    }
+
+    /// <summary>
+    /// A pass has four awaits in it and the link read is a real round trip to the radio, so a forced
+    /// pass - a phone picked, a resume, the setting coming back on - can land on top of the periodic
+    /// one. Two interleaved passes would each decide against a link status the other is still acting
+    /// on, and both would open a grace window against the same closed connection.
+    ///
+    /// Nothing is lost by declining: the pass in flight resumes against whatever the settings say
+    /// when it comes back, which is the new phone.
+    /// </summary>
+    [Fact]
+    public void A_forced_reconcile_does_not_run_on_top_of_one_already_in_flight()
+    {
+        using Harness h = new();
+        h.Calls.Transports = new[] { PhoneTransport, OtherTransport };
+        h.Link.DeferRead = true;
+
+        h.Power.RaiseResumed();
+        h.Scheduler.Advance(Seconds(5));
+        Assert.Equal(1, h.Link.ReadCount);
+
+        h.Manager.SelectPhone(OtherPhoneId);
+        Assert.Equal(1, h.Link.ReadCount);
+
+        h.Link.CompleteRead(BluetoothLinkStatus.Connected);
+
+        Assert.Equal(new[] { OtherPhoneId }, h.Sink.ConnectCalls);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    /// <summary>
+    /// And it defers to a pass in flight, not to one that has stopped answering. A read that never
+    /// completes would otherwise hold the guard for the life of the process and stop the only
+    /// backstop the app has - which is the predecessor's defining bug rebuilt out of a mutex.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_that_never_answers_does_not_stop_the_loop()
+    {
+        using Harness h = new();
+        h.Link.DeferRead = true;
+
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(1, h.Link.ReadCount);
+
+        // The tick at 60 s finds the pass from 30 s still waiting, and one whole period is long
+        // enough to call it gone.
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(2, h.Link.ReadCount);
+    }
+
+    /// <summary>
+    /// And a pass that was given up on and has now finally answered must not hand its replacement's
+    /// place away on the way out. The overlap this whole guard exists to prevent would then happen
+    /// anyway, in the one case where two passes really are running at once.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_that_was_given_up_on_does_not_release_its_replacement()
+    {
+        using Harness h = new();
+        h.Link.DeferRead = true;
+
+        h.Scheduler.Advance(Seconds(30));
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(2, h.Link.ReadCount);
+
+        // The first pass answers at last, while the second is still waiting on its own read.
+        h.Link.CompleteRead(BluetoothLinkStatus.Connected);
+
+        h.Power.RaiseResumed();
+        h.Scheduler.Advance(Seconds(5));
+
+        Assert.Equal(2, h.Link.ReadCount);
     }
 
     // --- resume --------------------------------------------------------------------------------
@@ -670,6 +832,36 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(5, h.States.Count);
     }
 
+    /// <summary>
+    /// Three ways the audio can stop and three different things for the user to do about them. The
+    /// reported state is <c>Suppressed</c> for two of them and <c>Discovering</c> for the third, which
+    /// is not enough on its own: "the phone dropped the audio connection" is something to fix on the
+    /// handset, and "out of range" is something to fix by walking back.
+    /// </summary>
+    [Fact]
+    public void Status_names_what_ended_the_connection()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        h.Manager.RequestDisconnect();
+        Assert.Equal("Disconnected.", h.Status[^1].Text);
+
+        h.Link.RaiseRemoved();
+        h.Link.RaiseAppeared();
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+        Assert.Equal("The phone dropped the audio connection.", h.Status[^1].Text);
+
+        h.Link.RaiseAppeared();
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+        Assert.Equal("The phone is out of range.", h.Status[^1].Text);
+
+        Assert.All(h.Status, message => Assert.Equal(LogLevel.Info, message.Level));
+    }
+
     [Fact]
     public void Every_inbound_event_is_posted_through_the_dispatcher()
     {
@@ -830,6 +1022,29 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(0, h.Scheduler.PendingCount);
     }
 
+    /// <summary>
+    /// Neither half is <see cref="IDisposable"/>, and each can be holding a scheduler handle when the
+    /// tray exits. A handle left armed fires a connect or a registration into a manager that has
+    /// disposed every seam under it.
+    /// </summary>
+    [Fact]
+    public void Dispose_leaves_no_retry_armed()
+    {
+        Harness h = new();
+        h.Sink.ConnectResult = false;
+        h.Calls.ConnectResult = CallTransportResult.NotClaimed("the role was not claimed");
+
+        h.Link.RaiseAppeared();
+        Assert.Equal(ConnectionState.RetryBackoff, h.Manager.State);
+
+        // The reconcile tick plus one retry per half - so the assertion below has something to prove.
+        Assert.Equal(3, h.Scheduler.PendingCount);
+
+        h.Manager.Dispose();
+
+        Assert.Equal(0, h.Scheduler.PendingCount);
+    }
+
     [Fact]
     public void Dispose_is_idempotent()
     {
@@ -859,6 +1074,26 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Power.RaiseResumed();
         h.Scheduler.Advance(Seconds(95));
 
+        Assert.Empty(h.Sink.ConnectCalls);
+        Assert.Empty(h.Calls.ConnectCalls);
+    }
+
+    /// <summary>
+    /// The case the unsubscribes in <c>Dispose</c> cannot cover, and the reason the disposal check
+    /// lives on the far side of the hop: the real dispatcher marshals with <c>BeginInvoke</c>, so an
+    /// edge raised on WinRT's thread a moment before the tray exits is already queued and arrives
+    /// afterwards. Acting on it reopens the connection the teardown has just closed.
+    /// </summary>
+    [Fact]
+    public void An_event_posted_before_Dispose_does_nothing_when_it_arrives_after()
+    {
+        DeferringUiDispatcher ui = new();
+        Harness h = new(ui: ui);
+
+        h.Link.RaiseAppeared();
+        h.Manager.Dispose();
+
+        Assert.Equal(1, ui.Drain());
         Assert.Empty(h.Sink.ConnectCalls);
         Assert.Empty(h.Calls.ConnectCalls);
     }
