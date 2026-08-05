@@ -44,6 +44,27 @@ public sealed class WasapiDeviceFactory : IAudioDeviceFactory
             .ToList();
     }
 
+    /// <summary>
+    /// Is that endpoint there right now?
+    ///
+    /// Here rather than in <see cref="EndpointMonitor"/> so there is exactly one definition of what
+    /// "the endpoint" is. <see cref="AudioRouter"/> and this factory already agree on it; a third copy
+    /// of "friendly name contains A2DP or SNK" living in the monitor is how the app would start
+    /// reporting an endpoint present that the router then cannot open, or the reverse.
+    ///
+    /// Costly, and the caller has to know it: a full <c>EnumerateAudioEndPoints</c>, measured at
+    /// <b>152-282 ms</b> on this machine. Never call it from an <c>IMMNotificationClient</c> callback.
+    ///
+    /// The device is disposed, unlike in <see cref="CreateSinkCapture"/>, where it is handed to a
+    /// <see cref="WasapiCapture"/> that owns it from then on. Nothing here outlives the answer.
+    /// </summary>
+    public static bool IsSinkCaptureEndpointPresent()
+    {
+        using MMDevice? device = FindSinkCaptureEndpoint();
+
+        return device is not null;
+    }
+
     /// <summary>The capture endpoint Windows creates while an A2DP sink connection is open.</summary>
     private static MMDevice? FindSinkCaptureEndpoint()
     {
