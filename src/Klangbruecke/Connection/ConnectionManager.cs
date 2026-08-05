@@ -37,7 +37,7 @@ namespace Klangbruecke.Connection;
 /// refuses to inline while a custom context is installed, which is always the case on the UI thread.
 ///
 /// Eleven of the fourteen awaits in these three classes have a named test that goes red for that site
-/// alone; the eight are in <c>ConnectionManagerTests</c> under "the captured context", which maps
+/// alone; the eight tests are in <c>ConnectionManagerTests</c> under "the captured context", which maps
 /// every site to its test and names the three it cannot cover and why. Do not read the prohibition as
 /// covered by one test, and do not read an aggregate mutant as covering the sites inside it: earlier
 /// versions of this comment did both.
@@ -307,8 +307,9 @@ public sealed class ConnectionManager : IDisposable
 
         // After subscribing, because the already-present case is reported by raising EndpointsChanged
         // from inside Start and a handler attached afterwards would miss it - which is finding #2
-        // exactly: the endpoint tracks the phone's own A2DP link and is routinely there before this
-        // app connects at all.
+        // exactly: the endpoint's lifetime is not this app's connection's, and it is routinely there
+        // before this app connects at all - measured Active before the connection was opened and
+        // still Active after the process was killed (docs/FINDINGS.md section 4).
         _endpoints.Start();
 
         _reconcileTimer = _scheduler.SchedulePeriodic(ReconcilePeriod, () => _ = ReconcileAsync("tick"));
@@ -371,6 +372,13 @@ public sealed class ConnectionManager : IDisposable
 
         _linkMachine.OnPhoneSelected();
         _linkMonitor.Watch(deviceId);
+
+        // The synchronous half of this click, repainted before anything is awaited. Handing off to
+        // the pass is not enough on its own: a pass that started under ReconcileStall ago returns
+        // without publishing, so reselecting the same phone while suppressed cleared the latch and
+        // repainted nothing. Refresh is idempotent and the pass publishes again at its end, so this
+        // costs one recompute and can announce nothing that is not already true.
+        Publish();
 
         // Through the reconcile rather than straight into a connect: the phone's presence is a
         // question only the radio can answer, the pass already asks it, and routing this through the
@@ -476,6 +484,11 @@ public sealed class ConnectionManager : IDisposable
         if (enabled)
         {
             _latch.OnAutoReconnectEnabled();
+
+            // The latch clearing is a reported change in its own right, and the pass below cannot be
+            // relied on to say so: one that started under ReconcileStall ago returns without
+            // publishing. See SelectPhone, which had the same hole for the same reason.
+            Publish();
 
             // Straight into a pass rather than waiting for the next tick. The user has just said
             // "come back"; a switch that appears to do nothing for half a minute is one they turn off
@@ -771,9 +784,41 @@ public sealed class ConnectionManager : IDisposable
                 return;
             }
 
-            _linkMachine.OnLinkStatusRead(status);
+            bool linkMoved = _linkMachine.OnLinkStatusRead(status);
             _latch.OnLinkState(_linkMachine.State);
 
+            if (linkMoved && _linkMachine.State == LinkState.Absent)
+            {
+                // The backstop actually reaching the half it exists for. This poll is the only thing
+                // that ever notices a range exit whose watcher edge never arrived, and until it said
+                // so the music half went on believing in a phone that had left: measured in the
+                // packaged 0.2.0.0 run, where a false watcher Added put the half in Backoff, the poll
+                // corrected the link on its second tick, and the half went on opening the radio every
+                // 60 s while the tray read Discovering. Worse than the wasted attempts is what
+                // happens when the phone returns - OnLinkPresentAsync acts only from Off, so the
+                // watcher's Added edge is refused and recovery waits on a 60 s retry that is never
+                // reset without a success. That is the range-exit-and-return path, which is the
+                // predecessor app's defining bug.
+                //
+                // <b>Edge-triggered, off the value LinkMachine already returns, and never
+                // level-triggered.</b> The state alone is Absent on every tick for as long as the
+                // phone is away, and a teardown on each of them bumps MusicHalf._generation and
+                // cancels whatever the half had armed. That is not hypothetical: re-picking the same
+                // phone resets the link machine to Absent while MusicHalf.Configure deliberately
+                // leaves a half on the same phone alone, so the countdown the click just granted
+                // sits under ticks that have nothing to report - see
+                // A_poll_that_moves_nothing_does_not_stand_a_backing_off_half_down.
+                //
+                // The flag is also what keeps the poll debounce intact: MoveTo answers false for
+                // Absent -> Absent and OnLinkStatusRead answers false from NoPhone, so this is
+                // reachable only from Present, which is the one transition the debounce guards.
+                //
+                // Music only, for the reason OnDeviceRemoved gives: registration is not link-scoped.
+                _music.OnLinkAbsent();
+            }
+
+            // After the teardown, so a half that has just gone Off does not pay for a 282 ms probe it
+            // cannot act on.
             RefreshEndpointLevel();
 
             // 2. A consistency check between two seams - and deliberately not described as more than
@@ -1107,7 +1152,9 @@ public sealed class ConnectionManager : IDisposable
     {
         if (_linkMachine.State == LinkState.Present)
         {
-            // The other await with no tripwire, for the same reason as ConnectHalvesAsync's second.
+            // The third of the three awaits with no tripwire, for the same reason as
+            // ConnectHalvesAsync's second - the map in ConnectionManagerTests under "the captured
+            // context" names all three together at the bottom.
             await _calls.OnLinkPresentAsync(ConnectPermitted);
         }
 

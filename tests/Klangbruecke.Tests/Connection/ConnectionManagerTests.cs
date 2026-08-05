@@ -287,6 +287,36 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(h.Sink.Devices, await h.Manager.FindPhonesAsync());
     }
 
+    /// <summary>
+    /// A selection changes state synchronously - the latch is cleared, the link machine is reset -
+    /// and handing the announcement to the pass is not enough: a pass that started under the stall
+    /// threshold ago returns before it publishes anything. So reselecting the same phone while
+    /// suppressed cleared the latch and repainted nothing, and the tray went on saying the app was
+    /// disconnected until a tick that could be half a minute away.
+    /// </summary>
+    [Fact]
+    public void Reselecting_the_same_phone_repaints_even_while_a_pass_is_in_flight()
+    {
+        using Harness h = new();
+        h.ReachConnected();
+
+        h.Manager.RequestDisconnect();
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+
+        // A pass wedged on its link read, so the one the click starts defers to it.
+        h.Link.DeferRead = true;
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(1, h.Link.ReadCount);
+
+        h.Manager.SelectPhone(PhoneId);
+
+        // The pass really did decline - this is the condition the bug needed, not an assumption.
+        Assert.Equal(1, h.Link.ReadCount);
+
+        // And the tray was told anyway.
+        Assert.Equal(ConnectionState.Discovering, h.Manager.State);
+    }
+
     // --- the grace window ----------------------------------------------------------------------
 
     /// <summary>
@@ -532,8 +562,9 @@ public sealed class ConnectionManagerTests : IDisposable
     }
 
     /// <summary>
-    /// Finding #2, and the case that produced it: the capture endpoint tracks the phone's own A2DP
-    /// link and was measured Active before this app opened a connection at all. One route, not two -
+    /// Finding #2, and the case that produced it: the capture endpoint's lifetime is not this app's
+    /// connection's (docs/FINDINGS.md section 4), and it was measured Active before this app opened a
+    /// connection at all. One route, not two -
     /// a second start would tear the first down and restart it, which is a gap in the audio for
     /// exactly the users whose endpoint was already there.
     /// </summary>
@@ -885,6 +916,144 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(2, h.Link.ReadCount);
     }
 
+    // --- the poll as the music half's backstop ---------------------------------------------------
+    //
+    // The poll exists precisely because a watcher edge can never arrive, so a poll that corrects the
+    // link and tells nobody is the backstop failing at the one job it has. Measured in the packaged
+    // 0.2.0.0 run: a false watcher Added for a phone that was not in the room put the music half in
+    // Backoff, the poll corrected Present -> Absent on its second tick, the tray read Discovering -
+    // and the half went on opening the radio every 60 s for as long as the app ran.
+
+    /// <summary>
+    /// The correction reaching the half. <b>The damage is not the wasted attempts</b> - it is that
+    /// <c>OnLinkPresentAsync</c> acts only from <c>Off</c>, so a half left in Backoff refuses the
+    /// watcher's Added edge when the phone actually comes back, and recovery then waits on a 60 s
+    /// retry that is never reset without a success. That is range-exit-and-return, which is the
+    /// predecessor app's defining bug.
+    /// </summary>
+    [Fact]
+    public void A_polled_range_exit_stands_the_music_half_down_and_disarms_its_retry()
+    {
+        using Harness h = new(enableCalls: false);
+        h.Sink.ConnectResult = false;
+
+        // The watcher says the phone is there and the radio disagrees, which is the measured case.
+        h.Link.RaiseAppeared();
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+        Assert.Equal(ConnectionState.RetryBackoff, h.Manager.State);
+
+        // Two polls, because one failed read is not a range exit.
+        h.Scheduler.Advance(Seconds(60));
+
+        Assert.Equal(1, h.Sink.DisconnectCount);
+        Assert.Equal(ConnectionState.Discovering, h.Manager.State);
+
+        // Off, not Backoff, and this is the assertion that matters: nothing is armed to open the
+        // radio again while the phone is gone. The state above reads Discovering either way, which
+        // is exactly how the projection and the behaviour came to disagree.
+        int connects = h.Sink.ConnectCalls.Count;
+        h.Scheduler.Advance(Seconds(600));
+        Assert.Equal(connects, h.Sink.ConnectCalls.Count);
+    }
+
+    /// <summary>
+    /// And the debounce is not bypassed on the way. <c>ILinkMonitor.ReadLinkStatusAsync</c> collapses
+    /// every failed read to <c>Unknown</c>, so one non-Connected poll is indistinguishable from a
+    /// transient hiccup - and tearing down on it stops the router and disconnects the sink mid-song.
+    /// </summary>
+    [Fact]
+    public void One_non_connected_poll_does_not_tear_the_music_half_down()
+    {
+        using Harness h = new(enableCalls: false);
+        h.ReachRouting();
+
+        h.Link.Status = BluetoothLinkStatus.Unknown;
+        h.Scheduler.Advance(Seconds(30));
+
+        Assert.Equal(0, h.Sink.DisconnectCount);
+        Assert.True(h.Router.IsRunning);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        // And a Connected read starts the run over rather than leaving it half finished, so the next
+        // failed read is the first of a new run and not the second of the old one.
+        h.Link.Status = BluetoothLinkStatus.Connected;
+        h.Scheduler.Advance(Seconds(30));
+
+        h.Link.Status = BluetoothLinkStatus.Unknown;
+        h.Scheduler.Advance(Seconds(30));
+
+        Assert.Equal(0, h.Sink.DisconnectCount);
+        Assert.True(h.Router.IsRunning);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    /// <summary>
+    /// <b>Edge-triggered, and this is the assertion that says so.</b> Every other tick in a range
+    /// exit reads <c>Absent</c> too, and a teardown on the level rather than on the transition would
+    /// bump <c>MusicHalf._generation</c> and cancel the half's timers every 30 s - discarding a
+    /// click-granted attempt that a later pass started.
+    ///
+    /// The state below is staged, not contrived: re-picking the same phone is the one input that
+    /// resets the link machine to <c>Absent</c> while deliberately leaving the half alone -
+    /// <c>MusicHalf.Configure</c> tears down only on a phone change - so the countdown the click just
+    /// granted is sitting there with the link reading Absent and no transition to report.
+    /// </summary>
+    [Fact]
+    public void A_poll_that_moves_nothing_does_not_stand_a_backing_off_half_down()
+    {
+        using Harness h = new(enableCalls: false);
+        h.Sink.ConnectResult = false;
+
+        h.Link.RaiseAppeared();
+        Assert.Equal(ConnectionState.RetryBackoff, h.Manager.State);
+        Assert.Single(h.Sink.ConnectCalls);
+
+        // The radio stops answering, and the user re-picks the same phone. The pass that click
+        // starts reads Absent - and moves nothing, because the machine was already Absent.
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+        h.Manager.SelectPhone(PhoneId);
+
+        Assert.Equal(0, h.Sink.DisconnectCount);
+
+        // The countdown is still armed, which is the whole of it.
+        h.Scheduler.Advance(Seconds(2));
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
+    }
+
+    /// <summary>
+    /// Music only. There is deliberately no symmetric call for the calls half: registration is not
+    /// link-scoped, holding it is what puts this PC in the phone's own call-audio picker, and every
+    /// unregister/re-register round trip makes the PC vanish from and reappear in that list - see
+    /// <c>CallsHalf</c>'s missing <c>OnLinkAbsent</c>, and <c>OnDeviceRemoved</c>, which this matches.
+    /// </summary>
+    [Fact]
+    public void A_polled_range_exit_leaves_the_calls_half_registered()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+        Assert.Equal(new[] { TransportId }, h.Calls.ConnectCalls);
+
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+        h.Scheduler.Advance(Seconds(60));
+
+        // Music is down.
+        Assert.Equal(1, h.Sink.DisconnectCount);
+        Assert.False(h.Router.IsRunning);
+
+        // The role is not, and it was neither released nor re-registered.
+        Assert.Equal(0, h.Calls.DisconnectCount);
+        Assert.Equal(new[] { TransportId }, h.Calls.ConnectCalls);
+
+        // And the phone comes back to a half that can take it. Off is the one state
+        // OnLinkPresentAsync acts from, which is the whole reason the teardown had to happen.
+        h.Link.Status = BluetoothLinkStatus.Connected;
+        h.Scheduler.Advance(Seconds(30));
+
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
+        Assert.Equal(new[] { TransportId }, h.Calls.ConnectCalls);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
     // --- resume --------------------------------------------------------------------------------
 
     /// <summary>
@@ -1021,6 +1190,35 @@ public sealed class ConnectionManagerTests : IDisposable
 
         Assert.True(h.Settings.AutoReconnect);
         Assert.Equal(saves + 1, h.Settings.SaveCount);
+    }
+
+    /// <summary>
+    /// And the clearing is reported without waiting for the pass, for the reason
+    /// <c>Reselecting_the_same_phone_repaints_even_while_a_pass_is_in_flight</c> gives: a pass that
+    /// started under the stall threshold ago returns before it publishes. A switch that leaves the
+    /// tray saying "Suppressed - auto-reconnect is off" for another half-minute is one the user
+    /// turns off again before it has had a chance to work.
+    /// </summary>
+    [Fact]
+    public void Turning_auto_reconnect_back_on_repaints_even_while_a_pass_is_in_flight()
+    {
+        using Harness h = new(enableCalls: false);
+        h.Sink.ConnectResult = false;
+
+        h.Link.RaiseAppeared();
+        h.Manager.SetAutoReconnect(false);
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+        Assert.Equal("auto-reconnect is off", h.Manager.Detail);
+
+        h.Link.DeferRead = true;
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(1, h.Link.ReadCount);
+
+        h.Manager.SetAutoReconnect(true);
+
+        Assert.Equal(1, h.Link.ReadCount);
+        Assert.Equal(ConnectionState.Idle, h.Manager.State);
+        Assert.Equal("nothing is running yet", h.Manager.Detail);
     }
 
     // --- calls switch --------------------------------------------------------------------------
@@ -1367,7 +1565,8 @@ public sealed class ConnectionManagerTests : IDisposable
     /// The five tests above cannot reach either. They are only reached from a reconcile pass, and in
     /// every scenario above the halves answer that pass with an already-completed task, so the awaiter
     /// never registers a continuation and <c>ConfigureAwait</c> has nothing to configure. Measured, not
-    /// assumed: mutating those five sites left all 83 tests green until this one existed.
+    /// assumed - historically, and the number dates the measurement rather than describing the suite:
+    /// when this test was written, mutating those five sites left all 83 tests of the day green.
     ///
     /// So this drives the connect from the <em>pass</em> rather than from a watcher edge, with the sink
     /// held open.
@@ -1397,8 +1596,9 @@ public sealed class ConnectionManagerTests : IDisposable
     /// <b>Getting there needs the retry timer out of the way, and the honest way to do that is to
     /// reproduce the case the branch exists for.</b> An <c>Advance</c> long enough to fire the retry
     /// once leaves the re-armed one sitting out the rest of that same drain - see
-    /// <c>FakeScheduler.Advance</c> - so the clock ends 29 s along with the half overdue and nothing
-    /// armed to fire. That is precisely a machine that was asleep through its own backoff. The pass is
+    /// <c>FakeScheduler.Advance</c> - so the clock ends 29 s along with the half overdue and its
+    /// re-armed retry still undelivered. That is precisely a machine that was asleep through its own
+    /// backoff: a timer that is armed and has not fired. The pass is
     /// then forced without advancing again, because any further advance would fire the retry first and
     /// the half would be Connecting rather than Backoff.
     /// </summary>
@@ -1466,7 +1666,6 @@ public sealed class ConnectionManagerTests : IDisposable
             h => h.Calls.CompleteFind(),
             h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
     }
-
 
     // --- what the tray is told -----------------------------------------------------------------
 
