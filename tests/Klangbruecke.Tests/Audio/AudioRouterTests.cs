@@ -476,10 +476,15 @@ public sealed class AudioRouterTests : IDisposable
         Assert.False(router.Start(null));
 
         StatusMessage status = Assert.Single(reported);
-        Assert.Equal("No A2DP sink endpoint - nothing is holding a connection open.", status.Text);
+        // Pinned because the wording is load-bearing, not decorative. It must not claim anything
+        // about the connection: docs/FINDINGS.md section 4 retracted "absent endpoint means nothing
+        // is holding a connection open", and this message fires in the one case where that reading
+        // is actively wrong - the endpoint vanishing between the monitor's read and Start, with the
+        // connection open.
+        Assert.Equal("No A2DP sink endpoint to capture from; not starting the route.", status.Text);
 
-        // Info, not Error. Per docs/FINDINGS.md section 4 this is the expected state whenever nothing
-        // is holding a connection open, which is most of the time.
+        // Info, not Error. There is no route to start and that is an ordinary state - the endpoint
+        // lags the connection by an unbounded interval (docs/FINDINGS.md section 4).
         Assert.Equal(LogLevel.Info, status.Level);
 
         Assert.False(router.IsRunning);

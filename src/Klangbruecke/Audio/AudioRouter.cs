@@ -114,11 +114,13 @@ public sealed class AudioRouter : IAudioRouter
             ICaptureSource? source = _devices.CreateSinkCapture();
             if (source is null)
             {
-                // Per docs/FINDINGS.md section 4 this is the expected state when nothing is holding a
-                // connection open, not a bug. It is also exactly what a failed connect looks like,
-                // which is why the A2DP connect result is logged by the caller rather than inferred
-                // from here.
-                Report("No A2DP sink endpoint - nothing is holding a connection open.");
+                // Says only what was observed. The old wording - "nothing is holding a connection
+                // open" - asserted the converse docs/FINDINGS.md section 4 now retracts, and it was
+                // wrong precisely when it fired: reaching here means the monitor saw the endpoint and
+                // it went away before Start could open it, i.e. while the half is Linked with the
+                // connection open. Absence proves nothing about the connection either way, which is
+                // also why the A2DP connect result is logged by the caller rather than inferred here.
+                Report("No A2DP sink endpoint to capture from; not starting the route.");
                 return false;
             }
 

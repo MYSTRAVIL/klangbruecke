@@ -381,9 +381,16 @@ public sealed class EndpointMonitor : IAudioEndpointMonitor
 
         if (present)
         {
-            // The measured case, not a defensive one: the endpoint tracks the phone's Bluetooth link
-            // and was already Active before the app opened its connection. A monitor that waited for an
-            // arrival edge here would wait forever for something that had already happened.
+            // The measured case, not a defensive one: the endpoint was already Active before this app
+            // subscribed, and a monitor that waited for an arrival edge would wait forever for
+            // something that had already happened. Seeding from the level is what makes that safe.
+            //
+            // Do not restate the old reason - "the endpoint tracks the phone's Bluetooth link". It
+            // does not. Measured 2026-08-05 (docs/FINDINGS.md section 4): the endpoint enumerated
+            // Present/Active for tens of minutes with the phone disconnected on both its BTHENUM and
+            // BTHLE nodes. So this seed can be a false positive, and the design holds anyway because
+            // presence is only ever consulted from Linked/Up - states reached after ConnectAsync
+            // returned true - where a wrong True costs one failed route start and a backoff.
             Raise("the endpoint was already present at subscribe time");
         }
     }
