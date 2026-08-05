@@ -4,7 +4,6 @@ using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
 using Klangbruecke.Diagnostics;
 using Klangbruecke.Platform;
-using NAudio.CoreAudioApi;
 using Windows.Devices.Enumeration;
 
 namespace Klangbruecke;
@@ -24,6 +23,10 @@ internal sealed class TrayContext : ApplicationContext
     // the UI thread, since Program.Main is what does it.
     private readonly ControlUiDispatcher _ui = new();
 
+    // The one thing in the app that opens WASAPI endpoints. Shared between the router, which routes
+    // through them, and the Output menu, which lists them.
+    private readonly IAudioDeviceFactory _devices = new WasapiDeviceFactory();
+
     // Not a field initializer, unlike its neighbours: it needs _ui, and a field initializer cannot
     // read another instance field.
     private readonly AudioRouter _router;
@@ -42,7 +45,7 @@ internal sealed class TrayContext : ApplicationContext
 
         // The router hands its stopped-event teardown to this dispatcher so it never runs on the
         // NAudio thread that raised the event; see AudioRouter.RequestTeardown for why that deadlocks.
-        _router = new AudioRouter(_ui);
+        _router = new AudioRouter(_ui, _devices);
 
         // The severity comes with the message. Forwarding only the text would have this view decide
         // how serious an event it did not witness was, which is how every component failure used to
@@ -179,13 +182,13 @@ internal sealed class TrayContext : ApplicationContext
         outputMenu.DropDownItems.Add(systemDefault);
         outputMenu.DropDownItems.Add(new ToolStripSeparator());
 
-        foreach (MMDevice device in AudioRouter.GetOutputDevices())
+        foreach (AudioOutputDevice device in _devices.ListOutputs())
         {
-            var item = new ToolStripMenuItem(device.FriendlyName)
+            var item = new ToolStripMenuItem(device.Name)
             {
-                Checked = device.ID == _settings.OutputDeviceId,
+                Checked = device.Id == _settings.OutputDeviceId,
             };
-            string id = device.ID;
+            string id = device.Id;
             item.Click += (_, _) => SelectOutput(id);
             outputMenu.DropDownItems.Add(item);
         }
@@ -379,31 +382,13 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
-    private void StartRouting()
-    {
-        MMDevice? source = AudioRouter.FindSinkCaptureEndpoint();
-        if (source is null)
-        {
-            // Per docs/FINDINGS.md §4 this is the expected state when nothing holds a connection open,
-            // not a bug. It is also exactly what a failed connect looks like, which is why the A2DP
-            // connect result is logged above rather than inferred from here.
-            SetStatus("No A2DP sink endpoint - nothing is holding a connection open.");
-            return;
-        }
-
-        MMDevice? sink = AudioRouter.GetOutputDeviceOrDefault(_settings.OutputDeviceId);
-        if (sink is null)
-        {
-            SetStatus("No usable output device.");
-            return;
-        }
-
-        // Both endpoint names, before the stream starts: a route that runs silently is almost always
-        // the right source paired with the wrong sink, and afterwards nothing says which two were used.
-        Log.Info($"Routing source='{source.FriendlyName}' sink='{sink.FriendlyName}'.");
-
-        _router.Start(source, sink);
-    }
+    /// <summary>
+    /// Both endpoint lookups now live in the router, behind <see cref="IAudioDeviceFactory"/>, and
+    /// so do the two statuses they used to raise from here - "No A2DP sink endpoint ..." and
+    /// "No usable output device." They arrive at the tray through <c>_router.Status</c> instead,
+    /// which is the same subscription every other router message already uses.
+    /// </summary>
+    private void StartRouting() => _router.Start(_settings.OutputDeviceId);
 
     private void Disconnect()
     {
