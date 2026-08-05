@@ -31,7 +31,13 @@ public sealed class CallTransportService : ICallTransportService
     /// cached bool answers with the state at the moment of the last connect instead. Deliberately
     /// unguarded: the two <c>IsRegistered()</c> calls in <see cref="ConnectAsync"/> are unguarded
     /// too, and a read that throws is a fault the caller's guard should see rather than a role that
-    /// is absent.
+    /// is absent. Swallowing it would report "not registered" for a state that is actually unknown,
+    /// which is a different answer than this property is allowed to give.
+    ///
+    /// This is a live ABI call, so callers must not put it anywhere a throw would strand them.
+    /// <c>TrayContext.RebuildMenuAsync</c> handles that by ordering rather than by catching - it adds
+    /// Exit before reading this - and the reconcile loop that needs to tell "role dropped" from
+    /// "could not read" gets a tri-state of its own rather than a swallow in here.
     /// </summary>
     public bool IsRegistered => _device is not null && _device.IsRegistered();
 

@@ -222,17 +222,28 @@ internal sealed class TrayContext : ApplicationContext
 
         menu.Items.Add(new ToolStripSeparator());
 
+        // Exit is built and added FIRST, then Disconnect is inserted above it, so the menu reads
+        // Disconnect-then-Exit while Exit is already in the collection before anything below can
+        // throw. Ordering, not a catch: _calls.IsRegistered is a live CsWinRT ABI call - the slot
+        // used to hold an auto-property that could not fail - and a throw from it unwinds to
+        // OnMenuOpening, which logs and then Show()s whatever was built. Added last, Exit would be
+        // the item missing, which is the one failure this method's own comment calls worse than a
+        // partial menu. This costs two lines and needs no invented state.
+        //
+        // It does not cover the AccessViolationException case in docs/FINDINGS.md §8 - a
+        // corrupted-state exception is not caught by OnMenuOpening either - but it does cover the
+        // ordinary device-gone HRESULT, which is the reachable one.
+        var exit = new ToolStripMenuItem("Exit");
+        exit.Click += (_, _) => ExitThread();
+        int exitIndex = menu.Items.Add(exit);
+
         // IsRegistered, not a connected flag. The old IsConnected was set only when
         // PhoneLineTransportDevice.ConnectAsync returned true, which it never has on this machine -
         // so the calls half could never enable this item even while it held the hands-free role, and
         // the one action that releases the role was unreachable from the tray.
         var disconnect = new ToolStripMenuItem("Disconnect") { Enabled = _sink.IsConnected || _calls.IsRegistered };
         disconnect.Click += (_, _) => Disconnect();
-        menu.Items.Add(disconnect);
-
-        var exit = new ToolStripMenuItem("Exit");
-        exit.Click += (_, _) => ExitThread();
-        menu.Items.Add(exit);
+        menu.Items.Insert(exitIndex, disconnect);
     }
 
     private void SelectOutput(string? deviceId)
@@ -391,7 +402,14 @@ internal sealed class TrayContext : ApplicationContext
             // PhoneLineTransportDevice.ConnectAsync's bool, which is False on every run on this
             // machine - so the one line a reader greps for said "failed" on the runs where calls
             // demonstrably worked.
-            Log.Info($"Call transport connect {(connect.Registered ? "succeeded" : "failed")}.");
+            //
+            // "registration", not "connect", and the one word is load-bearing. A throw below a
+            // successful RegisterApp reports Registered=true - correct, the role is held and the
+            // caller must not re-claim it - but that put "Call transport connect succeeded." one
+            // line above "[ERR] The call transport connect path threw.", the same noun reaching
+            // opposite verdicts in one grep. Naming what the verdict is actually read from settles
+            // it: registration succeeded, the connect attempt threw, and both are true.
+            Log.Info($"Call transport registration {(connect.Registered ? "succeeded" : "failed")}.");
 
             // Separate line, deliberately: the transport's own answer stays in the log as a fact to
             // correlate against, and never as part of the verdict above. "not reached" rather than a

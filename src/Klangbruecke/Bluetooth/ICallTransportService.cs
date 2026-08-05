@@ -15,7 +15,13 @@ namespace Klangbruecke.Bluetooth;
 /// Null rather than false in that case, deliberately: false is a measurement, and reporting one
 /// nothing measured puts a fact in the log that never happened.
 /// </param>
-/// <param name="Reason">A non-empty sentence for the log. Never null or blank.</param>
+/// <param name="Reason">
+/// A sentence for the log. The three factory paths below always fill it, and the tests pin that;
+/// it is deliberately NOT claimed as a type invariant, because for a struct it cannot be one -
+/// <c>default(CallTransportResult)</c> is always constructible and leaves this null, and the catch
+/// in <see cref="CallTransportService.ConnectAsync"/> builds one directly from an exception whose
+/// <c>Message</c> nothing in this codebase controls. Read it, do not assume it says something.
+/// </param>
 public readonly record struct CallTransportResult(bool Registered, bool? TransportConnected, string Reason)
 {
     /// <summary>
@@ -26,6 +32,11 @@ public readonly record struct CallTransportResult(bool Registered, bool? Transpo
     /// <see cref="CallTransportService"/>, because the call site cannot be exercised without package
     /// identity and a phone. Re-inverting the rule there would be invisible to the suite; re-inverting
     /// it here fails <c>Registered_with_TransportConnected_false_is_success</c>.
+    ///
+    /// One path does bypass this: the catch in <c>CallTransportService.ConnectAsync</c> constructs a
+    /// result directly, because a throw can leave the role claimed with no transport answer at all
+    /// and that combination is not a verdict this factory renders. So "the rule lives in Claimed"
+    /// covers every path where the transport actually answered - not literally every construction.
     /// </summary>
     public static CallTransportResult Claimed(bool transportConnected) => new(
         true,
