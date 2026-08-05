@@ -23,6 +23,16 @@ public enum SuppressionReason
 /// behaviours: either a deliberate disconnect outlives the phone leaving the room and the app never
 /// comes back, or turning auto-reconnect off lasts until the user next walks out of range.
 /// </summary>
+/// <remarks>
+/// <b>Single-threaded, and it subscribes to nothing.</b> Every input is a method call that
+/// <c>ConnectionManager</c> has already marshalled onto the UI thread through <c>IUiDispatcher</c>,
+/// which is the same contract <see cref="MusicHalf"/> and <see cref="CallsHalf"/> state and the
+/// reason all four hold no locks. It is worth stating here rather than left to inference:
+/// <see cref="Set"/> writes two fields, and the pair is the invariant - a reader that saw the new
+/// <see cref="Reason"/> beside the old sawAbsent would have a fresh deliberate disconnect one
+/// Present report away from expiring, which is the exact bug <see cref="Set"/> clears both fields to
+/// prevent.
+/// </remarks>
 public sealed class SuppressionLatch
 {
     /// <summary>

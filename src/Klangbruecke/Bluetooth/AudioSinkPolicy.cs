@@ -22,13 +22,6 @@ public static class AudioSinkPolicy
     public static bool CanOpenConnection(bool isPackaged) => isPackaged;
 
     /// <summary>
-    /// Why the music half is not being attempted, in the words the log will carry.
-    ///
-    /// Names the specific call rather than the feature, because the reader who meets this line is
-    /// looking for something they did wrong and there is nothing: the same call crashes a bare test
-    /// host with no app code in the frame.
-    /// </summary>
-    /// <summary>
     /// What the verdict is worth in the log. The same rule as the calls half's
     /// <c>CallsPolicy.LevelFor</c>: a half that cannot run at all is Warn, anything the user chose is
     /// Info. The music half has no "switched off by the user" state, so it only ever produces the
@@ -39,6 +32,13 @@ public static class AudioSinkPolicy
     /// </summary>
     public static LogLevel LevelFor(bool isPackaged) => isPackaged ? LogLevel.Info : LogLevel.Warn;
 
+    /// <summary>
+    /// Why the music half is not being attempted, in the words the log will carry.
+    ///
+    /// Names the specific call rather than the feature, because the reader who meets this line is
+    /// looking for something they did wrong and there is nothing: the same call crashes a bare test
+    /// host with no app code in the frame.
+    /// </summary>
     public static string Explain(bool isPackaged) => isPackaged
         ? "Music enabled."
         : "Music half skipped: no MSIX package identity. AudioPlaybackConnection.TryCreateFromId "

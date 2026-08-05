@@ -26,6 +26,16 @@ public enum LinkState
 /// the predecessor's defining bug. So both paths have to land in the same two states, which is what
 /// makes this worth a type rather than a bool.
 /// </summary>
+/// <remarks>
+/// <b>Single-threaded, and it subscribes to nothing.</b> Every input is a method call that
+/// <c>ConnectionManager</c> has already marshalled onto the UI thread through <c>IUiDispatcher</c>,
+/// which is the same contract <see cref="MusicHalf"/> and <see cref="CallsHalf"/> state and the
+/// reason all four hold no locks. It is worth stating here rather than left to inference:
+/// <see cref="MoveTo"/> reads, compares and writes <see cref="State"/> without atomicity, so two
+/// threads reporting a watcher edge and a poll at once could both see the old value and one of them
+/// would return "nothing changed" for a change that happened - and callers log, and now tear a half
+/// down, on that flag.
+/// </remarks>
 public sealed class LinkMachine
 {
     /// <summary>
@@ -48,7 +58,7 @@ public sealed class LinkMachine
     private const int NonConnectedPollsBeforeAbsent = 2;
 
     /// <summary>
-    /// Length of the current run of non-Connected polls. Only consulted while
+    /// Length of the current run of non-Connected polls. Only <em>acted on</em> while
     /// <see cref="LinkState.Present"/> - the one transition the debounce guards - and cleared by
     /// every arrival in Present, which is what makes the run consecutive rather than cumulative.
     ///

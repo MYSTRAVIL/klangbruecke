@@ -101,6 +101,15 @@ public sealed class LinkMonitor : ILinkMonitor
     /// starts a real <see cref="DeviceWatcher"/>, which is OS device enumeration inside a suite that
     /// runs in two seconds. Call <see cref="Watch"/>, not this: on its own it adopts an id that
     /// nothing is watching for, so no edge will ever arrive.
+    ///
+    /// <b>It refuses nothing, deliberately, and that is only safe because nothing in production calls
+    /// it.</b> It is not on <c>ILinkMonitor</c> and <see cref="Watch"/> is its one caller here, so the
+    /// two states it can reach and <see cref="Watch"/> cannot - retargeting a live watcher, which
+    /// leaves that watcher running against the old selector while the id says otherwise, and running
+    /// after <see cref="Dispose"/>, which <see cref="Watch"/> throws for - are reachable from a test
+    /// and from nowhere else. A guard here would be one no consumer can trip, so the sentence is the
+    /// guard: if this ever grows a production caller, it needs <see cref="Watch"/>'s
+    /// <see cref="ObjectDisposedException"/> check and a stop of the live watcher, not a comment.
     /// </summary>
     public void SetWatchTarget(string phoneDeviceId)
     {

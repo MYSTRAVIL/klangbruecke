@@ -12,12 +12,19 @@ namespace Klangbruecke.Audio;
 /// the endpoint arrived</b> - and this is it.
 ///
 /// <b>The endpoint is not the connection.</b> Measured: opening and closing an
-/// <c>AudioPlaybackConnection</c> does not by itself create or destroy the capture endpoint. On this
-/// machine it tracks the phone's Bluetooth A2DP link, which is not the app's to control, and it was
+/// <c>AudioPlaybackConnection</c> does not by itself create or destroy the capture endpoint - it was
 /// already <c>Active</c> before the app opened its connection and still <c>Active</c> after the app was
-/// killed. So <see cref="Start"/> must report an endpoint that is <b>already present</b> rather than
-/// waiting for an arrival that has already happened - an edge-only design reproduces the very bug this
-/// interface exists to remove.
+/// killed. <b>What it does track instead is not established, and this contract deliberately does not
+/// say.</b> The obvious reading - that it follows the phone's own Bluetooth A2DP link - was retracted on
+/// 2026-08-05 (docs/FINDINGS.md §4) on a measured counterexample: with the phone disconnected on both
+/// its <c>BTHENUM</c> and <c>BTHLE</c> nodes and its Hands-Free endpoints gone,
+/// <c>Line (&lt;phone&gt; A2DP SNK)</c> still enumerated <c>Present=True, Status=OK</c>. So
+/// <see cref="SinkCaptureEndpointPresent"/> is evidence about the endpoint and about nothing else, in
+/// either direction.
+///
+/// So <see cref="Start"/> must report an endpoint that is <b>already present</b> rather than waiting for
+/// an arrival that has already happened - an edge-only design reproduces the very bug this interface
+/// exists to remove.
 ///
 /// <b>Nothing here marshals</b>, for the reason <c>ILinkMonitor</c> gives rather than the one
 /// <c>IPowerNotifier</c> gives: nothing has marshalled at all. <see cref="EndpointsChanged"/> arrives on

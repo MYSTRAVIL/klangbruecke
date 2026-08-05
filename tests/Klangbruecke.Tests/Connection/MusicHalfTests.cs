@@ -91,9 +91,10 @@ public sealed class MusicHalfTests
     }
 
     /// <summary>
-    /// The other half of finding #2. Measured: the endpoint tracks the phone's own A2DP link, so it
-    /// is usually <c>Active</c> before this app connects at all - and an arrival that has already
-    /// happened raises no notification. Waiting for one would mean waiting for the 30 s reconcile.
+    /// The other half of finding #2. Measured: the endpoint's lifetime is not this app's connection's
+    /// (docs/FINDINGS.md section 4), so it is routinely <c>Active</c> before this app connects at all
+    /// - and an arrival that has already happened raises no notification. Waiting for one would mean
+    /// waiting for the 30 s reconcile.
     /// </summary>
     [Fact]
     public async Task Connecting_with_the_endpoint_already_present_reaches_Up()

@@ -42,7 +42,18 @@ public interface ILinkMonitor : IDisposable
     /// <summary>
     /// Watch one device id. Replaces any previous watch, and always starts from
     /// <see cref="DevicePresent"/> false: selection is an intent, not an observation.
+    ///
+    /// Do not call this after <see cref="IDisposable.Dispose"/>, and expect an implementation to
+    /// refuse rather than tolerate it - <c>LinkMonitor</c> throws. Dispose is idempotent, so a watch
+    /// started after one would never be stopped: it would run for the life of the process with live
+    /// handlers firing into a disposed object, and nothing downstream can detect that.
+    /// <see cref="StopWatching"/> stays harmless by contrast, because teardown paths call it without
+    /// knowing what has already gone.
     /// </summary>
+    /// <exception cref="ObjectDisposedException">
+    /// The implementation has been disposed. <c>LinkMonitor</c> throws this; the interface does not
+    /// require it, only that a caller not reach the state.
+    /// </exception>
     void Watch(string phoneDeviceId);
 
     void StopWatching();

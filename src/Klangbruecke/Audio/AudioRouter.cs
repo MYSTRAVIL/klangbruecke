@@ -116,10 +116,13 @@ public sealed class AudioRouter : IAudioRouter
             {
                 // Says only what was observed. The old wording - "nothing is holding a connection
                 // open" - asserted the converse docs/FINDINGS.md section 4 now retracts, and it was
-                // wrong precisely when it fired: reaching here means the monitor saw the endpoint and
-                // it went away before Start could open it, i.e. while the half is Linked with the
-                // connection open. Absence proves nothing about the connection either way, which is
-                // also why the A2DP connect result is logged by the caller rather than inferred here.
+                // wrong precisely when it fired. Two routes reach here and neither is a disconnection:
+                // MusicHalf.StartRouteIfDue, where the monitor saw the endpoint and it went away
+                // before Start could open it, i.e. while the half is Linked with the connection open;
+                // and ConnectionManager.RepointRoute, which calls Start on a running route from Up
+                // with no monitor read involved at all. Absence proves nothing about the connection
+                // either way, which is also why the A2DP connect result is logged by the caller
+                // rather than inferred here.
                 Report("No A2DP sink endpoint to capture from; not starting the route.");
                 return false;
             }

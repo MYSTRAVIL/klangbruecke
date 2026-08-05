@@ -210,6 +210,38 @@ public sealed class AudioRouterTests : IDisposable
         Assert.Empty(TeardownWarnings());
     }
 
+    /// <summary>
+    /// The same property on the output, which had the affordance and no assertion.
+    ///
+    /// <c>Stop</c>'s own comment says the unsubscribe goes "before Dispose, which joins the play
+    /// thread that raises it", so the router already claims WasapiOut raises PlaybackStopped from
+    /// inside Dispose - and the unsubscribe does not prevent it, because the delegate list was read
+    /// when Play took the handler. Nothing pinned that the ordering survives, and the output half is
+    /// not covered by the capture half above: the two are separate blocks in Stop, disposed in
+    /// sequence, and only the session nulled at the top of the method guards either.
+    /// </summary>
+    [Fact]
+    public void Stop_is_not_re_entered_when_the_outputs_disposal_re_raises_stopped()
+    {
+        var factory = new FakeAudioDeviceFactory();
+        using var router = new AudioRouter(Inline(), factory);
+        (_, FakeRenderSink sink) = Start(router, factory);
+
+        sink.RaisesStoppedOnDispose = true;
+
+        int stopped = 0;
+        router.Stopped += (_, _) => stopped++;
+
+        router.Stop();
+
+        // One disposal, not two: a re-entered Stop would dispose the same endpoints again and
+        // announce a deliberate teardown as a route failure.
+        Assert.Equal(1, sink.CountOf("Dispose"));
+        Assert.Equal(0, stopped);
+        Assert.False(router.IsRunning);
+        Assert.Empty(TeardownWarnings());
+    }
+
     [Fact]
     public void A_queued_teardown_is_a_no_op_after_Stop_already_ran()
     {
@@ -478,13 +510,16 @@ public sealed class AudioRouterTests : IDisposable
         StatusMessage status = Assert.Single(reported);
         // Pinned because the wording is load-bearing, not decorative. It must not claim anything
         // about the connection: docs/FINDINGS.md section 4 retracted "absent endpoint means nothing
-        // is holding a connection open", and this message fires in the one case where that reading
-        // is actively wrong - the endpoint vanishing between the monitor's read and Start, with the
-        // connection open.
+        // is holding a connection open", and both cases that fire this message are ones where that
+        // reading is actively wrong - the endpoint vanishing between the monitor's read and
+        // MusicHalf.StartRouteIfDue, with the connection open, and ConnectionManager.RepointRoute
+        // re-pointing a running route from Up without consulting the monitor at all.
         Assert.Equal("No A2DP sink endpoint to capture from; not starting the route.", status.Text);
 
-        // Info, not Error. There is no route to start and that is an ordinary state - the endpoint
-        // lags the connection by an unbounded interval (docs/FINDINGS.md section 4).
+        // Info, not Error. There is no route to start and that is an ordinary state - the endpoint's
+        // arrival is not tied to the connection's at all, and "lags" would overstate it: 5 of 8
+        // recorded runs never saw it appear, and this session measured one outliving a dead link
+        // (docs/FINDINGS.md section 4).
         Assert.Equal(LogLevel.Info, status.Level);
 
         Assert.False(router.IsRunning);

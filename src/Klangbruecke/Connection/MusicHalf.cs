@@ -372,10 +372,11 @@ public sealed class MusicHalf
         _connectBackoff.Reset();
         SetState(MusicState.Linked);
 
-        // Not Up. The endpoint may be minutes away - or may have been there all along, since it
-        // tracks the phone's own A2DP link and was measured Active before this app connected at all.
-        // An arrival that already happened raises no notification, so asking now is the difference
-        // between routing audio and waiting for the 30 s reconcile to notice.
+        // Not Up. The endpoint may be minutes away - or may have been there all along, because its
+        // lifetime is not this connection's: measured Active before this app connected at all, and
+        // still Active after the app was killed (docs/FINDINGS.md section 4). An arrival that already
+        // happened raises no notification, so asking now is the difference between routing audio and
+        // waiting for the 30 s reconcile to notice.
         StartRouteIfDue(_endpoints.SinkCaptureEndpointPresent);
     }
 

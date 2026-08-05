@@ -157,9 +157,10 @@ public sealed class EndpointMonitorTests : IDisposable
     //
     // The whole reason this class exists. Measured in the probe's A2DP window: the capture endpoint was
     // already Active before the app opened its AudioPlaybackConnection and still Active after the app
-    // was killed - it tracks the phone's Bluetooth link, which is not the app's to control. A monitor
-    // that only reacts to edges would, in that state, wait forever for an arrival that already
-    // happened, which is the bug it was built to remove.
+    // was killed - its lifetime is not this app's connection's, in either direction, and what it does
+    // follow is not established (docs/FINDINGS.md section 4). A monitor that only reacts to edges would,
+    // in that state, wait forever for an arrival that already happened, which is the bug it was built to
+    // remove.
 
     [Fact]
     public void Start_raises_EndpointsChanged_when_the_endpoint_is_already_present()

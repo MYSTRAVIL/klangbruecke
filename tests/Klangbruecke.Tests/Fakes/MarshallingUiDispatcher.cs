@@ -23,7 +23,15 @@ namespace Klangbruecke.Tests.Fakes;
 /// </summary>
 public sealed class MarshallingUiDispatcher : IUiDispatcher
 {
-    private readonly int _uiThreadId = Environment.CurrentManagedThreadId;
+    /// <summary>
+    /// The thread itself, not its id. Managed thread ids are unique only among <em>live</em> threads
+    /// and are reused once one exits, so a comparison against a recorded id can answer "yes, you are
+    /// the UI thread" to a threadpool thread that inherited the number - which would run
+    /// <c>ApplyEndpointPresence</c> off the test thread, the exact hazard this class exists to
+    /// prevent, intermittently and in whichever test happened to be running.
+    /// </summary>
+    private readonly Thread _uiThread = Thread.CurrentThread;
+
     private readonly ConcurrentQueue<Action> _queued = new();
     private int _posts;
 
@@ -35,7 +43,7 @@ public sealed class MarshallingUiDispatcher : IUiDispatcher
 
     public void Post(Action action)
     {
-        if (Environment.CurrentManagedThreadId == _uiThreadId)
+        if (ReferenceEquals(Thread.CurrentThread, _uiThread))
         {
             Interlocked.Increment(ref _posts);
             action();

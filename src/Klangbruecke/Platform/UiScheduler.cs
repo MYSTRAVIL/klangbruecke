@@ -132,8 +132,9 @@ public sealed class UiScheduler : IScheduler, IDisposable
             // Disposing a WinForms timer from inside its own Tick is safe, but not because the
             // message is finished with - Tick is raised from the timer's own WndProc while WM_TIMER
             // is still being dispatched. It is safe because the teardown is same-thread: destroying
-            // a window from within its own window procedure is legal, and Stop-then-Dispose inside
-            // Tick is the documented one-shot idiom.
+            // a window from within its own window procedure is legal. Stop-then-Dispose inside Tick
+            // is common practice rather than a documented idiom - only Stop is documented as safe
+            // there - so the sentence above is the argument, not the citation.
             _timer.Dispose();
             _owner.Forget(this);
         }

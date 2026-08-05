@@ -5,7 +5,10 @@ namespace Klangbruecke.Connection;
 /// <summary>What the tray reports. Derived, never assigned: see <see cref="ConnectionStateProjection"/>.</summary>
 public enum ConnectionState
 {
-    /// <summary>Nothing is being attempted - no phone picked, or no half switched on.</summary>
+    /// <summary>
+    /// Nothing is being attempted - no phone picked, no half switched on, or nothing that is switched
+    /// on is doing anything yet. The detail names which of the three.
+    /// </summary>
     Idle,
 
     /// <summary>A phone is picked and is not in the room. A <c>DeviceWatcher</c> is waiting for it.</summary>
@@ -315,9 +318,9 @@ public static class ConnectionStateProjection
         // than the guess the default arm below refuses to make.
         SuppressionReason.None => "auto-reconnect is off",
 
-        // Covers None, which cannot reach here, and any reason added later. Deliberately borrows
-        // neither phrase above: both are claims about how the dormancy ends, and guessing wrong sends
-        // the user to wait for something that will not happen.
+        // Covers any reason added later - None has had its own arm since rule 2b landed. Deliberately
+        // borrows neither phrase above: both are claims about how the dormancy ends, and guessing
+        // wrong sends the user to wait for something that will not happen.
         _ => "not reconnecting",
     };
 
