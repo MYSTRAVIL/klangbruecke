@@ -54,6 +54,39 @@ public sealed class CallTransportServiceContractTests : IDisposable
         Assert.False(_calls.IsRegistered);
     }
 
+    /// <summary>
+    /// <c>NotRegistered</c>, not <c>Unknown</c>. There is no device to ask, and that is a known
+    /// answer rather than a failed one - the role cannot be held through a device this class does not
+    /// have. <c>CallsHalf</c> acts on the two answers in opposite directions, so a service that
+    /// hedged here would have the reconcile loop sit on its hands for a role that is provably absent.
+    /// </summary>
+    [Fact]
+    public void ReadRegistration_is_NotRegistered_before_connecting()
+    {
+        Assert.Equal(RegistrationStatus.NotRegistered, _calls.ReadRegistration());
+    }
+
+    [Fact]
+    public void ReadRegistration_is_still_NotRegistered_after_Disconnect()
+    {
+        _calls.Disconnect();
+
+        Assert.Equal(RegistrationStatus.NotRegistered, _calls.ReadRegistration());
+    }
+
+    /// <summary>
+    /// The two reads answer the same question and must not disagree. <c>IsRegistered</c> is kept
+    /// unguarded and unchanged because <c>TrayContext.RebuildMenuAsync</c> depends on its current
+    /// semantics and defends itself by ordering; the tri-state exists for the reconcile timer, where
+    /// ordering buys nothing. Different guards, one answer.
+    /// </summary>
+    [Fact]
+    public void ReadRegistration_agrees_with_IsRegistered_when_nothing_is_held()
+    {
+        Assert.False(_calls.IsRegistered);
+        Assert.NotEqual(RegistrationStatus.Registered, _calls.ReadRegistration());
+    }
+
     [Fact]
     public void Disconnect_on_a_fresh_service_does_not_throw()
     {

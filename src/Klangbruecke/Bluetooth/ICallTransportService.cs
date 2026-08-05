@@ -59,6 +59,28 @@ public readonly record struct CallTransportResult(bool Registered, bool? Transpo
 }
 
 /// <summary>
+/// Whether this process holds the hands-free role - with "could not tell" kept apart from "no".
+///
+/// The distinction exists because the two answers demand opposite actions and only one of them is
+/// safe to guess. <see cref="NotRegistered"/> means register again;
+/// <see cref="Unknown"/> means do nothing at all and ask again on the next tick. Collapsing Unknown
+/// into NotRegistered - which is what a <c>bool</c> forces - would have a transient ABI failure
+/// unregister and re-register a role that was never lost, and that round trip flaps the phone's
+/// call-audio-device option, which is exactly the harm the calls half's design is built around.
+/// </summary>
+public enum RegistrationStatus
+{
+    /// <summary>The role is held by this process.</summary>
+    Registered,
+
+    /// <summary>The role is not held. A measurement, not a fallback.</summary>
+    NotRegistered,
+
+    /// <summary>The read itself failed. No information, and not evidence of either other value.</summary>
+    Unknown,
+}
+
+/// <summary>
 /// The calls half of the app, as its callers see it: find the phone-line transports, claim the
 /// Bluetooth HFP hands-free role on one of them, and answer whether the role is still held.
 ///
@@ -68,10 +90,24 @@ public readonly record struct CallTransportResult(bool Registered, bool? Transpo
 /// </summary>
 public interface ICallTransportService : IDisposable
 {
-    /// <summary>Live PhoneLineTransportDevice.IsRegistered(). False when no transport is held.</summary>
+    /// <summary>
+    /// Live PhoneLineTransportDevice.IsRegistered(). False when no transport is held.
+    ///
+    /// A convenience for callers that can survive a throw by ordering - the tray menu is the one
+    /// such caller. Anything on a timer must use <see cref="ReadRegistration"/> instead: a throw out
+    /// of a timer callback reaches <c>Application.ThreadException</c>, and no amount of ordering
+    /// helps there.
+    /// </summary>
     bool IsRegistered { get; }
 
     event EventHandler<StatusMessage>? Status;
+
+    /// <summary>
+    /// The same question as <see cref="IsRegistered"/>, guarded, and able to say it could not
+    /// answer. This is the one the reconcile loop reads - see <see cref="RegistrationStatus"/> for
+    /// why the third value is not a nicety.
+    /// </summary>
+    RegistrationStatus ReadRegistration();
 
     Task<IReadOnlyList<TransportCandidate>> FindTransportsAsync();
     Task<CallTransportResult> ConnectAsync(string transportDeviceId);

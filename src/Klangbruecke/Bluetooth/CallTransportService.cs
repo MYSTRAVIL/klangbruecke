@@ -37,9 +37,47 @@ public sealed class CallTransportService : ICallTransportService
     /// This is a live ABI call, so callers must not put it anywhere a throw would strand them.
     /// <c>TrayContext.RebuildMenuAsync</c> handles that by ordering rather than by catching - it adds
     /// Exit before reading this - and the reconcile loop that needs to tell "role dropped" from
-    /// "could not read" gets a tri-state of its own rather than a swallow in here.
+    /// "could not read" reads <see cref="ReadRegistration"/> instead, which is a tri-state of its own
+    /// rather than a swallow in here.
     /// </summary>
     public bool IsRegistered => _device is not null && _device.IsRegistered();
+
+    /// <summary>
+    /// The guarded read, and the only place in this class where a failed <c>IsRegistered()</c> is
+    /// swallowed. It is allowed to swallow it precisely because it does not have to lie about the
+    /// result: <see cref="RegistrationStatus.Unknown"/> is a third answer, and
+    /// <c>CallsHalf.ReconcileAsync</c> - the caller this exists for - acts on it by doing nothing.
+    ///
+    /// The guard belongs here rather than at that call site because the call site is on a 30 s timer,
+    /// where an escaping throw unwinds past the callback into <c>Application.ThreadException</c>.
+    /// <see cref="IsRegistered"/> stays unguarded and stays as it is; the tray menu depends on its
+    /// current semantics and defends itself by ordering.
+    ///
+    /// No device is <see cref="RegistrationStatus.NotRegistered"/>, not Unknown. There is nothing to
+    /// ask, which is a known answer - the role cannot be held through a device this class does not
+    /// have.
+    /// </summary>
+    public RegistrationStatus ReadRegistration()
+    {
+        if (_device is null)
+        {
+            return RegistrationStatus.NotRegistered;
+        }
+
+        try
+        {
+            return _device.IsRegistered() ? RegistrationStatus.Registered : RegistrationStatus.NotRegistered;
+        }
+        catch (Exception ex)
+        {
+            // Report only, deliberately not also Log.Error the way the connect path does. That path
+            // runs once per attempt; this one runs every 30 seconds for as long as the app is up, and
+            // an ABI that has started failing would write the same pair of lines twice a minute
+            // forever. Whatever is listening to Status is what puts this in the log.
+            Report($"Could not read the hands-free registration: {ex.Message}", LogLevel.Warn);
+            return RegistrationStatus.Unknown;
+        }
+    }
 
     public event EventHandler<StatusMessage>? Status;
 
