@@ -21,3 +21,6 @@ artifacts/
 *.pfx.password
 
 .env
+
+# Handoff continuation logs (JSON envelopes from headless spawns)
+handoffs/logs/
