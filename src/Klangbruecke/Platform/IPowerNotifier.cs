@@ -40,8 +40,10 @@ namespace Klangbruecke.Platform;
 /// is installed by the first <c>Control</c> constructed, which is <c>ControlUiDispatcher</c>'s
 /// marshalling control in <c>Program.Main</c>, and <c>ConnectionManager.Start</c> is reached from
 /// <c>TrayContext</c>'s constructor. Both run before <c>Application.Run</c> is entered and both are
-/// on the UI thread with the context already current, so this app gets consequence 1 above. Pinned by
-/// <c>UiDispatcherTests.Control_InstallsTheWinFormsSynchronizationContextOnTheThreadThatBuildsIt</c>.</item>
+/// on the UI thread with the context already current, so this app gets consequence 1 above. The
+/// installation itself is pinned by
+/// <c>UiDispatcherTests.Control_InstallsTheWinFormsSynchronizationContextOnTheThreadThatBuildsIt</c> -
+/// which is all it pins, so do not lean on it for anything downstream of the capture.</item>
 /// </list>
 ///
 /// Either way <c>ConnectionManager</c> posts every inbound event through <c>IUiDispatcher</c> before

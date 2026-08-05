@@ -13,12 +13,23 @@ namespace Klangbruecke;
 /// the exact shortcoming of the app this replaces.
 ///
 /// <b>A view, and only a view.</b> It draws a menu, turns a click into one call, and writes what it
-/// is told into a tooltip. It opens no Bluetooth connection, starts no route, reads no package
-/// identity to decide anything, and holds no state machine - <see cref="ConnectionManager"/> owns all
-/// of that, and every handler below calls exactly one of its methods. The rule is worth stating as a
-/// rule because the previous version of this file was the opposite: it held the sink, the call
-/// transport, the router and the device factory, and the connect sequence was 140 lines of tray code
-/// that nothing could test and that had no answer at all for a phone that came back into range.
+/// is told into a tooltip. It opens no Bluetooth connection, starts no route, and holds no state
+/// machine - <see cref="ConnectionManager"/> owns all of that, and every handler that changes
+/// anything calls exactly one of its methods. (Exit is the exception, and the only one: it ends the
+/// message loop, which is <see cref="ApplicationContext"/>'s own job and not the manager's.) The rule
+/// is worth stating as a rule because the previous version of this file was the opposite: it held the
+/// sink, the call transport, the router and the device factory, and the connect sequence was 140
+/// lines of tray code that nothing could test and that had no answer at all for a phone that came
+/// back into range.
+///
+/// <b>It does read <see cref="PackageIdentity.IsPackaged"/>, for two menu labels and nothing else.</b>
+/// Said plainly because the first draft of this comment claimed it read none at all, which the
+/// menu-building path 100 lines below already contradicted - the exact defect class this task was
+/// sweeping up elsewhere. The two reads are <see cref="AudioSinkPolicy.MenuItem"/> and
+/// <see cref="CallsPolicy.MenuItem"/>, both pure functions of the flag, both asserted, and neither
+/// used to decide whether anything is attempted. Deciding <em>that</em> from a process-wide static
+/// stays out of the manager on purpose - see its class comment - which is why the labels are the only
+/// place the flag surfaces at all.
 ///
 /// <b>Four things reach it, and none of them is a seam.</b> The icon it writes to, the presenter that
 /// writes to it, the manager it asks, and the settings - read only, for the ticks beside the menu
@@ -57,9 +68,17 @@ internal sealed class TrayContext : ApplicationContext
         _icon.ContextMenuStrip = _menu;
         _menu.Opening += OnMenuOpening;
 
+        // Both, and the second is not a nicety. The tooltip is one line with two writers - these, and
+        // every component's own Status - so a component announcement displaces the state sentence and
+        // something has to bring it back. StateChanged alone could not: a connection that stays
+        // Connected while its detail moves from "waiting for phone audio" to "music and calls up"
+        // raises nothing, and "A2DP sink state: Closed" would sit in the tooltip over a working route.
+        // That is the exact failure leading with the state was meant to fix.
+        //
         // Before Start, because Start ends in a Publish and an announcement with nobody listening is
         // the one the tooltip would spend the whole session missing.
         _connection.StateChanged += OnConnectionStateChanged;
+        _connection.DetailChanged += OnConnectionDetailChanged;
 
         // <b>Here, and the thread this runs on is the point.</b> Start subscribes PowerNotifier, and
         // SystemEvents captures whichever SynchronizationContext is current at that moment and
@@ -84,6 +103,9 @@ internal sealed class TrayContext : ApplicationContext
     /// a different instant, and "Connected" beside "retrying in 8s" is worse than either alone.
     /// </summary>
     private void OnConnectionStateChanged(object? sender, ConnectionState state) => ShowConnectionState();
+
+    /// <summary>The name held still and the phrase moved. Same sentence, same repaint.</summary>
+    private void OnConnectionDetailChanged(object? sender, EventArgs e) => ShowConnectionState();
 
     private void ShowConnectionState() => _status.Show(_connection.State, _connection.Detail);
 
@@ -183,7 +205,19 @@ internal sealed class TrayContext : ApplicationContext
 
     private async Task<ToolStripMenuItem> BuildPhoneMenuAsync()
     {
-        var phoneMenu = new ToolStripMenuItem("Phone");
+        // The music half's only statement anywhere that it needs the packaged build. See
+        // AudioSinkPolicy.MenuItem for why this one stays clickable where the calls item does not.
+        (string text, bool enabled) = AudioSinkPolicy.MenuItem(PackageIdentity.IsPackaged);
+
+        var phoneMenu = new ToolStripMenuItem(text) { Enabled = enabled };
+
+        // Mirrors the Output submenu's "System default", and it is the only way to tell the app to
+        // stop caring about phones at all - Disconnect is a latch that expires when the phone leaves
+        // and returns, which is a different thing.
+        var none = new ToolStripMenuItem("None") { Checked = _settings.PhoneDeviceId is null };
+        none.Click += (_, _) => _connection.DeselectPhone();
+        phoneMenu.DropDownItems.Add(none);
+        phoneMenu.DropDownItems.Add(new ToolStripSeparator());
 
         try
         {

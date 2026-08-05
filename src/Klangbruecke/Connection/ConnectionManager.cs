@@ -28,6 +28,11 @@ namespace Klangbruecke.Connection;
 /// <see cref="_endpointProbe"/> - because the thing they guard is deliberately <em>not</em> on this
 /// thread.
 ///
+/// <b>Never add <c>ConfigureAwait(false)</c> to anything in here or in the two halves.</b> It reads
+/// like a tidy-up and it is the one token that takes the whole design apart: the continuation moves
+/// to whichever thread answered the radio, and four machines that hold no lock start sharing state
+/// across threads. <c>A_reconcile_resumes_on_the_context_that_started_it</c> is what goes red.
+///
 /// <b>What it does not do.</b> It never reads <c>ICallTransportService.IsRegistered</c>: that is a
 /// live CsWinRT ABI call, and a throw out of a timer callback reaches
 /// <c>Application.ThreadException</c> where no ordering helps. <see cref="CallsHalf"/> reads the
@@ -220,6 +225,32 @@ public sealed class ConnectionManager : IDisposable
 
     /// <summary>Raised on the UI thread, once per change of <see cref="State"/>.</summary>
     public event EventHandler<ConnectionState>? StateChanged;
+
+    /// <summary>
+    /// Raised on the UI thread when <see cref="Detail"/> moved and <see cref="State"/> did not.
+    ///
+    /// <b>The name is not the whole sentence, and the half that moves most often is the half the other
+    /// event cannot report.</b> Music going Linked to Up leaves the state at <c>Connected</c> and
+    /// changes the detail from "waiting for phone audio" to "music and calls up" - two different
+    /// things for the user to do, under one name. So does a Degraded half going from "music is not
+    /// running" to "music retrying in 8s". A tray listening only to <see cref="StateChanged"/> shows
+    /// the older phrase until the state itself moves, which for a stable connection can be the rest of
+    /// the session - and, worse, leaves a component's own announcement sitting in the tooltip with
+    /// nothing to displace it.
+    ///
+    /// <b>Exclusive with <see cref="StateChanged"/>, never both.</b> A state change already carries a
+    /// recomputed detail, so raising both would repaint the tray twice for one move and write the
+    /// sentence to the log twice with it.
+    ///
+    /// <b>And only on a change.</b> <see cref="Publish"/> runs at the end of every completed reconcile
+    /// pass, so an unconditional report would be one identical log entry every 30 s for the life of
+    /// the process - the same arithmetic <see cref="ReportDrift"/> refuses.
+    ///
+    /// No argument, unlike <see cref="StateChanged"/>: a subscriber that wants the phrase reads
+    /// <see cref="Detail"/> beside <see cref="State"/>, which is the only way to get both halves of
+    /// the sentence from one instant.
+    /// </summary>
+    public event EventHandler? DetailChanged;
 
     /// <summary>
     /// The manager's own announcements, for the tray tooltip and the log.
@@ -1250,13 +1281,24 @@ public sealed class ConnectionManager : IDisposable
     /// </summary>
     private void Publish()
     {
-        ConnectionState previous = State;
+        ConnectionState previousState = State;
+
+        // Captured beside the state, and the pair is why both are captured rather than only the one
+        // that used to be. A detail that moved under an unchanged name is a real change with a real
+        // consumer - see DetailChanged - and it was previously unobservable from outside this class.
+        string previousDetail = Detail;
 
         Refresh();
 
-        if (State != previous)
+        if (State != previousState)
         {
             StateChanged?.Invoke(this, State);
+        }
+        else if (!string.Equals(Detail, previousDetail, StringComparison.Ordinal))
+        {
+            // else, not a second if. The state change above already carries a recomputed detail, and
+            // both firing for one move would repaint the tray twice and log the sentence twice.
+            DetailChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 

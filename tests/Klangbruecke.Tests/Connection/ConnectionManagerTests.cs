@@ -1137,6 +1137,68 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
     }
 
+    /// <summary>
+    /// <b>Every await in a pass resumes on the thread the pass started on</b> - which is the whole of
+    /// what makes four state machines with no lock between them correct.
+    ///
+    /// Two things have to be true for that, and only one of them had anything going red. The first is
+    /// that the UI thread carries a <see cref="SynchronizationContext"/> at all; in the app that is
+    /// the WinForms one, installed by <c>ControlUiDispatcher</c>'s marshalling control, and
+    /// <c>UiDispatcherTests</c> pins it. The second is that <b>nothing on these paths calls
+    /// <c>ConfigureAwait(false)</c></b> - a one-token change that looks like a tidy-up and silently
+    /// moves the continuation onto whichever thread answered. Nothing in the suite could see it: every
+    /// double answers instantly, so the continuation runs inline on the test thread with or without a
+    /// captured context.
+    ///
+    /// This makes the difference observable. The link read is held open, answered from a worker
+    /// thread, and the continuation is then either posted back here - captured - or run on the worker.
+    /// The reconcile's link read is the deepest await in the class and the four below it are reached
+    /// only through it, so this covers the pass end to end.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_resumes_on_the_context_that_started_it()
+    {
+        SynchronizationContext? original = SynchronizationContext.Current;
+        var context = new RecordingSynchronizationContext();
+        SynchronizationContext.SetSynchronizationContext(context);
+
+        try
+        {
+            using Harness h = new();
+
+            // The pass starts on this thread, with this context current, and parks on the link read.
+            h.Link.DeferRead = true;
+            h.Scheduler.Advance(Seconds(30));
+
+            int posts = context.PostCount;
+            Assert.Equal(0, context.PendingCount);
+
+            // Answered from somewhere else entirely. Joined, so the assertion below cannot race: the
+            // continuation is either posted or run by the time SetResult returns.
+            var worker = new Thread(() => h.Link.CompleteRead(BluetoothLinkStatus.Connected));
+            worker.Start();
+            worker.Join();
+
+            // Posted, not run. A ConfigureAwait(false) anywhere above leaves this at zero, because the
+            // worker thread would have carried the rest of the pass itself.
+            Assert.Equal(posts + 1, context.PostCount);
+
+            // And the state has not moved yet, which is the other half of "not run": the pass is
+            // sitting in this queue, not finished on the worker.
+            Assert.Equal(ConnectionState.Discovering, h.Manager.State);
+
+            // Draining is the message loop's job, and doing it here carries the rest of the pass -
+            // four more awaits, all on completed tasks - through to the end on this thread.
+            context.Drain();
+
+            Assert.Equal(ConnectionState.Connected, h.Manager.State);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(original);
+        }
+    }
+
     // --- what the tray is told -----------------------------------------------------------------
 
     /// <summary>
@@ -1164,6 +1226,111 @@ public sealed class ConnectionManagerTests : IDisposable
         // Music Linked -> Up is a real transition of a real machine and reports the same Connected.
         h.SetEndpointPresent(true);
         Assert.Equal(5, h.States.Count);
+    }
+
+    /// <summary>
+    /// The name is not the whole sentence, and the half of it that moves most often is the half
+    /// <c>StateChanged</c> cannot report.
+    ///
+    /// Music going Linked -> Up keeps the state at <c>Connected</c> and changes the detail from
+    /// "waiting for phone audio" to "music and calls up" - two different things for the user to do,
+    /// under one name. With only <c>StateChanged</c> the tray had no way to hear it, so the tooltip
+    /// sat on the older phrase until the state itself moved.
+    /// </summary>
+    [Fact]
+    public void Detail_changing_under_an_unchanged_state_is_reported()
+    {
+        using Harness h = new();
+
+        h.ReachConnected();
+        Assert.Equal("waiting for phone audio", h.Manager.Detail);
+
+        int states = h.States.Count;
+        int details = h.Details.Count;
+
+        h.SetEndpointPresent(true);
+
+        Assert.Equal(states, h.States.Count);
+        Assert.Equal(details + 1, h.Details.Count);
+        Assert.Equal("music and calls up", h.Details[^1]);
+    }
+
+    /// <summary>
+    /// At most one of the pair per publish. Both firing would repaint the tooltip twice for one move
+    /// and write the sentence to the log twice with it - and the tray's whole reason for repainting
+    /// on the detail is that it does not already repaint on the state.
+    /// </summary>
+    [Fact]
+    public void A_state_change_reports_itself_once_and_not_also_as_a_detail_change()
+    {
+        using Harness h = new();
+
+        int details = h.Details.Count;
+
+        // Discovering -> Connecting -> ... -> Connected: every one of them changes the detail too,
+        // because the detail is derived from the state.
+        h.ReachConnected();
+
+        Assert.True(h.States.Count > 1);
+        Assert.Equal(details, h.Details.Count);
+    }
+
+    /// <summary>
+    /// A publish that corrects nothing says nothing. The reconcile publishes on every completed pass
+    /// - once per 30 s for the life of the process - and the tray logs every sentence it is handed,
+    /// so a detail report that fired unconditionally would be 2,880 identical entries a day.
+    /// </summary>
+    [Fact]
+    public void An_unchanged_detail_is_not_reported()
+    {
+        using Harness h = new();
+
+        h.ReachRouting();
+
+        int states = h.States.Count;
+        int details = h.Details.Count;
+
+        // Two full reconcile passes over a connection that is behaving.
+        h.Scheduler.Advance(Seconds(60));
+
+        Assert.Equal(states, h.States.Count);
+        Assert.Equal(details, h.Details.Count);
+    }
+
+    /// <summary>
+    /// The tray tooltip has one line and two writers, and this is the pair wired together the way
+    /// <c>Program.Main</c> and <c>TrayContext</c> wire them - a component's <c>Status</c> straight to
+    /// the presenter, and the state sentence repainted from the manager.
+    ///
+    /// The failure being pinned: a component announcement displaces the state sentence, and before
+    /// the detail was reported at all, only a change of <em>state</em> brought it back. "A2DP sink
+    /// state: Closed" could therefore sit in the tooltip while the app was up and routing again,
+    /// which is the exact thing leading with the state was meant to fix.
+    /// </summary>
+    [Fact]
+    public void A_component_status_does_not_hold_the_tooltip_past_the_next_change()
+    {
+        var written = new List<string>();
+        var presenter = new StatusPresenter(new ImmediateUiDispatcher(), written.Add);
+
+        using Harness h = new();
+
+        // The two lines the shell uses, and no others.
+        h.Manager.StateChanged += (_, _) => presenter.Show(h.Manager.State, h.Manager.Detail);
+        h.Manager.DetailChanged += (_, _) => presenter.Show(h.Manager.State, h.Manager.Detail);
+
+        h.ReachConnected();
+        Assert.Equal("Klangbruecke: Connected — waiting for phone audio", written[^1]);
+
+        // A component speaking for itself, exactly as AudioSinkService.PublishState does.
+        presenter.Show("A2DP sink state: Closed");
+        Assert.Equal("Klangbruecke: A2DP sink state: Closed", written[^1]);
+
+        // And the next thing that moves is a detail, not a state: the endpoint arrives and music
+        // goes Linked -> Up under an unchanged Connected.
+        h.SetEndpointPresent(true);
+
+        Assert.Equal("Klangbruecke: Connected — music and calls up", written[^1]);
     }
 
     /// <summary>
@@ -1711,6 +1878,7 @@ public sealed class ConnectionManagerTests : IDisposable
 
             Manager = new ConnectionManager(Settings, Sink, Calls, Router, Endpoints, Link, Scheduler, Power, Ui);
             Manager.StateChanged += (_, state) => States.Add(state);
+            Manager.DetailChanged += (_, _) => Details.Add(Manager.Detail);
             Manager.Status += (_, message) => Status.Add(message);
 
             Manager.Start();
@@ -1742,6 +1910,13 @@ public sealed class ConnectionManagerTests : IDisposable
 
         /// <summary>Every reported state change, oldest first.</summary>
         public List<ConnectionState> States { get; } = new();
+
+        /// <summary>
+        /// Every detail reported <em>without</em> the state moving, oldest first. Deliberately not the
+        /// detail behind every entry in <see cref="States"/> as well: the two events are exclusive, and
+        /// a list that merged them could not tell a test which of the pair had fired.
+        /// </summary>
+        public List<string> Details { get; } = new();
 
         public List<StatusMessage> Status { get; } = new();
 

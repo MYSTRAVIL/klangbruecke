@@ -94,11 +94,18 @@ internal static class Program
     /// <list type="number">
     /// <item>The dispatcher is first. Constructing it creates a <c>Control</c>, and a Control's
     /// constructor installs the WinForms <c>SynchronizationContext</c> on this thread - which is what
-    /// makes every <c>await</c> in <c>ConnectionManager</c> resume on the UI thread with no
-    /// <c>ConfigureAwait</c> anywhere in it, and what makes <c>PowerNotifier</c>'s subscription later
-    /// capture this thread rather than the <c>SystemEvents</c> window thread. "Before
-    /// <c>Application.Run</c>" is not the same question as "before the context exists", and this is
-    /// the line that separates them.</item>
+    /// makes <c>PowerNotifier</c>'s subscription later capture this thread rather than the
+    /// <c>SystemEvents</c> window thread. "Before <c>Application.Run</c>" is not the same question as
+    /// "before the context exists", and this is the line that separates them. Pinned by
+    /// <c>UiDispatcherTests.Control_InstallsTheWinFormsSynchronizationContextOnTheThreadThatBuildsIt</c>.
+    /// <para>
+    /// It is also one of the two things that make every <c>await</c> in <c>ConnectionManager</c>
+    /// resume on the UI thread, which is what lets four state machines share it with no lock. The
+    /// other is that nothing on those paths calls <c>ConfigureAwait(false)</c>, and that is a separate
+    /// claim with a separate test -
+    /// <c>ConnectionManagerTests.A_reconcile_resumes_on_the_context_that_started_it</c>. Neither test
+    /// covers the other's leg; do not read one as evidence for both.
+    /// </para></item>
     /// <item>The status subscriptions come after the presenter is constructed, never before. They
     /// used to be taken first and were safe only because nothing raised a status until the end of the
     /// same constructor - a fact about call ordering, not about the code, and one edit away from
@@ -108,6 +115,9 @@ internal static class Program
     /// through this dispatcher and writes this icon - and a late endpoint probe still posts through
     /// it from the threadpool. Disposing it first would drop the first and let the second run inline
     /// on a threadpool thread.</item>
+    /// <item>The icon is made visible <em>after</em> the tray is constructed, because the tray's
+    /// constructor is where <c>ConnectionManager.Start</c> makes its three live-device calls and a
+    /// throw out of any of them never reaches the Dispose that would hide it.</item>
     /// </list>
     /// </summary>
     private static void RunTray()
@@ -150,11 +160,20 @@ internal static class Program
         var connection = new ConnectionManager(
             settings, sink, callTransport, router, endpoints, link, scheduler, power, ui);
 
+        // Built hidden. It is shown below, after the tray exists to hide it again.
+        //
+        // TrayContext's constructor calls ConnectionManager.Start, which subscribes SystemEvents,
+        // registers an MMDevAPI notification client and starts a DeviceWatcher - three live-device
+        // calls, none of them inside a try. A throw out of any of them escapes before
+        // Application.Run, so ApplicationContext.Dispose is never reached and nothing ever hides the
+        // icon: a visible icon in the notification area belonging to a process that has already
+        // gone, which the shell leaves drawn until it next reaps it. Shown after construction, that
+        // failure leaves nothing on screen at all.
         var icon = new NotifyIcon
         {
             Icon = SystemIcons.Application,
             Text = "Klangbruecke",
-            Visible = true,
+            Visible = false,
         };
 
         var status = new StatusPresenter(ui, text => icon.Text = text);
@@ -171,7 +190,13 @@ internal static class Program
         router.Status += (_, m) => status.Show(m);
         connection.Status += (_, m) => status.Show(m);
 
-        Application.Run(new TrayContext(icon, status, connection, settings));
+        var tray = new TrayContext(icon, status, connection, settings);
+
+        // Only now. Everything that could throw on the way up has run, and from here the icon has an
+        // owner whose Dispose hides it. See the note where it was built.
+        icon.Visible = true;
+
+        Application.Run(tray);
     }
 
     /// <summary>
