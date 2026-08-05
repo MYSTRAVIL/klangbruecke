@@ -715,7 +715,7 @@ The fakes need to be able to: raise `RecordingStopped` / `PlaybackStopped` on de
 | `IsRunning_is_false_when_the_capture_stopped_status_is_raised` | a `Status` subscriber reads `IsRunning` at the instant it is invoked | 2 |
 | `IsRunning_is_false_when_the_playback_stopped_status_is_raised` | same for the playback handler | 2 |
 | `Stop_is_not_re_entered_when_disposal_re_raises_stopped` | fake's `Dispose` raises `Stopped`; `Stop()` runs its body once | 3 |
-| `A_queued_teardown_is_a_no_op_after_Stop_already_ran` | deferring dispatcher; `Stop()`, then drain; no second teardown | 3 |
+| `A_queued_teardown_is_a_no_op_after_Stop_already_ran` | deferring dispatcher; `Stop()`, then drain; no second teardown | 4 |
 | `A_teardown_posted_before_a_restart_does_not_kill_the_new_route` | deferring dispatcher; raise stopped, `Stop()`, `Start()`, then drain; the new route is still running | 4 |
 | `A_stopped_event_from_a_replaced_capture_is_ignored` | keep the first fake, `Start()` again, raise stopped on the old one; nothing tears down | 5 |
 | `A_stopped_event_from_a_replaced_output_is_ignored` | same for the render side | 5 |
