@@ -93,11 +93,17 @@ is disconnected and reconnected for real**, and record the result here.
 
 **Measured, and it is the same answer whether registration happens from an MTA or an STA thread.**
 
-Thread ids below are the ones that appear in the saved logs, counted with a case-sensitive match on
-the logger's `CALLBACK <client>.` field. (A first pass at this used a case-insensitive `CALLBACK`,
-which also matches `RegisterEndpointNotificationCallback returned …` and `40 callback(s) seen` —
-main-thread lines — and so wrongly made `tid=4`, the registering thread, look like a callback
-thread. The numbers here are from the corrected count.)
+Thread ids below are the ones that appear in the **saved logs**, counted with a case-sensitive match
+on the logger's `CALLBACK <client>.` field. Two corrections got them here, and they are separate:
+
+- An earlier draft of this table listed `tid=7` and `tid=8` for the MTA registrant. Both came from a
+  20-second `watch mta` smoke run at 02:10 whose output went to the console and was never written to
+  a file. They were real observations, but nothing can re-read them, so they are out.
+- A first attempt at recounting used a case-insensitive `CALLBACK`, which also matches
+  `RegisterEndpointNotificationCallback returned …` and `40 callback(s) seen` — main-thread lines —
+  inflating every tally by 3 and making `tid=4`, the registering thread, appear to be a callback
+  thread. That was an error in the checking, not in the earlier table. The numbers below come from
+  the corrected, case-sensitive count.
 
 | Registering thread | Callback arrives on | Log |
 |---|---|---|
@@ -124,9 +130,11 @@ Consequences:
   against it.** Distinct thread ids over time do not establish overlap. The only run that holds a
   handler open long enough to test it — `reentrant`, where each handler blocks 152–282 ms in an
   inline lookup — shows strict serialization: the next callback starts 1 ms *after* the previous
-  handler returned, every time (`02:17:00.606` enter → `.858` return → `.859` next enter). Two
-  milliseconds across all logs carry two different callback thread ids, which at the log's 1 ms
-  resolution is equally consistent with fast sequential delivery. **Build the handler thread-safe
+  handler returned, every time (`02:17:00.606` enter → `.858` return → `.859` next enter). Exactly
+  two milliseconds across all logs carry two different callback thread ids — `02:15:51.916` in
+  `lifetime-mta.log` (tid 5 and 6) and `02:16:00.673` in `lifetime-sta.log` (tid 5 and 6) — which at
+  the log's 1 ms resolution is equally consistent with fast sequential delivery. **Build the handler
+  thread-safe
   anyway** — that is a precaution against an unmeasured hypothesis, not a measured requirement, and
   it is cheap.
 - **Callbacks are duplicated.** One trigger — `SetDefaultEndpoint` called once for each of the
@@ -385,20 +393,36 @@ from "the listener was dead".
 
 Registration, delivery, and the threads — MTA registrant (`lifetime mta`):
 
-**How these blocks are edited.** The logger (source at the end of this note) emits every line as
-`HH:mm:ss.fff +N,NNs [tid=N apt=X pool=Y bg=Y] text`, unconditionally. In the blocks below:
+**How these blocks are edited — read this before counting lines.** The logger (source at the end of
+this note) emits every line as `HH:mm:ss.fff +N,NNs [tid=N apt=X pool=Y bg=Y] text`,
+unconditionally. What follows are **excerpts, not runs.** Specifically:
 
-- device-id suffixes like `[{0.0.1.00000000}.{03bb069a-…}]` are trimmed off the end;
-- the logger's column padding (it pads `apt=` to 11 characters) is collapsed to single spaces;
-- the `pool=` and `bg=` columns are dropped **only** where they are constant for the whole block —
-  they read `pool=N bg=N` on main-thread lines and `pool=N bg=Y` on every callback line, without
-  exception, and the first block below keeps them in full so the real format is visible;
-- `[... x omitted ...]` marks lines removed from the middle of a run;
-- `(xN)` marks N consecutive identical lines collapsed to one;
-- anything in `( )` at the right-hand end of a line, and any `<-` marker, is my annotation, not
+- **Lines are dropped silently almost everywhere.** Exactly two blocks mark an interior gap — the
+  `lifetime mta` block (`[... 7 lines omitted ...]`) and the `sta-pump` block
+  (`[... 8 further callbacks ...]`). Every other block drops phase headers, `Register`/`TRIGGER`
+  lines and most callback lines with **no marker at all**. **Do not infer a callback count from the
+  number of lines shown** — the counts are in the probe's own `RESULT …: N callback(s)` and
+  `Watch window over. N callback(s) seen.` lines, which are what the note's claims rest on. Where a
+  block shows two callbacks and its own `RESULT` says ten, the other eight were dropped here, not
+  missing from the log.
+- Device-id suffixes like `[{0.0.1.00000000}.{03bb069a-…}]` are trimmed off the end, and so is
+  trailing explanatory text inside a line — the `(False => …)` clause on the GC line, `: {message}`
+  after an exception type, the `(non-zero => …)` gloss on `RESULT P4`, and the
+  `pid=… os=… clr=…` tail of the `Probe start` line (one block keeps that tail, the other trims it).
+- The logger's column padding (it pads `apt=` to 11 characters) is collapsed to single spaces, and
+  the `pool=`/`bg=` columns are dropped in most blocks — including blocks that mix main-thread lines
+  (`bg=N`) with callback lines (`bg=Y`). The first block below keeps them in full so the real format
+  is visible, and the per-log statement that every callback line reads `pool=N bg=Y` comes from
+  matching the files, not from these excerpts.
+- `(xN)` means **N occurrences of that line within that stretch of the run**, not N consecutive
+  identical lines, and it carries the timestamp range it stands for. (The `throwing` block's ten
+  throws are two bursts of five either side of a line printed between them; they are shown as two
+  `(x5)` markers in the right places rather than one collapse that would imply the wrong order.)
+- Anything in `( )` at the right-hand end of a line, and any `<-` marker, is my annotation, not
   probe output.
 
-Nothing is reworded, reordered, or re-timed.
+No block reorders or re-times anything: quoted lines appear in log order, and within a line the
+timestamp, thread id and message text are as the probe printed them.
 
 ```
 02:15:39.539 +  1,36s [tid=4   apt=MTA  pool=N bg=N] Register -> 0x00000000
@@ -483,8 +507,9 @@ A handler that throws (`throwing mta`):
 
 ```
 02:16:53.336 +  1,37s [tid=5  apt=MTA  pool=N bg=Y] CALLBACK throwing.OnDefaultDeviceChanged: about to throw InvalidOperationException
-   (x10)
+   (x5, 02:16:53.336-.367 — the flip)
 02:16:54.872 +  2,91s [tid=4  apt=MTA  pool=N bg=N] RESULT: the process is still alive after the handler threw.
+   (x5 more, 02:16:54.877-.912 — the restore, interleaved with the RestoreDefaults lines)
 02:16:55.728 +  3,76s [tid=4  apt=MTA  pool=N bg=N] Unregister -> 0x00000000
 02:16:55.728 +  3,76s [tid=4  apt=MTA  pool=N bg=N] RESULT: 10 exception(s) thrown out of callbacks; process still running.
 ```
@@ -561,12 +586,15 @@ temp directory, and the decision above asks for it to be re-run against a real p
 the whole thing is reproduced here. Three files, copy-paste into an empty directory,
 `dotnet run -c Release -- <mode>`. Nothing outside NAudio 2.2.1 is required.
 
-This was verified rather than asserted: the two source blocks below were extracted back out of this
-markdown file, diffed against the files that produced every measurement above (`Program.cs`,
-832 lines — **identical**), then built and run from the extracted copy. That round-trip build
-succeeded with 0 warnings and the resulting binary delivered callbacks normally
-(`watch mta 16` at 02:42, 10 callbacks on `tid=6`/`tid=7`, controls verified `TOOK EFFECT`,
-exit code 0).
+This was verified rather than asserted: all three source blocks below were extracted back out of
+this markdown file and diffed against the files that produced every measurement above — all three
+**identical**, `Program.cs` at 832 lines — then built and run from the extracted copy. The
+round-trip build reported `Build succeeded. 0 Warning(s) 0 Error(s)` and the resulting binary
+behaved normally on a `watch mta 16` run at 02:42.
+
+That round-trip run's output went to the console and was **not** saved to a log, so unlike
+everything under "Raw output" it cannot be re-read — take it as a build-and-smoke check, not as
+evidence for any claim in this note. Nothing above rests on it.
 
 The parts worth reading before re-running:
 
@@ -580,8 +608,12 @@ The parts worth reading before re-running:
   before touching anything and put them back after. `setdefault` mode exists so an orchestration
   script can restore them from outside even when a probe run dies mid-way, which two of them do on
   purpose.
-- **`PhaseClientOnlyWeaklyHeld`** — the one that kills the process. It runs as its own mode, last,
-  because a crash mid-suite skips both the remaining phases and the restore.
+- **`PhaseClientOnlyWeaklyHeld`** — the one that kills the process. It is split out into its own
+  `weakclient` mode so that its crash cannot skip the phases that would have followed it inside
+  `Lifetime()`. What protects the machine's default endpoints is *not* where it sits in the running
+  order — `run-suite.ps1` runs it fourth and fifth of seven, ahead of `throwing` and `reentrant` —
+  but the unconditional `Restore` that the script's `Run` helper performs after every run, by
+  explicit device id, whether the run exited 0 or died.
 
 ### `EndpointProbe.csproj`
 
