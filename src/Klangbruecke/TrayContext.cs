@@ -341,9 +341,10 @@ internal sealed class TrayContext : ApplicationContext
 
         try
         {
-            // Deliberately not naming the WinRT type. The calls half gets its own record and its own
-            // seam in the next task; until then this line is the last place DeviceInformation could
-            // leak into the tray, and the point of the music half's seam is that it does not.
+            // Deliberately inferred rather than declared. The music half's whole point this task was
+            // to stop the tray naming WinRT enumeration types at all; the calls half gets its own
+            // record and its own seam in the next task, and until it does this is the one line that
+            // would put one back. Grep this file for the type name and there should be no hits.
             var transports = await CallTransportService.FindDevicesAsync();
 
             TransportMatchResult result = TransportMatcher.Match(
