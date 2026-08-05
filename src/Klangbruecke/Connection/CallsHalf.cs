@@ -66,6 +66,10 @@ public sealed class CallsHalf
     /// rather than only stranding the state. That is the intended trade - the alternative to blocking
     /// is the overlap above - and a registration that never returns is a reconcile-side timeout
     /// question, which belongs to the manager and not here.
+    ///
+    /// The manager has since answered it, and the answer is no: see <c>ConnectionManager</c>'s
+    /// reconcile, which explains why a teardown underneath a call that has not returned is a worse
+    /// outcome than a half that goes on reporting Registering.
     /// </summary>
     private bool _inFlight;
 

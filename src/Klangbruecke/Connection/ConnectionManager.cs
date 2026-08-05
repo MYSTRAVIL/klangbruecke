@@ -62,6 +62,20 @@ public sealed class ConnectionManager : IDisposable
     /// </summary>
     private static readonly TimeSpan ResumeSettle = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// How long a pass may be running before the next one stops deferring to it.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately shorter than <see cref="ReconcilePeriod"/> rather than equal to it. A pass starts
+    /// a hair <em>after</em> the tick that launched it, so with the two the same the tick one period
+    /// later would find the wedged pass a few microseconds short of the threshold and defer as well -
+    /// recovery would cost two periods instead of one, on the real timer, and never in a test where
+    /// virtual time lands exactly on the boundary. Five seconds of margin, on the same reasoning as
+    /// the resume settle: long enough that a slow-but-live read is not abandoned, short enough that
+    /// the tick that finds it does not have to be punctual.
+    /// </remarks>
+    private static readonly TimeSpan ReconcileStall = TimeSpan.FromSeconds(25);
+
     private readonly Settings _settings;
     private readonly IAudioSinkService _sink;
     private readonly ICallTransportService _callTransport;
@@ -96,8 +110,11 @@ public sealed class ConnectionManager : IDisposable
     /// A time rather than a bool, and the difference is the whole reason this app exists. A read that
     /// never completes would leave a bool set for the life of the process and silently stop the only
     /// backstop the app has - an app that is wrong forever with nothing to correct it, which is the
-    /// predecessor's defining bug rebuilt out of a mutex. A pass that has been running longer than
-    /// the interval between passes has stopped being one to defer to.
+    /// predecessor's defining bug rebuilt out of a mutex. A pass still running after
+    /// <see cref="ReconcileStall"/> has stopped being one to defer to.
+    ///
+    /// Deferring is only half the invariant; the abandoned pass must also stop acting when it finally
+    /// answers. See <see cref="Superseded"/>.
     /// </summary>
     private DateTimeOffset? _reconcilingSince;
 
@@ -110,6 +127,13 @@ public sealed class ConnectionManager : IDisposable
     /// route audio over it when the capture endpoint finally arrived - finding #2, rebuilt out of a
     /// setting. Released the moment every enabled half is up, in <see cref="Publish"/>, because from
     /// there on the setting is what the user meant.
+    ///
+    /// <b>It is released by success, not by time, and that is the one shape of "auto-reconnect off
+    /// still reconnects".</b> A click whose halves never come up keeps its permission and goes on
+    /// retrying on the backoff - one attempt a minute at the ceiling - until the user disconnects,
+    /// deselects, or it works. That is the brief's definition taken literally, and it is the
+    /// defensible half of the trade: the failure mode is an app that keeps trying to do what it was
+    /// asked, and the alternative failure mode is the predecessor's.
     /// </summary>
     private bool _clickGrant;
 
@@ -226,13 +250,23 @@ public sealed class ConnectionManager : IDisposable
         Publish();
     }
 
-    public Task<IReadOnlyList<PhoneDevice>> FindPhonesAsync() => _sink.FindDevicesAsync();
+    /// <summary>
+    /// Empty rather than an enumeration once disposed, for the reason the setters return early: the
+    /// tray rebuilds its menu on every right-click, and a right-click during shutdown would otherwise
+    /// reach a device enumerator this class has already let go of.
+    /// </summary>
+    public Task<IReadOnlyList<PhoneDevice>> FindPhonesAsync() => _disposed
+        ? Task.FromResult<IReadOnlyList<PhoneDevice>>(Array.Empty<PhoneDevice>())
+        : _sink.FindDevicesAsync();
 
     /// <summary>
     /// Through the router, so nothing above this class ever names a WASAPI type - see
-    /// <see cref="IAudioRouter.ListOutputs"/>.
+    /// <see cref="IAudioRouter.ListOutputs"/>. Empty once disposed, as
+    /// <see cref="FindPhonesAsync"/> is, and for the same right-click.
     /// </summary>
-    public IReadOnlyList<AudioOutputDevice> ListOutputDevices() => _router.ListOutputs();
+    public IReadOnlyList<AudioOutputDevice> ListOutputDevices() => _disposed
+        ? Array.Empty<AudioOutputDevice>()
+        : _router.ListOutputs();
 
     /// <summary>
     /// The user picked a phone. The most explicit "connect to this" the app has: it clears the
@@ -336,6 +370,16 @@ public sealed class ConnectionManager : IDisposable
             Publish();
             return;
         }
+
+        // The same grant a phone selection gets, on the same reasoning: the switch going on is an
+        // explicit "do this now", and without it turning calls on with auto-reconnect off is a menu
+        // item that visibly does nothing. It is a grant rather than a one-off attempt because
+        // registration is a two-step round trip that can legitimately need a retry.
+        //
+        // It does also let the music half finish coming up, since one grant covers both halves. That
+        // is the intended reading of "finishing what the user started" - the user asked for the phone
+        // to be usable, not for half of it.
+        _clickGrant = true;
 
         _ = RegisterCallsAsync();
     }
@@ -497,17 +541,17 @@ public sealed class ConnectionManager : IDisposable
     /// <summary>
     /// An audio endpoint somewhere on the machine changed - most likely nothing to do with us.
     ///
-    /// The one handler that does not post first, and the exception is the point. What must reach the
-    /// UI thread is a bool; what must never run on it is the read that produces one. So the read
-    /// happens here, on whichever thread the OS raised this on - measured as MMDevAPI's own worker
-    /// threads, never the registering one - and only its answer is posted. That is also why the gate
-    /// is <see cref="Interlocked"/> rather than a plain flag.
+    /// <b>Marks dirty; it does not go and look.</b> This runs on whichever thread the OS raised it on -
+    /// MMDevAPI's own MTA workers, and once on the UI thread, because <c>EndpointMonitor.Start</c>
+    /// reports an already-present endpoint by raising from inside itself. Neither may spend 152-282 ms
+    /// here: an <c>IMMNotificationClient</c> callback is contractually required not to block, and the
+    /// UI-thread raise would put a second full enumeration on the startup path on top of the one
+    /// <c>EndpointMonitor.Start</c> has just done. So the only work on this thread is shutting the
+    /// gate; the read happens on the threadpool and only its answer comes back.
     ///
-    /// One raise is on the UI thread, and it is worth naming rather than glossing:
-    /// <c>EndpointMonitor.Start</c> reports an already-present endpoint by raising this from inside
-    /// itself, on the thread that called it. That costs one enumeration on the startup path - where
-    /// that class has just done the identical read, one line earlier, on the same thread - before the
-    /// tray icon has a menu to freeze. Every later read is off this thread.
+    /// The gate closes here rather than on the worker, and that ordering is the collapse: it is shut
+    /// synchronously, before this returns, so the rest of a burst is turned away whether or not the
+    /// probe has started yet.
     /// </summary>
     private void OnEndpointsChanged(object? sender, EventArgs e)
     {
@@ -519,7 +563,7 @@ public sealed class ConnectionManager : IDisposable
             return;
         }
 
-        ProbeEndpointLevel();
+        _ = Task.Run(ProbeEndpointLevel);
     }
 
     // --- the grace window -----------------------------------------------------------------------
@@ -602,7 +646,7 @@ public sealed class ConnectionManager : IDisposable
             return;
         }
 
-        if (_reconcilingSince is { } running && _scheduler.Now - running < ReconcilePeriod)
+        if (_reconcilingSince is { } running && _scheduler.Now - running < ReconcileStall)
         {
             return;
         }
@@ -618,8 +662,11 @@ public sealed class ConnectionManager : IDisposable
             // arrived, which is what sleep and resume do to WinRT device events.
             BluetoothLinkStatus status = await _linkMonitor.ReadLinkStatusAsync();
 
-            if (_disposed)
+            if (Superseded(startedAt))
             {
+                // The answer is older than the pass that replaced this one, and a link status from
+                // 45 s ago is not a correction - it is drift, arriving in the machine whose job is to
+                // remove it.
                 return;
             }
 
@@ -646,16 +693,30 @@ public sealed class ConnectionManager : IDisposable
             // 3, 4 and 5 - the capture endpoint, the route, and the registration - are each discharged
             // inside the half that owns them. Reading any of them here would be a second opinion that
             // could disagree with the machine acting on it.
-            await _music.ReconcileAsync(permitted);
-            await _calls.ReconcileAsync(permitted);
+            if (!await StillOurs(_music.ReconcileAsync(permitted), startedAt))
+            {
+                return;
+            }
+
+            if (!await StillOurs(_calls.ReconcileAsync(permitted), startedAt))
+            {
+                return;
+            }
 
             if (_linkMachine.State == LinkState.Present)
             {
                 // Level-triggered, like everything else in the pass: both halves ignore this unless
                 // they are Off, so saying it every 30 s costs nothing and saying it never is how an
                 // app that missed one edge stays down for the rest of the session.
-                await _music.OnLinkPresentAsync(permitted);
-                await _calls.OnLinkPresentAsync(permitted);
+                if (!await StillOurs(_music.OnLinkPresentAsync(permitted), startedAt))
+                {
+                    return;
+                }
+
+                if (!await StillOurs(_calls.OnLinkPresentAsync(permitted), startedAt))
+                {
+                    return;
+                }
             }
 
             EnforceConnectPermission();
@@ -680,6 +741,35 @@ public sealed class ConnectionManager : IDisposable
                 _reconcilingSince = null;
             }
         }
+    }
+
+    /// <summary>
+    /// Has this pass been given up on and replaced?
+    ///
+    /// Asked after every await, and it is the same guard the halves spell <c>_generation</c>: what
+    /// crosses an await is not a data race - the whole class is one thread - but a stale
+    /// <em>answer</em>. Holding the marker is only half of it. A pass whose link read finally returns
+    /// 45 s late would otherwise write that status into the link machine, feed it to the latch and
+    /// run both halves against a state its replacement is halfway through establishing, which is
+    /// exactly the interleaving <see cref="_reconcilingSince"/> exists to prevent.
+    /// </summary>
+    private bool Superseded(DateTimeOffset startedAt) => _disposed || _reconcilingSince != startedAt;
+
+    /// <summary>
+    /// Awaits one step of a pass and answers whether the pass is still the current one.
+    ///
+    /// A helper rather than the check written out four times, for the reason
+    /// <c>MusicHalf.StartRouteIfDue</c> is the one place a route is started: written out, a fifth
+    /// awaited step could be added and the guard forgotten, and the two arms would agree on every
+    /// input the suite can produce - so neither could be broken without the other covering for it.
+    /// Every await inside a pass except the link read, which has a value to hand back, goes through
+    /// here.
+    /// </summary>
+    private async Task<bool> StillOurs(Task step, DateTimeOffset startedAt)
+    {
+        await step;
+
+        return !Superseded(startedAt);
     }
 
     /// <summary>
@@ -930,6 +1020,10 @@ public sealed class ConnectionManager : IDisposable
         _ = Task.Run(ProbeEndpointLevel);
     }
 
+    /// <summary>
+    /// The 152-282 ms enumeration, and the one thing in this class that deliberately does not run on
+    /// the UI thread. Both callers hand it to the threadpool; only the bool comes back.
+    /// </summary>
     private void ProbeEndpointLevel()
     {
         bool present = _endpoints.SinkCaptureEndpointPresent;
@@ -1034,8 +1128,14 @@ public sealed class ConnectionManager : IDisposable
         return calls is { } c && c < m ? c : m;
     }
 
-    private void Report(string message, LogLevel level = LogLevel.Info)
-        => Status?.Invoke(this, new StatusMessage(message, level));
+    /// <summary>
+    /// Always Info. This class announces decisions, not failures - the seams raise their own status
+    /// for what went wrong, at the severity they witnessed it at, which is what
+    /// <see cref="StatusMessage"/> carries a level for at all. A level parameter here would only ever
+    /// let this class re-grade an event it did not see.
+    /// </summary>
+    private void Report(string message)
+        => Status?.Invoke(this, new StatusMessage(message, LogLevel.Info));
 
     /// <summary>
     /// The hop every inbound event makes before it is allowed to touch anything, and the disposal

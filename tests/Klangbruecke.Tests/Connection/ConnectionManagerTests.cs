@@ -190,6 +190,8 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new();
         h.ReachRouting();
 
+        int saves = h.Settings.SaveCount;
+
         h.Manager.DeselectPhone();
 
         Assert.Equal(1, h.Calls.DisconnectCount);
@@ -197,8 +199,12 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.True(h.Router.StopCount >= 1, "the route was left running over a phone nobody selected");
         Assert.False(h.Router.IsRunning);
         Assert.Equal(1, h.Link.StopWatchingCount);
-        Assert.Null(h.Settings.PhoneDeviceId);
         Assert.Equal(ConnectionState.Idle, h.Manager.State);
+
+        // Written, not just held. An in-memory clear that never reaches the file comes back as the
+        // old phone on the next start, which is the "it forgot my setting" bug this app exists to end.
+        Assert.Null(h.Settings.PhoneDeviceId);
+        Assert.Equal(saves + 1, h.Settings.SaveCount);
     }
 
     [Fact]
@@ -207,12 +213,16 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new();
         h.ReachRouting();
 
+        int saves = h.Settings.SaveCount;
+
         h.Manager.SelectOutput(OtherOutputId);
 
         Assert.Equal(new string?[] { OutputId, OtherOutputId }, h.Router.StartCalls);
         Assert.Single(h.Sink.ConnectCalls);
         Assert.Equal(0, h.Sink.DisconnectCount);
+
         Assert.Equal(OtherOutputId, h.Settings.OutputDeviceId);
+        Assert.Equal(saves + 1, h.Settings.SaveCount);
     }
 
     /// <summary>
@@ -401,7 +411,7 @@ public sealed class ConnectionManagerTests : IDisposable
     public void An_endpoint_that_is_already_present_starts_exactly_one_route()
     {
         using Harness h = new();
-        h.Endpoints.SetPresent(true);
+        h.SetEndpointPresent(true);
 
         h.Link.RaiseAppeared();
 
@@ -506,8 +516,15 @@ public sealed class ConnectionManagerTests : IDisposable
     {
         using Harness h = new();
 
-        h.Scheduler.Advance(Seconds(95));
+        // Straddled, so the period is pinned from below as well as above: a count after 95 s alone is
+        // satisfied by anything from 24 s to 31 s.
+        h.Scheduler.Advance(Seconds(29.9));
+        Assert.Equal(0, h.Link.ReadCount);
 
+        h.Scheduler.Advance(Seconds(0.2));
+        Assert.Equal(1, h.Link.ReadCount);
+
+        h.Scheduler.Advance(Seconds(64.9));
         Assert.Equal(3, h.Link.ReadCount);
     }
 
@@ -534,10 +551,17 @@ public sealed class ConnectionManagerTests : IDisposable
         h.ReachRouting();
         _log.Entries.Clear();
 
-        // A route that stopped without saying so. Only a level read finds this one, and it is the
-        // one drift in the five checks that no other component logs for itself.
+        // A route that stopped without saying so. Only a level read finds this one, and it is the one
+        // drift in the five checks that no other component logs for itself.
         h.Router.DieSilently();
-        h.Scheduler.Advance(Seconds(30));
+
+        // And it stays down, so the condition is still there on the second and third ticks. That is
+        // what makes the brief's row - "one entry, not three" - a real distinction: a single tick
+        // cannot tell a line written per correction from a line written per tick, and a drift that
+        // repairs itself would produce a second honest line for the repair.
+        h.Router.StartResult = false;
+
+        h.Scheduler.Advance(Seconds(95));
 
         Assert.Single(_log.Entries);
     }
@@ -635,6 +659,102 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(2, h.Link.ReadCount);
     }
 
+    /// <summary>
+    /// Holding the marker is only half of it. A pass that finally answers 45 s late must also stop
+    /// <em>acting</em>: its link status is 45 seconds old, and writing it into the machine whose job
+    /// is to remove drift - then running both halves against a state its replacement is halfway
+    /// through establishing - is exactly the interleaving the guard is documented as preventing.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_that_was_given_up_on_does_not_act_on_its_stale_answer()
+    {
+        using Harness h = new();
+
+        // Pass A starts at 30 s and hangs.
+        h.Link.DeferRead = true;
+        h.Scheduler.Advance(Seconds(30));
+
+        // Pass B, at 60 s, answers at once and brings both halves up.
+        h.Link.DeferRead = false;
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        // And then the connection goes away with no event at all, which is what check 2 exists to
+        // catch - so a pass that goes on running has something to find.
+        h.Sink.Disconnect();
+
+        int reads = h.Link.ReadCount;
+        int connects = h.Sink.ConnectCalls.Count;
+
+        // A's read comes back at last, carrying a status from before the phone was even found. It
+        // must decide nothing: not the link status it is holding, and not the checks below it.
+        h.Link.CompleteRead(BluetoothLinkStatus.Disconnected);
+
+        Assert.Equal(0, h.Router.StopCount);
+        Assert.Equal(connects, h.Sink.ConnectCalls.Count);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        // A grace window opened by the stale pass would read the link again three seconds later.
+        h.Scheduler.Advance(Grace);
+        Assert.Equal(reads, h.Link.ReadCount);
+    }
+
+    /// <summary>
+    /// The link read is not the only place a pass gives up the thread. A connect attempt inside
+    /// <c>MusicHalf.ReconcileAsync</c> awaits a radio too, and a pass superseded there must stop just
+    /// as flatly - otherwise it goes on to drive the calls half with a permission flag and a link
+    /// state it computed a minute ago.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_superseded_inside_a_half_stops_there()
+    {
+        using Harness h = new();
+
+        // Pass A gets as far as opening the connection and hands off the thread there.
+        h.Sink.DeferConnect = true;
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(1, h.Sink.PendingConnects);
+
+        // Pass B, a period later, runs to completion and takes the marker with it.
+        h.Scheduler.Advance(Seconds(30));
+
+        _log.Entries.Clear();
+
+        // A's connect answers at last. Its own idea of "before" is a minute old and describes a
+        // world with no link and no halves - reported now, it would credit this pass with every
+        // correction B made and put a line in the log that describes a tick that did not happen.
+        h.Sink.CompleteConnect(true);
+
+        Assert.Empty(_log.Entries);
+    }
+
+    /// <summary>
+    /// The threshold is deliberately shorter than the tick that has to clear it. On a real timer a
+    /// pass starts a hair after the tick that launched it, so a threshold of one whole period would
+    /// have the next tick miss it by microseconds and defer again - recovery costing two periods
+    /// instead of one, invisibly, and never in a test where virtual time lands on the boundary.
+    /// </summary>
+    [Fact]
+    public void The_stall_threshold_is_shorter_than_the_tick_that_clears_it()
+    {
+        using Harness h = new();
+        h.Link.DeferRead = true;
+
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(1, h.Link.ReadCount);
+
+        // A forced pass 24.9 s into the wedged one still defers to it.
+        h.Scheduler.Advance(Seconds(19.9));
+        h.Power.RaiseResumed();
+        h.Scheduler.Advance(Seconds(5));
+        Assert.Equal(1, h.Link.ReadCount);
+
+        // 29.9 s in - still short of a whole period, and still before the 60 s tick - it does not.
+        h.Power.RaiseResumed();
+        h.Scheduler.Advance(Seconds(5));
+        Assert.Equal(2, h.Link.ReadCount);
+    }
+
     // --- resume --------------------------------------------------------------------------------
 
     /// <summary>
@@ -691,12 +811,18 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Link.RaiseAppeared();
         Assert.Equal(ConnectionState.RetryBackoff, h.Manager.State);
 
+        int saves = h.Settings.SaveCount;
+
         h.Manager.SetAutoReconnect(false);
         h.Scheduler.Advance(Seconds(120));
 
         Assert.Single(h.Sink.ConnectCalls);
         Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
         Assert.Equal("auto-reconnect is off", h.Manager.Detail);
+
+        // A switch that does not survive a restart is a switch the user flips again every morning.
+        Assert.False(h.Settings.AutoReconnect);
+        Assert.Equal(saves + 1, h.Settings.SaveCount);
     }
 
     /// <summary>
@@ -710,7 +836,7 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new(phoneDeviceId: null, autoReconnect: false);
 
         h.Manager.SelectPhone(PhoneId);
-        h.Endpoints.SetPresent(true);
+        h.SetEndpointPresent(true);
 
         Assert.Equal(new[] { PhoneId }, h.Sink.ConnectCalls);
         Assert.True(h.Router.IsRunning);
@@ -727,7 +853,7 @@ public sealed class ConnectionManagerTests : IDisposable
     {
         using Harness h = new(phoneDeviceId: null, autoReconnect: false);
         h.Manager.SelectPhone(PhoneId);
-        h.Endpoints.SetPresent(true);
+        h.SetEndpointPresent(true);
 
         h.Link.Status = BluetoothLinkStatus.Disconnected;
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
@@ -756,10 +882,15 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
 
         h.Sink.ConnectResult = true;
+        int saves = h.Settings.SaveCount;
+
         h.Manager.SetAutoReconnect(true);
 
         Assert.Equal(2, h.Sink.ConnectCalls.Count);
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        Assert.True(h.Settings.AutoReconnect);
+        Assert.Equal(saves + 1, h.Settings.SaveCount);
     }
 
     // --- calls switch --------------------------------------------------------------------------
@@ -770,10 +901,14 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new();
         h.ReachConnected();
 
+        int saves = h.Settings.SaveCount;
+
         h.Manager.SetCallsEnabled(false);
 
         Assert.Equal(1, h.Calls.DisconnectCount);
+
         Assert.False(h.Settings.EnableCalls);
+        Assert.Equal(saves + 1, h.Settings.SaveCount);
     }
 
     [Fact]
@@ -803,6 +938,23 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(0, h.Router.StopCount);
     }
 
+    /// <summary>
+    /// The switch is as explicit a "do this now" as picking a phone is, so it carries the same grant.
+    /// Without it, turning calls on with auto-reconnect off is a menu item that visibly does nothing -
+    /// the half refuses for want of permission and there is no way for the user to tell.
+    /// </summary>
+    [Fact]
+    public void Enabling_calls_registers_even_with_auto_reconnect_off()
+    {
+        using Harness h = new(autoReconnect: false, enableCalls: false);
+        h.Link.RaiseAppeared();
+        Assert.Empty(h.Calls.ConnectCalls);
+
+        h.Manager.SetCallsEnabled(true);
+
+        Assert.Equal(new[] { TransportId }, h.Calls.ConnectCalls);
+    }
+
     // --- what the tray is told -----------------------------------------------------------------
 
     /// <summary>
@@ -828,7 +980,7 @@ public sealed class ConnectionManagerTests : IDisposable
             h.States);
 
         // Music Linked -> Up is a real transition of a real machine and reports the same Connected.
-        h.Endpoints.SetPresent(true);
+        h.SetEndpointPresent(true);
         Assert.Equal(5, h.States.Count);
     }
 
@@ -865,16 +1017,22 @@ public sealed class ConnectionManagerTests : IDisposable
     [Fact]
     public void Every_inbound_event_is_posted_through_the_dispatcher()
     {
-        CountingUiDispatcher ui = new();
-        using Harness h = new(ui: ui);
+        using Harness h = new();
+        MarshallingUiDispatcher ui = h.Marshaller!;
 
         int posts = ui.Posts;
 
         h.Link.RaiseAppeared();
         Assert.Equal(++posts, ui.Posts);
 
+        // The one that arrives from the threadpool, because its answer is a 152-282 ms enumeration
+        // that neither the notification thread nor the message loop may spend. Still one post.
         h.Endpoints.RaiseEndpointsChanged();
-        Assert.Equal(++posts, ui.Posts);
+        Assert.True(
+            SpinWait.SpinUntil(() => ui.Posts == posts + 1, TimeSpan.FromSeconds(5)),
+            $"expected {posts + 1} posts, saw {ui.Posts}");
+        posts++;
+        ui.Drain();
 
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         Assert.Equal(++posts, ui.Posts);
@@ -902,7 +1060,7 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new();
 
         h.Link.RaiseAppeared();
-        h.Endpoints.SetPresent(true);
+        h.SetEndpointPresent(true);
 
         Assert.Equal(new[] { PhoneId }, h.Sink.ConnectCalls);
         Assert.Equal(0, h.Sink.DisconnectCount);
@@ -922,27 +1080,39 @@ public sealed class ConnectionManagerTests : IDisposable
     /// once per callback is seconds of frozen message loop per phone connect: no tray menu, no
     /// balloon, no shutdown.
     ///
-    /// Deferring dispatcher on purpose. Under <see cref="ImmediateUiDispatcher"/> each notification is
-    /// fully applied before the next arrives, so a burst is not a burst; this is the arrangement that
-    /// actually happens, where the UI thread is busy and the callbacks pile up behind it.
+    /// The gate is only reopened once the answer has been applied, so the arrangement that shows the
+    /// collapse is the one that actually happens: a busy UI thread with the callbacks piling up
+    /// behind it. That is exactly what the marshalling dispatcher reproduces - the answer waits until
+    /// the test thread pumps it.
     /// </summary>
     [Fact]
     public void A_burst_of_endpoint_notifications_costs_one_underlying_read()
     {
-        DeferringUiDispatcher ui = new();
-        using Harness h = new(ui: ui);
+        using Harness h = new();
+        MarshallingUiDispatcher ui = h.Marshaller!;
 
         for (int i = 0; i < 5; i++)
         {
             h.Endpoints.RaiseEndpointsChanged();
         }
 
+        // The gate shuts synchronously on the notification thread, before the probe has even been
+        // handed to the threadpool, so the four that follow are turned away whatever the timing. Only
+        // the winner's answer has to be waited for.
+        Assert.True(
+            SpinWait.SpinUntil(() => ui.HasQueuedWork, TimeSpan.FromSeconds(5)),
+            "the endpoint probe never answered");
+
         Assert.Equal(1, h.Endpoints.PresenceReads);
-        Assert.Single(ui.Captured);
+        Assert.Equal(1, ui.Drain());
 
         // And the next cause is still heard: this collapses a burst, it does not go deaf.
-        ui.Drain();
         h.Endpoints.RaiseEndpointsChanged();
+
+        Assert.True(
+            SpinWait.SpinUntil(() => h.Endpoints.PresenceReads >= 2, TimeSpan.FromSeconds(5)),
+            "the gate was never reopened");
+
         Assert.Equal(2, h.Endpoints.PresenceReads);
     }
 
@@ -958,11 +1128,28 @@ public sealed class ConnectionManagerTests : IDisposable
 
         Assert.Equal(1, h.Endpoints.PresenceReads);
 
-        h.Endpoints.SetPresent(false);
+        h.SetEndpointPresent(false);
 
         Assert.Equal(2, h.Endpoints.PresenceReads);
         Assert.False(h.Router.IsRunning);
         Assert.Equal("waiting for phone audio", h.Manager.Detail);
+    }
+
+    /// <summary>
+    /// The notification handler must mark dirty, not go and look. It runs on MMDevAPI's own worker
+    /// threads - where an <c>IMMNotificationClient</c> callback is contractually forbidden to block -
+    /// and once on the UI thread, because <c>EndpointMonitor.Start</c> reports an already-present
+    /// endpoint by raising from inside itself. 152-282 ms is not something either thread may spend.
+    /// </summary>
+    [Fact]
+    public void The_notification_path_reads_the_endpoint_level_off_the_calling_thread()
+    {
+        using Harness h = new();
+
+        h.SetEndpointPresent(true);
+
+        Assert.Equal(1, h.Endpoints.PresenceReads);
+        Assert.NotEqual(Environment.CurrentManagedThreadId, h.Endpoints.LastReadThreadId);
     }
 
     /// <summary>
@@ -1069,13 +1256,18 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Manager.Dispose();
 
         h.Link.RaiseAppeared();
+
+        // Raw, not the pumping helper: the manager is unsubscribed, so there is no probe to wait for
+        // and waiting for one is what this test is asserting will not happen.
         h.Endpoints.SetPresent(true);
+
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         h.Power.RaiseResumed();
         h.Scheduler.Advance(Seconds(95));
 
         Assert.Empty(h.Sink.ConnectCalls);
         Assert.Empty(h.Calls.ConnectCalls);
+        Assert.Equal(0, h.Endpoints.PresenceReads);
     }
 
     /// <summary>
@@ -1096,6 +1288,24 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(1, ui.Drain());
         Assert.Empty(h.Sink.ConnectCalls);
         Assert.Empty(h.Calls.ConnectCalls);
+    }
+
+    /// <summary>
+    /// The tray rebuilds its menu on every right-click, and both of these enumerate real hardware.
+    /// A right-click landing during shutdown would otherwise reach a device enumerator and a sink
+    /// this class has already disposed.
+    /// </summary>
+    [Fact]
+    public async Task The_menu_queries_answer_empty_once_disposed()
+    {
+        Harness h = new();
+        h.Router.Outputs = new[] { new AudioOutputDevice(OutputId, "Speakers") };
+        h.Sink.Devices = new[] { new PhoneDevice(PhoneId, "MYSTRAPIX9") };
+
+        h.Manager.Dispose();
+
+        Assert.Empty(h.Manager.ListOutputDevices());
+        Assert.Empty(await h.Manager.FindPhonesAsync());
     }
 
     // --- the harness ---------------------------------------------------------------------------
@@ -1126,7 +1336,15 @@ public sealed class ConnectionManagerTests : IDisposable
             // raises - so this is only what a level read would answer.
             Link.Status = BluetoothLinkStatus.Connected;
 
-            Ui = ui ?? new ImmediateUiDispatcher();
+            // Marshalling rather than immediate, and it is not a detail. The endpoint level is read
+            // on the threadpool - it must never run on the message loop - so its answer comes back
+            // through Post from another thread. ImmediateUiDispatcher would apply that answer on the
+            // threadpool thread, waking a half and republishing state while the test asserts about
+            // it: a suite certifying a single-threaded contract by breaking it. Here the answer is
+            // queued and run on the test thread, exactly as ControlUiDispatcher runs it on the UI
+            // thread. Everything else a test raises still runs inline.
+            Marshaller = ui as MarshallingUiDispatcher ?? (ui is null ? new MarshallingUiDispatcher() : null);
+            Ui = ui ?? Marshaller!;
 
             Manager = new ConnectionManager(Settings, Sink, Calls, Router, Endpoints, Link, Scheduler, Power, Ui);
             Manager.StateChanged += (_, state) => States.Add(state);
@@ -1154,6 +1372,9 @@ public sealed class ConnectionManagerTests : IDisposable
 
         public IUiDispatcher Ui { get; }
 
+        /// <summary>The dispatcher as a marshaller, or null when a test supplied a different one.</summary>
+        public MarshallingUiDispatcher? Marshaller { get; }
+
         public ConnectionManager Manager { get; }
 
         /// <summary>Every reported state change, oldest first.</summary>
@@ -1175,8 +1396,38 @@ public sealed class ConnectionManagerTests : IDisposable
         public void ReachRouting()
         {
             ReachConnected();
-            Endpoints.SetPresent(true);
+            SetEndpointPresent(true);
             Assert.True(Router.IsRunning);
+        }
+
+        /// <summary>
+        /// The capture endpoint arriving or going away, driven the way the OS drives it: the level
+        /// changes, MMDevAPI says something changed, and the manager answers from the threadpool
+        /// because the read is 152-282 ms and neither the notification thread nor the message loop
+        /// may spend that.
+        ///
+        /// The two waits are the whole of the asynchrony in these tests, and they are bounded: the
+        /// probe is a field read on a fake. Everything the manager does with the answer runs on this
+        /// thread, in <see cref="MarshallingUiDispatcher.Drain"/>.
+        /// </summary>
+        public void SetEndpointPresent(bool present)
+        {
+            MarshallingUiDispatcher marshaller =
+                Marshaller ?? throw new InvalidOperationException("This harness has a different dispatcher.");
+
+            int readsBefore = Endpoints.PresenceReads;
+
+            Endpoints.SetPresent(present);
+
+            Assert.True(
+                SpinWait.SpinUntil(() => Endpoints.PresenceReads > readsBefore, TimeSpan.FromSeconds(5)),
+                "the endpoint level was never read");
+
+            Assert.True(
+                SpinWait.SpinUntil(() => marshaller.HasQueuedWork, TimeSpan.FromSeconds(5)),
+                "the endpoint probe never posted its answer");
+
+            marshaller.Drain();
         }
 
         public void Dispose() => Manager.Dispose();

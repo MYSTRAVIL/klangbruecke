@@ -60,8 +60,8 @@ public class Settings
     /// %LOCALAPPDATA% file that the installed app on this machine reads at startup, so a suite that
     /// let it run would overwrite the developer's own saved phone with whatever a test constructed -
     /// and the damage would surface hours later as "the app forgot my phone", which reads as a
-    /// Bluetooth fault. <c>ConnectionManager</c> saves on four separate setters; there is no test of
-    /// any of them that does not go through here.
+    /// Bluetooth fault. <c>ConnectionManager</c> saves on five separate setters and more than ten
+    /// tests exercise them; not one of those tests can reach a setter without coming through here.
     /// </summary>
     public virtual void Save()
     {

@@ -728,19 +728,34 @@ public sealed class ConnectionStateProjectionTests
                 connectPermitted: false)));
     }
 
-    // The one read in DetailFor with no Enabled guard beside it. It is unreachable - Degraded needs an
-    // enabled half up, and with calls disabled that forces every other read to agree the app is
-    // Connected - but "unreachable" is a property of the rules above it, and rule 2b is a new rule
-    // above it. This sweeps every snapshot rather than trusting the argument twice.
+    // DegradedDetail's calls branch is the one read in this file with no Enabled guard beside it, and
+    // what makes that safe is a property of the rules above it rather than of the branch: Degraded
+    // requires an enabled half up, and with either half disabled every other read then agrees the app
+    // is Connected instead. So the invariant to pin is the premise, not the branch - and the premise
+    // is what a new rule above (2b is one) could quietly take away.
+    //
+    // Read the shape of this test before changing it. The two DoesNotContain arms are a tripwire and
+    // are *expected to be unreachable today*; a run in which they execute is a rule change that has
+    // made the unguarded read live. The assertions that actually fire are the two around them: every
+    // Degraded row has both halves enabled, and there are Degraded rows at all - without that second
+    // one, deleting rule 6 would leave this sweeping 2880 snapshots and asserting nothing.
     [Fact]
     public void The_degraded_detail_never_describes_a_disabled_half()
     {
+        int degraded = 0;
+
         foreach (ConnectionSnapshot snapshot in EverySnapshotValue(TimeSpan.FromSeconds(8)))
         {
             if (ConnectionStateProjection.Project(snapshot) != ConnectionState.Degraded)
             {
                 continue;
             }
+
+            degraded++;
+
+            Assert.True(
+                snapshot.MusicEnabled && snapshot.CallsEnabled,
+                $"Degraded is reachable with a half switched off: {snapshot}");
 
             string detail = ConnectionStateProjection.DetailFor(snapshot);
 
@@ -754,6 +769,8 @@ public sealed class ConnectionStateProjectionTests
                 Assert.DoesNotContain("music", detail, StringComparison.OrdinalIgnoreCase);
             }
         }
+
+        Assert.True(degraded > 0, "no snapshot projected Degraded, so this sweep proved nothing");
     }
 
     // StatusPresenter composes "Klangbruecke: <message>" and truncates the result at 96 characters
