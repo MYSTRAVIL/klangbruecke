@@ -35,15 +35,19 @@ public sealed class MarshallingUiDispatcher : IUiDispatcher
 
     public void Post(Action action)
     {
-        Interlocked.Increment(ref _posts);
-
         if (Environment.CurrentManagedThreadId == _uiThreadId)
         {
+            Interlocked.Increment(ref _posts);
             action();
             return;
         }
 
+        // Enqueued before it is counted, and the order is the whole of it: counted first, a test that
+        // waits on Posts and then drains can find the queue still empty, drain nothing, and go on to
+        // assert against work that has not run. Enqueued first, every count a test can observe has
+        // work behind it.
         _queued.Enqueue(action);
+        Interlocked.Increment(ref _posts);
     }
 
     /// <summary>

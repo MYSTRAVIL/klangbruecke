@@ -96,13 +96,20 @@ public sealed class ConnectionManager : IDisposable
     private IDisposable? _graceTimer;
     private IDisposable? _resumeTimer;
 
+    /// <summary>
+    /// Bumped by every grace window that is armed, and read - never written - by the window that
+    /// finally answers. The same shape the halves spell <c>_generation</c>, and here for the same
+    /// reason: what crosses the await is a stale answer, not a data race.
+    /// </summary>
+    private int _graceGeneration;
+
     private bool _started;
     private bool _disposed;
 
     /// <summary>
     /// When the pass currently running started, or null when none is.
     ///
-    /// A pass has four awaits in it and the link read is a real round trip to a radio, so a forced
+    /// A pass has five awaits in it and the link read is a real round trip to a radio, so a forced
     /// pass - a phone picked, a resume, the setting coming back on - can land on top of the periodic
     /// one. Two interleaved passes would each decide against a link status the other is still acting
     /// on, and both would open a grace window against the same closed connection.
@@ -367,6 +374,13 @@ public sealed class ConnectionManager : IDisposable
             // rather than a settings re-push - see CallsHalf.Configure for why the difference matters
             // more here than it does for music.
             _calls.OnDisabled();
+
+            // And the grant the switch handed out below goes back with it. Without this, turning
+            // calls on and straight off again with auto-reconnect off leaves permission standing -
+            // and the next reconcile connects the *music* half on the strength of a switch the user
+            // reverted.
+            _clickGrant = false;
+
             Publish();
             return;
         }
@@ -584,17 +598,24 @@ public sealed class ConnectionManager : IDisposable
             // One window at a time. A connection that reports Closed twice, or a reconcile that finds
             // it gone on two ticks running, would otherwise arm two windows that each read the link
             // and decide again.
+            //
+            // "At a time" only covers the wait, though. The handle is dropped the moment the window
+            // fires, so a second Closed arriving while the first window's link read is still
+            // outstanding arms a second window on top of it - which is why the generation is taken
+            // here, at the moment the question is asked.
+            int generation = ++_graceGeneration;
+
             _graceTimer = _scheduler.Schedule(GraceWindow, () =>
             {
                 _graceTimer = null;
-                _ = OnGraceWindowElapsedAsync();
+                _ = OnGraceWindowElapsedAsync(generation);
             });
         }
 
         Publish();
     }
 
-    private async Task OnGraceWindowElapsedAsync()
+    private async Task OnGraceWindowElapsedAsync(int generation)
     {
         if (_disposed)
         {
@@ -603,8 +624,14 @@ public sealed class ConnectionManager : IDisposable
 
         BluetoothLinkStatus status = await _linkMonitor.ReadLinkStatusAsync();
 
-        if (_disposed)
+        if (Superseded(generation))
         {
+            // A newer Closed has asked the same question since, and this answer predates it. Acting
+            // on it is worse here than anywhere else in the class: this is the one read that decides
+            // deliberate-versus-out-of-range, so a stale one either latches a suppression nobody
+            // asked for - the app then sitting next to a phone it refuses to reconnect to, which is
+            // the predecessor's defining bug reached from a new direction - or records an absence
+            // that expires a suppression the user did ask for.
             return;
         }
 
@@ -756,6 +783,19 @@ public sealed class ConnectionManager : IDisposable
     private bool Superseded(DateTimeOffset startedAt) => _disposed || _reconcilingSince != startedAt;
 
     /// <summary>
+    /// The same question for the grace window, which awaits the same radio and has the same hole
+    /// without it. Two overloads rather than two differently-named checks, so the two paths read
+    /// alike at the call site.
+    ///
+    /// A generation rather than a timestamp, because the two guards are answering different
+    /// questions. The reconcile also needs to know when to <em>stop waiting</em> for a pass that has
+    /// wedged - hence a time it can compare against. A window needs no such rule: it is superseded
+    /// only by another window being armed, which is an event, and one is armed whenever the
+    /// connection reports Closed again.
+    /// </summary>
+    private bool Superseded(int graceGeneration) => _disposed || _graceGeneration != graceGeneration;
+
+    /// <summary>
     /// Awaits one step of a pass and answers whether the pass is still the current one.
     ///
     /// A helper rather than the check written out four times, for the reason
@@ -899,8 +939,7 @@ public sealed class ConnectionManager : IDisposable
         await _music.OnLinkPresentAsync(permitted);
         await _calls.OnLinkPresentAsync(permitted);
 
-        EnforceConnectPermission();
-        Publish();
+        FinishTurn();
     }
 
     private async Task RegisterCallsAsync()
@@ -910,6 +949,33 @@ public sealed class ConnectionManager : IDisposable
             await _calls.OnLinkPresentAsync(ConnectPermitted);
         }
 
+        FinishTurn();
+    }
+
+    /// <summary>
+    /// The tail every turn that awaits something ends with, and the disposal re-check that has to go
+    /// with it.
+    ///
+    /// These two turns deliberately do <em>not</em> take the reconcile's supersession guard, and the
+    /// difference is worth stating rather than leaving as an omission: what they do after their
+    /// awaits is level-triggered and idempotent. <see cref="EnforceConnectPermission"/> reads the
+    /// halves' current states and <see cref="Publish"/> recomputes from scratch, so a pass
+    /// interleaving with them changes what they compute, never whether what they compute is correct.
+    /// The reconcile needs the guard because it carries a value across its await - a link status, and
+    /// a "before" snapshot - and both go stale; nothing is carried across these.
+    ///
+    /// Disposal is different, because it is not about staleness: the tray can be gone by the time an
+    /// await returns, and raising <c>StateChanged</c> into it - or standing a half down after
+    /// everything under it has been disposed - is work on an object that no longer exists.
+    /// </summary>
+    private void FinishTurn()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        EnforceConnectPermission();
         Publish();
     }
 
