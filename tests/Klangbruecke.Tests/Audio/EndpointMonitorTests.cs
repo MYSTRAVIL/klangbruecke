@@ -207,7 +207,7 @@ public sealed class EndpointMonitorTests : IDisposable
             registrar,
             () =>
             {
-                registrar.Operations.Add("probe");
+                registrar.Record("probe");
                 return false;
             });
 
@@ -323,10 +323,18 @@ public sealed class EndpointMonitorTests : IDisposable
     {
         int rootedBefore = EndpointMonitor.LiveClientCount;
 
-        // The interleaving this defends against cannot be forced from a test - it needs Start to be
-        // preempted between its disposal check and the publish of the client - so this drives the two
+        // The interleaving this defends against cannot be forced from a test, so this drives the two
         // methods at each other repeatedly and asserts the invariant that must hold whichever way they
-        // land. It is deterministic in green: with the Dekker pair in place no ordering can break it.
+        // land. Like its sibling above, it is a probabilistic detector rather than a proof: the
+        // guarantee comes from the lock these two methods share, not from this loop.
+        //
+        // The assertion is on the *order*, not on counts, and that correction matters more than it
+        // looks. This test used to assert RegisterCount <= UnregisterCount, which is order-blind - and
+        // the one interleaving that actually leaves a live registration behind produces one of each and
+        // sailed straight through it. That sequence reads ["unregister", "dispose", "register"]:
+        // Dispose saw a published client, unregistered nothing, released the root and disposed the
+        // registrar, and only then did Start register - on a fresh enumerator, permanently, with the
+        // client it named rooted by nothing once the monitor is dropped.
         for (int attempt = 0; attempt < 50; attempt++)
         {
             var registrar = new FakeEndpointNotificationRegistrar();
@@ -353,18 +361,51 @@ public sealed class EndpointMonitorTests : IDisposable
                     }
                 });
 
-            // Never registered without also being unregistered. The reverse is allowed and does happen:
-            // Dispose can see a published client that Start has not registered yet, unregister nothing,
-            // and Start then declines to register at all.
-            Assert.True(
-                registrar.RegisterCount <= registrar.UnregisterCount,
-                $"attempt {attempt}: registered {registrar.RegisterCount} time(s) but unregistered "
-                + $"{registrar.UnregisterCount}. A registration nothing gives back outlives the monitor, "
-                + "and the client it names is then rooted by nothing.");
+            IReadOnlyList<string> operations = registrar.Operations;
+            int lastRegister = LastIndexOf(operations, "register");
+
+            // Every register is answered by a later unregister. An unregister with no register before it
+            // is fine and does happen - Dispose can find a published client that Start has not
+            // registered yet - so the invariant is directional, not a count match.
+            if (lastRegister >= 0)
+            {
+                Assert.True(
+                    LastIndexOf(operations, "unregister") > lastRegister,
+                    $"attempt {attempt}: [{string.Join(", ", operations)}] - a registration was taken "
+                    + "and never given back. It outlives the monitor on a fresh enumerator, and the "
+                    + "client it names is rooted by nothing once the monitor is dropped: 0xC0000005.");
+            }
 
             // And nothing is left rooted. Whoever loses the race gives the root back.
             Assert.Equal(rootedBefore, EndpointMonitor.LiveClientCount);
         }
+    }
+
+    [Fact]
+    public void The_real_registrar_refuses_to_register_after_it_has_been_disposed()
+    {
+        // The one test that touches MmDeviceNotificationRegistrar, and it reaches no COM at all: the
+        // refusal is checked before `_enumerator ??= new MMDeviceEnumerator()`, and disposing a
+        // registrar that never registered has no enumerator to dispose. That is the whole reason this
+        // guard is worth having at the seam rather than only in the monitor - it is the one part of the
+        // real registrar a test host can execute.
+        //
+        // Without it, this class is one caller away from the worst bug in the file. `??=` would build a
+        // *fresh* enumerator after Dispose and take a live registration that the disposed registrar can
+        // never give back; the client it names is then rooted by nothing as soon as its monitor is
+        // dropped, and the next notification is 0xC0000005.
+        using var owner = new EndpointMonitor(new FakeEndpointNotificationRegistrar(), () => false);
+        var client = new EndpointNotificationClient(owner);
+
+        var registrar = new MmDeviceNotificationRegistrar();
+        registrar.Dispose();
+
+        Assert.Null(Record.Exception(() => registrar.Register(client)));
+
+        (LogLevel Level, string Message, Exception? Exception) refusal =
+            Assert.Single(_log.Entries, e => e.Level == LogLevel.Warn);
+
+        Assert.Contains("disposed", refusal.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     // --- beyond the brief: the strong reference ----------------------------------------------------
@@ -939,4 +980,18 @@ public sealed class EndpointMonitorTests : IDisposable
     }
 
     private static void RunConcurrently(int threads, Action body) => RunConcurrently(threads, _ => body());
+
+    /// <summary>Last position of <paramref name="operation"/>, or -1. No LINQ overload does this.</summary>
+    private static int LastIndexOf(IReadOnlyList<string> operations, string operation)
+    {
+        for (int i = operations.Count - 1; i >= 0; i--)
+        {
+            if (operations[i] == operation)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
 }

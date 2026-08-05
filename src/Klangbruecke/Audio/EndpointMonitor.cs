@@ -95,10 +95,16 @@ public sealed class EndpointMonitor : IAudioEndpointMonitor
     /// impossible.
     ///
     /// So a client is rooted here for exactly as long as it may be registered, and removed in
-    /// <see cref="Dispose"/>. The cost on the misuse path is a leak - the client roots the monitor
-    /// back, so neither is collected - and that is the right trade: the registration was never removed
-    /// in that scenario either, so the process already had a monitor it could not stop. This turns it
-    /// from one that kills the process into one that merely keeps working.
+    /// <see cref="Dispose"/>.
+    ///
+    /// <b>Be honest about how far the leak on the misuse path reaches.</b> The client roots the monitor
+    /// back, the monitor roots its <see cref="EndpointsChanged"/> invocation list, and each subscriber
+    /// roots its own object graph - in Stage 1 that is <c>ConnectionManager</c> and everything it holds,
+    /// for the life of the process. That is not small, and it is still the right trade: the registration
+    /// was never removed in that scenario either, so the process already had a monitor it could not
+    /// stop. This turns one that kills the process into one that merely keeps working - and
+    /// <see cref="LiveClientCount"/> is how a consumer's own teardown test catches the omission before
+    /// it ships.
     ///
     /// Same hazard shape as <c>PowerNotifier</c>'s static <c>SystemEvents</c> subscription, deliberately
     /// taken on here rather than inherited from the BCL. <see cref="LiveClientCount"/> is what makes it
@@ -140,32 +146,47 @@ public sealed class EndpointMonitor : IAudioEndpointMonitor
     /// </summary>
     private EndpointNotificationClient? _client;
 
-    // int rather than bool, and Interlocked rather than volatile, because these two are not just
-    // published across threads - they are *claimed*. Volatile makes a write visible; it does not make
-    // check-then-act atomic, and both guards here are check-then-act over a resource whose double
-    // acquisition is the crash this file exists to prevent:
-    //
-    //   - Two concurrent Start()s that each pass a plain `if (_started)` both build a client. The
-    //     second overwrites _client, and the first is left registered and rooted by nothing.
-    //   - A Start() preempted between its disposal check and publishing _client races a Dispose() that
-    //     reads _client as null, skips the unregister, and returns. Start then registers a client the
-    //     monitor will never unregister and nothing will keep alive.
-    //
-    // The second is a Dekker pair, so the fences matter as much as the atomicity: Start does
-    // Interlocked.Exchange(_client) then reads _disposed; Dispose does Interlocked.Exchange(_disposed)
-    // then reads _client. Each side has a full barrier between its store and its load, which is what
-    // rules out the store-load reorder that x86's TSO permits and every weaker model permits more of.
-    // With plain volatile on both, both sides can see the other's stale value.
-    //
-    // Reads that are only a best-effort guard - the notification handler, the level - go through
-    // IsDisposed, which is an ordinary acquire read. They are not part of either pair.
+    /// <summary>
+    /// Serialises <see cref="Start"/> against <see cref="Dispose"/>, and both against themselves.
+    ///
+    /// <b>An earlier version of this file tried to do it with <see cref="Interlocked"/> alone and was
+    /// wrong.</b> That version claimed each flag atomically and relied on a Dekker pair - Start publishes
+    /// <see cref="_client"/> then reads <c>_disposed</c>, Dispose claims <c>_disposed</c> then reads
+    /// <see cref="_client"/> - so at least one side always sees the other. True, and not enough: when
+    /// <b>Dispose</b> is the side that sees, it acts too early to help. It unregisters a client that is
+    /// not registered yet, gives back the static root, disposes the registrar, and returns - and Start
+    /// then resumes and registers. The registrar built a fresh enumerator, so that registration is live,
+    /// nothing will ever remove it, and once the disposed monitor is dropped the client it names is
+    /// rooted by nothing. That is the 0xC0000005 the whole file exists to prevent, reintroduced by the
+    /// fix for a different race.
+    ///
+    /// A lock has none of that subtlety: either Start's whole critical section runs first and Dispose
+    /// then unregisters what it registered, or Dispose runs first and Start finds <c>_disposed</c> set
+    /// and never registers. There is no third ordering to reason about, which is the point - the
+    /// previous design was defensible line by line and still wrong.
+    ///
+    /// <b>What is deliberately outside it:</b> the level read (a full COM enumeration, 152-282 ms
+    /// measured) and <see cref="Raise"/> (which hands control to a subscriber). Holding a lock across
+    /// either would make this the app's worst contention point and turn the subscriber callout into a
+    /// deadlock waiting for a partner. The notification handler never takes it at all, so MMDevAPI's
+    /// worker threads can never block on the UI thread.
+    ///
+    /// Lock order is <c>_gate</c> then <see cref="LiveClientsGate"/>, never the reverse - nothing that
+    /// holds the static gate calls back into an instance.
+    /// </summary>
+    private readonly object _gate = new();
+
+    // volatile, and that is all they need to be now: every write is inside _gate, so the lock is what
+    // makes the check-then-act atomic. volatile is only for the readers that deliberately do not take
+    // the lock - the notification handler and the level - where a stale read is a best-effort guard
+    // rather than part of a claim.
     //
     // This is also where the probe's thread-safety precaution is actually paid for. Whether two
     // callbacks can be in flight at once was not measured, and the one run able to test it showed
     // strict serialization - but the handler mutates nothing at all, so the precaution costs nothing
     // there. It is Start and Dispose, not the callback, that needed the work.
-    private int _started;
-    private int _disposed;
+    private volatile bool _started;
+    private volatile bool _disposed;
 
     /// <summary>
     /// How many notification clients this type is currently keeping alive, process-wide. Zero unless a
@@ -209,11 +230,14 @@ public sealed class EndpointMonitor : IAudioEndpointMonitor
     public event EventHandler? EndpointsChanged;
 
     /// <summary>
-    /// An ordinary acquire read, for the guards that are advisory rather than part of a claim. The two
-    /// places that must not race - <see cref="Start"/> and <see cref="Dispose"/> - use
-    /// <see cref="Interlocked"/> on <c>_disposed</c> directly; see the field comment.
+    /// A lock-free read, and the name exists to mark that as deliberate. The two places that must not
+    /// race - <see cref="Start"/> and <see cref="Dispose"/> - read <c>_disposed</c> inside
+    /// <see cref="_gate"/>. This one is for the two that must never block on it: the notification
+    /// handler, which runs on MMDevAPI's worker threads and must not be able to wait on the UI thread,
+    /// and the level, which is read on the reconcile tick. Both are advisory guards where a read that
+    /// is one instant stale is harmless.
     /// </summary>
-    private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+    private bool IsDisposed => _disposed;
 
     /// <summary>
     /// A live lookup on every read, deliberately not cached.
@@ -274,65 +298,66 @@ public sealed class EndpointMonitor : IAudioEndpointMonitor
         // registration taken after the first Dispose would never be unregistered; the monitor would then
         // be dropped, the client with it, and the next notification into a collected client is the
         // 0xC0000005 above.
-        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // CompareExchange, not a read followed by a write. Two threads that both pass a plain
-        // `if (_started)` each build a client and register it; the second overwrites _client, and the
-        // first is then registered with nothing rooting it - one GC from the crash above.
-        if (Interlocked.CompareExchange(ref _started, 1, 0) != 0)
+        lock (_gate)
         {
-            return;
-        }
+            if (_started)
+            {
+                return;
+            }
 
-        var client = new EndpointNotificationClient(this);
-
-        // Rooted before it is published and long before it is registered, so no window exists in which
-        // the object is reachable by the audio service and by nothing else.
-        Root(client);
-
-        // Interlocked for the fence as much as for the store. This write and the read of IsDisposed
-        // below are one half of a Dekker pair with Dispose's Exchange and its read of _client; see the
-        // field comment. With a plain (or volatile) assignment here, Dispose can read _client as null
-        // while this thread reads _disposed as false, and the registration below outlives the monitor.
-        Interlocked.Exchange(ref _client, client);
-
-        if (IsDisposed)
-        {
-            // Dispose ran between the guard at the top of this method and the publish above. The Dekker
-            // pair guarantees at least one of the two sees the other, so either Dispose already
-            // unregistered this client - harmlessly, since nothing is registered yet, and the registrar
-            // absorbs the "element not found" that follows - or it saw nothing and skipped, in which
-            // case registering now would leave a registration nothing will ever remove.
+            // Re-checked inside the lock, and this is the branch the previous design got wrong. Dispose
+            // takes the same lock, so reaching here with _disposed set means Dispose has already run to
+            // completion - it has unregistered whatever it found, given the static root back and
+            // disposed the registrar. Registering now would take a live registration on a fresh
+            // enumerator that nothing will ever remove.
             //
-            // Either way: do not register, and give the root back.
-            Unroot(client);
+            // A quiet return rather than a throw: the sequential misuse is already refused above, and
+            // this is a race, not a caller error. It is warned about because it means the app is deaf.
+            if (_disposed)
+            {
+                Log.Warn("The endpoint monitor was disposed while it was starting. No notification "
+                         + "registration was taken; the route will rely on the reconcile.");
+                return;
+            }
 
-            Log.Warn("The endpoint monitor was disposed while it was starting. No notification "
-                     + "registration was taken; the route will rely on the reconcile.");
-            return;
-        }
+            _started = true;
 
-        try
-        {
-            _registrar.Register(client);
-        }
-        catch (Exception ex)
-        {
-            // Absorbed, and reported with the same consequence sentence the failed-HRESULT path uses,
-            // because they are the same failure of the same call: `new MMDeviceEnumerator()` can throw
-            // while the audio service is restarting - the property below names that case too. Letting
-            // it escape would put a WER dialog on the UI-thread startup path, in an app whose whole
-            // premise is not to have a window.
-            //
-            // _started stays claimed, so this is not retried, and that is deliberate rather than
-            // convenient: a throw out of Register leaves the registration in an unknown state, and a
-            // retry that double-registered would orphan this client - the exact shape of the crash this
-            // class is built around. The level read below and the consumer's reconcile are the
-            // backstop, which is precisely the fallback the probe's own decision names.
-            Log.Error(
-                "Registering for audio endpoint notifications threw. The A2DP sink endpoint's arrival "
-                + "will not be noticed; the route will only recover on the next reconcile.",
-                ex);
+            var client = new EndpointNotificationClient(this);
+
+            // Rooted before it is published and before it is registered, so no window exists in which
+            // the object is reachable by the audio service and by nothing else.
+            Root(client);
+            _client = client;
+
+            try
+            {
+                _registrar.Register(client);
+            }
+            catch (Exception ex)
+            {
+                // Absorbed. `new MMDeviceEnumerator()` can throw while the audio service is restarting -
+                // the property below names that same failure - and letting it escape would put a WER
+                // dialog on the UI-thread startup path, in an app whose whole premise is not to have a
+                // window. Reported at Error rather than the Warn the failed-HRESULT path uses, and the
+                // difference is deliberate: a non-zero HRESULT is COM answering "no" in a well-formed
+                // way, an exception is the call failing in a way nothing anticipated. The consequence
+                // sentence is the same because the consequence is.
+                //
+                // _started stays claimed, so this is not retried. Being precise about why, because the
+                // obvious reading is stronger than the truth: for the failure actually named above -
+                // the enumerator construction - nothing was registered, provably, because the registrar
+                // constructs before it registers. But Register does not distinguish which of its two
+                // steps threw, and a retry that double-registered after a throw from the *second* step
+                // would orphan this client. Conservative on an ambiguity, not on a known-bad state. The
+                // level read below and the consumer's reconcile are the backstop, which is precisely the
+                // fallback the probe's own decision names.
+                Log.Error(
+                    "Registering for audio endpoint notifications threw. The A2DP sink endpoint's "
+                    + "arrival will not be noticed; the route will only recover on the next reconcile.",
+                    ex);
+            }
         }
 
         bool present = SinkCaptureEndpointPresent;
@@ -426,15 +451,25 @@ public sealed class EndpointMonitor : IAudioEndpointMonitor
 
     public void Dispose()
     {
-        // Exchange for two reasons. It claims the disposal exactly once - two concurrent Disposes must
-        // not both unregister, because the second call throws COMException 0x80070490 - and it puts a
-        // full barrier between that store and the read of _client below, which is this thread's half of
-        // the Dekker pair with Start. See the field comment.
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        lock (_gate)
         {
-            return;
-        }
+            if (_disposed)
+            {
+                return;
+            }
 
+            _disposed = true;
+
+            DisposeUnderGate();
+        }
+    }
+
+    /// <summary>
+    /// The teardown itself, always under <see cref="_gate"/>. Split out only so the lock in
+    /// <see cref="Dispose"/> reads as the one thing it is.
+    /// </summary>
+    private void DisposeUnderGate()
+    {
         EndpointNotificationClient? client = _client;
 
         if (client is not null)
@@ -560,6 +595,10 @@ public sealed class MmDeviceNotificationRegistrar : IEndpointNotificationRegistr
 {
     private MMDeviceEnumerator? _enumerator;
 
+    // volatile because this is a last line of defence and must hold for any caller, including one that
+    // does not serialise its own Register and Dispose the way EndpointMonitor does.
+    private volatile bool _disposed;
+
     /// <summary>
     /// The enumerator is built here rather than in the constructor, for the reason
     /// <c>PowerNotifier.Start</c> does not subscribe in its: constructing a monitor should not activate
@@ -567,6 +606,19 @@ public sealed class MmDeviceNotificationRegistrar : IEndpointNotificationRegistr
     /// </summary>
     public void Register(IMMNotificationClient client)
     {
+        // The second line of defence, at the layer that owns the enumerator. EndpointMonitor's lock
+        // already makes a register-after-dispose impossible from *this* caller - but without this flag
+        // the class is one caller away from the worst bug in the file: `_enumerator ??= new(...)` would
+        // build a *fresh* enumerator after Dispose and take a live registration that the disposed
+        // registrar can never give back. Refused where the fact is known, not only where it is
+        // currently prevented.
+        if (_disposed)
+        {
+            Log.Warn("Refused to register for audio endpoint notifications: the registrar is already "
+                     + "disposed. A registration taken now could never be given back.");
+            return;
+        }
+
         _enumerator ??= new MMDeviceEnumerator();
 
         int hr = _enumerator.RegisterEndpointNotificationCallback(client);
@@ -600,6 +652,10 @@ public sealed class MmDeviceNotificationRegistrar : IEndpointNotificationRegistr
 
     public void Dispose()
     {
+        // First, so that a Register racing this is refused rather than building a fresh enumerator
+        // behind the teardown.
+        _disposed = true;
+
         MMDeviceEnumerator? enumerator = _enumerator;
         _enumerator = null;
 

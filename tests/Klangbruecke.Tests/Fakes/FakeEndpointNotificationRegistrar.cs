@@ -22,30 +22,114 @@ namespace Klangbruecke.Tests.Fakes;
 /// </summary>
 public sealed class FakeEndpointNotificationRegistrar : IEndpointNotificationRegistrar
 {
+    // Synchronised, and not as a formality. Two of these tests drive Start and Dispose at each other
+    // from separate threads released a nanosecond apart, 50 times - so Register really does run
+    // concurrently with Unregister and Dispose here. Unsynchronised, a concurrent List<T>.Add can throw
+    // IndexOutOfRangeException from inside List.Add (a confusing red in the one test least able to
+    // afford one), and a lost `++` breaks the assertion in both directions: a dropped UnregisterCount
+    // is a false red, and a dropped RegisterCount silently masks the exact invariant the racing test
+    // exists to check. The 40-odd single-threaded tests pay one uncontended lock each.
+    private readonly object _gate = new();
+
+    private readonly List<string> _operations = new();
+
+    private int _registerCount;
+    private int _unregisterCount;
+    private int _disposeCount;
+    private WeakReference? _client;
+    private bool _unregisteredTheClientItRegistered;
+
     /// <summary>
-    /// Every call in order, as lower-case verbs. Shutdown ordering is the assertion this exists for;
-    /// tests may append their own markers to interleave a probe call with the registration.
+    /// Every call in order, as lower-case verbs. Shutdown ordering is the assertion this exists for -
+    /// and order, not just counts: the interleaving that leaves a live registration behind produces the
+    /// same counts as the correct one and differs only in sequence.
+    ///
+    /// A snapshot, so an assertion cannot read a list another thread is still appending to. Use
+    /// <see cref="Record"/> to interleave a marker of your own.
     /// </summary>
-    public List<string> Operations { get; } = new();
+    public IReadOnlyList<string> Operations
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _operations.ToList();
+            }
+        }
+    }
 
-    public int RegisterCount { get; private set; }
+    public int RegisterCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _registerCount;
+            }
+        }
+    }
 
-    public int UnregisterCount { get; private set; }
+    public int UnregisterCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _unregisterCount;
+            }
+        }
+    }
 
-    public int DisposeCount { get; private set; }
+    public int DisposeCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _disposeCount;
+            }
+        }
+    }
 
     /// <summary>
     /// The client that was registered, weakly. Null until <see cref="Register"/> runs. See the note
     /// above before making this a strong reference.
     /// </summary>
-    public WeakReference? Client { get; private set; }
+    public WeakReference? Client
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _client;
+            }
+        }
+    }
 
     /// <summary>
     /// <see cref="Unregister"/> was handed the same object <see cref="Register"/> was given. False
     /// until an unregister happens. The registration is keyed on the client, so handing back a
     /// different one reports success and leaves the real registration in place.
     /// </summary>
-    public bool UnregisteredTheClientItRegistered { get; private set; }
+    public bool UnregisteredTheClientItRegistered
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _unregisteredTheClientItRegistered;
+            }
+        }
+    }
+
+    /// <summary>Appends a marker of the caller's own, in sequence with the real calls.</summary>
+    public void Record(string operation)
+    {
+        lock (_gate)
+        {
+            _operations.Add(operation);
+        }
+    }
 
     /// <summary>
     /// Thrown out of <see cref="Register"/> when set. The real registrar constructs an
@@ -63,9 +147,12 @@ public sealed class FakeEndpointNotificationRegistrar : IEndpointNotificationReg
 
     public void Register(IMMNotificationClient client)
     {
-        RegisterCount++;
-        Operations.Add("register");
-        Client = new WeakReference(client);
+        lock (_gate)
+        {
+            _registerCount++;
+            _operations.Add("register");
+            _client = new WeakReference(client);
+        }
 
         if (RegisterThrows is not null)
         {
@@ -75,12 +162,15 @@ public sealed class FakeEndpointNotificationRegistrar : IEndpointNotificationReg
 
     public void Unregister(IMMNotificationClient client)
     {
-        UnregisterCount++;
-        Operations.Add("unregister");
+        lock (_gate)
+        {
+            _unregisterCount++;
+            _operations.Add("unregister");
 
-        // Target is read into a local that dies with this call, so nothing here outlives the method and
-        // keeps the client alive past a later collection.
-        UnregisteredTheClientItRegistered = ReferenceEquals(client, Client?.Target);
+            // Target is read into a local that dies with this call, so nothing here outlives the method
+            // and keeps the client alive past a later collection.
+            _unregisteredTheClientItRegistered = ReferenceEquals(client, _client?.Target);
+        }
 
         if (TeardownThrows is not null)
         {
@@ -90,8 +180,11 @@ public sealed class FakeEndpointNotificationRegistrar : IEndpointNotificationReg
 
     public void Dispose()
     {
-        DisposeCount++;
-        Operations.Add("dispose");
+        lock (_gate)
+        {
+            _disposeCount++;
+            _operations.Add("dispose");
+        }
 
         if (TeardownThrows is not null)
         {
