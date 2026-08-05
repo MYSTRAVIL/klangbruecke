@@ -47,6 +47,22 @@ public sealed class ConnectionManagerTests : IDisposable
 
     private static readonly TimeSpan Grace = TimeSpan.FromSeconds(3);
 
+    /// <summary>
+    /// How long a test will wait for the threadpool to hand the endpoint probe's answer back.
+    ///
+    /// <b>A failure budget, not a timing assertion.</b> Nothing waits for any part of it on a passing
+    /// run - the handoff is a field read on a fake and completes in microseconds - so the only thing
+    /// this number decides is how long a genuinely broken build takes to say so. It is therefore set
+    /// far beyond any plausible scheduling hiccup rather than near it: a machine busy enough to lose
+    /// a five-second race would turn a correct implementation red, and a test that fails when the
+    /// build is fine is worse than one that takes half a minute to report a build that is not.
+    ///
+    /// The cost is real and worth stating: a mutant that keeps the probe on the calling thread is
+    /// killed by this timeout rather than by an immediate assert, so a mutation sweep pays it once
+    /// per such run.
+    /// </summary>
+    private static readonly TimeSpan HandoffBudget = TimeSpan.FromSeconds(30);
+
     private readonly ILog _originalLog = Log.Current;
     private readonly RecordingLog _log = new();
 
@@ -1101,7 +1117,7 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Endpoints.RaiseEndpointsChanged();
         posts++;
         Assert.True(
-            SpinWait.SpinUntil(() => ui.HasQueuedWork && ui.Posts == posts, TimeSpan.FromSeconds(5)),
+            SpinWait.SpinUntil(() => ui.HasQueuedWork && ui.Posts == posts, HandoffBudget),
             $"the endpoint probe never posted its answer: queued={ui.HasQueuedWork}, posts={ui.Posts}");
 
         Assert.Equal(1, ui.Drain());
@@ -1172,7 +1188,7 @@ public sealed class ConnectionManagerTests : IDisposable
         // handed to the threadpool, so the four that follow are turned away whatever the timing. Only
         // the winner's answer has to be waited for.
         Assert.True(
-            SpinWait.SpinUntil(() => ui.HasQueuedWork, TimeSpan.FromSeconds(5)),
+            SpinWait.SpinUntil(() => ui.HasQueuedWork, HandoffBudget),
             "the endpoint probe never answered");
 
         Assert.Equal(1, h.Endpoints.PresenceReads);
@@ -1182,7 +1198,7 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Endpoints.RaiseEndpointsChanged();
 
         Assert.True(
-            SpinWait.SpinUntil(() => h.Endpoints.PresenceReads >= 2, TimeSpan.FromSeconds(5)),
+            SpinWait.SpinUntil(() => h.Endpoints.PresenceReads >= 2, HandoffBudget),
             "the gate was never reopened");
 
         Assert.Equal(2, h.Endpoints.PresenceReads);
@@ -1238,7 +1254,7 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Scheduler.Advance(Seconds(30));
 
         Assert.True(
-            SpinWait.SpinUntil(() => h.Endpoints.PresenceReads > before, TimeSpan.FromSeconds(5)),
+            SpinWait.SpinUntil(() => h.Endpoints.PresenceReads > before, HandoffBudget),
             "the reconcile never refreshed the endpoint level");
 
         Assert.NotEqual(Environment.CurrentManagedThreadId, h.Endpoints.LastReadThreadId);
@@ -1365,7 +1381,7 @@ public sealed class ConnectionManagerTests : IDisposable
         raiser.Join();
 
         Assert.True(
-            SpinWait.SpinUntil(() => ui.HasQueuedWork, TimeSpan.FromSeconds(5)),
+            SpinWait.SpinUntil(() => ui.HasQueuedWork, HandoffBudget),
             "the watcher edge was never posted");
 
         h.Manager.Dispose();
@@ -1530,9 +1546,8 @@ public sealed class ConnectionManagerTests : IDisposable
         /// The alternative that would satisfy the rule exactly: have <see cref="FakeEndpointMonitor"/>
         /// signal a <c>TaskCompletionSource</c> from its read, and await that. It was not taken
         /// because it puts a test-only synchronisation primitive inside a double whose whole value is
-        /// being dumber than the thing it stands in for. The cost of not taking it, stated: a mutant
-        /// that keeps the probe inline is killed by a five-second timeout rather than an immediate
-        /// assert, so a sweep pays five seconds on each such run.
+        /// being dumber than the thing it stands in for. Its cost is named on
+        /// <see cref="HandoffBudget"/>, which is also where the size of the wait is argued.
         ///
         /// Everything the manager does with the answer still runs on this thread, in
         /// <see cref="MarshallingUiDispatcher.Drain"/>.
@@ -1547,11 +1562,11 @@ public sealed class ConnectionManagerTests : IDisposable
             Endpoints.SetPresent(present);
 
             Assert.True(
-                SpinWait.SpinUntil(() => Endpoints.PresenceReads > readsBefore, TimeSpan.FromSeconds(5)),
+                SpinWait.SpinUntil(() => Endpoints.PresenceReads > readsBefore, HandoffBudget),
                 "the endpoint level was never read");
 
             Assert.True(
-                SpinWait.SpinUntil(() => marshaller.HasQueuedWork, TimeSpan.FromSeconds(5)),
+                SpinWait.SpinUntil(() => marshaller.HasQueuedWork, HandoffBudget),
                 "the endpoint probe never posted its answer");
 
             marshaller.Drain();
