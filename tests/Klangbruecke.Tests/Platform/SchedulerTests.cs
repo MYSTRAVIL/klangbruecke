@@ -34,11 +34,22 @@ public sealed class SchedulerTests
     {
         var scheduler = new FakeScheduler(Start);
         int calls = 0;
+        DateTimeOffset seenByTheCallback = default;
 
-        scheduler.Schedule(Seconds(2), () => calls++);
+        scheduler.Schedule(Seconds(2), () =>
+        {
+            calls++;
+            seenByTheCallback = scheduler.Now;
+        });
         scheduler.Advance(Seconds(3));
 
         Assert.Equal(1, calls);
+
+        // The callback sees the time it came due, not the end of the window it was collected in.
+        // Downstream leans on this hardest: a backoff callback reads Now to work out its next delay
+        // and a grace window stamps a disconnect with it, so a scheduler that ran everything at the
+        // advance target would skew both by however far the test happened to advance.
+        Assert.Equal(Start + Seconds(2), seenByTheCallback);
     }
 
     // The grace window and the backoff both schedule one-shots and then let a lot of virtual time
@@ -154,6 +165,19 @@ public sealed class SchedulerTests
 
         Assert.Equal(1, outerCalls);
         Assert.Equal(1, innerCalls);
+    }
+
+    // Not from the brief's table. IScheduler documents this rejection as part of the seam's contract,
+    // so leaving it to review would have widened the interface with a rule nothing checks. It is also
+    // load-bearing here rather than merely defensive: a non-positive period re-arms at the instant it
+    // fired, and Advance would drain it forever - a hung suite, not a red one.
+    [Fact]
+    public void SchedulePeriodic_rejects_a_period_that_is_not_positive()
+    {
+        var scheduler = new FakeScheduler(Start);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => scheduler.SchedulePeriodic(TimeSpan.Zero, () => { }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => scheduler.SchedulePeriodic(Seconds(-1), () => { }));
     }
 
     [Fact]

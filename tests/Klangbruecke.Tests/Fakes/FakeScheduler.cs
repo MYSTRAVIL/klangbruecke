@@ -61,6 +61,14 @@ public sealed class FakeScheduler : IScheduler
     ///
     /// A periodic re-arms in place rather than being re-added, so it keeps its epoch and can still
     /// fire several times within one Advance - which is the whole point of a 30 s reconcile tick.
+    ///
+    /// What that costs, stated because callbacks read Now: sitting an entry out means the drain ends
+    /// with Now at the target, so the next Advance can fire it well past its due time. A 2 s one-shot
+    /// scheduled from a callback at Start+1 during Advance(60) runs with Now = Start+60, not
+    /// Start+3, and a further Advance(0) collects it no earlier - the skew is already banked. The
+    /// invariant that does hold, and the only one to rely on: Now never runs backwards, and a
+    /// callback never observes a Now earlier than its own due time. Anything needing an exact
+    /// interval must schedule it before the Advance that should collect it.
     /// </summary>
     public void Advance(TimeSpan by)
     {

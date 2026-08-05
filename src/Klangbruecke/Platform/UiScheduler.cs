@@ -1,19 +1,19 @@
 namespace Klangbruecke.Platform;
 
 /// <summary>
-/// Delivers every callback on the thread that constructed it. UI thread only.
+/// Delivers every callback on the thread that scheduled it. UI thread only.
 ///
 /// Built on <see cref="System.Windows.Forms.Timer"/>, which posts WM_TIMER through the message pump
-/// and so raises Tick on the thread that started it - no marshalling needed inside this class, and
-/// no lock anywhere in the state machine it drives. <see cref="System.Threading.Timer"/> would be
-/// the obvious swap and is the one thing that must not happen here: its callbacks arrive on the
-/// threadpool, which would quietly turn the whole single-threaded design into a racy one with no
+/// and so raises Tick on the thread that started the timer - no marshalling needed inside this
+/// class, and no lock anywhere in the state machine it drives. <see cref="System.Threading.Timer"/>
+/// would be the obvious swap and is the one thing that must not happen here: its callbacks arrive on
+/// the threadpool, which would quietly turn the whole single-threaded design into a racy one with no
 /// test to show for it.
 ///
-/// Precisely: Tick arrives on the thread that *started* the timer, which is the thread that called
-/// Schedule. Construct and use this from the UI thread only - Stage 1 requires that anyway. Called
-/// from a thread with no message pump, nothing would ever fire, which is why there is no marshalling
-/// here to make it look safe.
+/// The thread that starts the timer is the one that called Schedule, not the one that ran the
+/// constructor - the two are the same in this app only because Stage 1 requires everything to happen
+/// on the UI thread. Scheduled from a thread with no message pump, nothing would ever fire, which is
+/// why there is no marshalling here to make it look safe.
 ///
 /// Untested by design: it is a thin adapter whose behaviour is the pump's, and exercising it would
 /// need a live message loop. FakeScheduler carries the tested semantics.
@@ -129,8 +129,11 @@ public sealed class UiScheduler : IScheduler, IDisposable
             _timer.Stop();
             _timer.Tick -= OnTick;
 
-            // Disposing a WinForms timer from inside its own Tick is safe: the pump has already
-            // finished with the message by the time the handler runs.
+            // Disposing a WinForms timer from inside its own Tick is safe, but not because the
+            // message is finished with - Tick is raised from the timer's own WndProc while WM_TIMER
+            // is still being dispatched. It is safe because the teardown is same-thread: destroying
+            // a window from within its own window procedure is legal, and Stop-then-Dispose inside
+            // Tick is the documented one-shot idiom.
             _timer.Dispose();
             _owner.Forget(this);
         }
