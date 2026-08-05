@@ -34,8 +34,12 @@ public sealed class LinkMonitor : ILinkMonitor
     // volatile, not locked. Both are written by the thread that calls Watch/StopWatching - the UI
     // thread - and read on the watcher's own callback thread, which is neither of the two. The design
     // forbids locks anywhere in this stage; volatile is what makes a write on one visible to the
-    // other without one. A torn read is impossible for either type, so the worst case is one stale
-    // edge, which LinkMachine already de-duplicates.
+    // other without one, and a torn read is impossible for either type.
+    //
+    // What volatile does not buy is atomicity across the two, so StopWatching cannot fully exclude a
+    // callback that is already past its id check - see the ordering there. A stale *edge* out of that
+    // window is harmless: LinkMachine ignores an appeared/removed with no phone selected. A stale
+    // *level* is not, because nothing de-duplicates DevicePresent, which is why the ordering exists.
     private volatile string? _watchedDeviceId;
     private volatile bool _devicePresent;
 
@@ -52,11 +56,19 @@ public sealed class LinkMonitor : ILinkMonitor
     /// </summary>
     public void Watch(string phoneDeviceId)
     {
+        // Refused rather than tolerated, and the only method here that refuses anything. Dispose's
+        // idempotence guard returns early on a second call, so a watcher started after the first
+        // Dispose would never be stopped: it would run for the life of the process with live handlers
+        // firing into a disposed object. Nothing downstream can detect that, and the caller doing it
+        // has a real defect worth surfacing. StopWatching stays harmless by contrast - teardown paths
+        // call it without knowing what has already gone.
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         // Replace, never stack. Two live watchers over the same selector would double every edge, and
         // the older one would keep reporting the phone the user just stopped caring about.
         StopWatching();
 
-        _watchedDeviceId = phoneDeviceId;
+        SetWatchTarget(phoneDeviceId);
 
         // GetDeviceSelector, not TryCreateFromId. The statics interface is live unpackaged and only
         // that one method on it faults (FINDINGS §8), so the selector plus DeviceInformation
@@ -79,48 +91,85 @@ public sealed class LinkMonitor : ILinkMonitor
         // either way. An empty handler kept "just in case" would be untestable code defending an
         // unverified claim.
         _watcher = watcher;
+        watcher.Start();
+    }
+
+    /// <summary>
+    /// Everything <see cref="Watch"/> does that is not WinRT: adopt the id, and say what that means.
+    ///
+    /// Public, and the seam the callbacks below are tested through - <see cref="Watch"/> itself
+    /// starts a real <see cref="DeviceWatcher"/>, which is OS device enumeration inside a suite that
+    /// runs in two seconds. Call <see cref="Watch"/>, not this: on its own it adopts an id that
+    /// nothing is watching for, so no edge will ever arrive.
+    /// </summary>
+    public void SetWatchTarget(string phoneDeviceId)
+    {
+        _watchedDeviceId = phoneDeviceId;
+
+        // Always false, even though StopWatching has just cleared it. Watch's documented guarantee is
+        // that presence starts from nothing - picking a different phone while the old one was present
+        // must not claim the new one is in the room - and stating it here is what lets it be asserted
+        // without a watcher.
+        _devicePresent = false;
 
         Log.Info($"Watching the Bluetooth link for id={phoneDeviceId}");
-        watcher.Start();
+
+        if (!TryParseAddress(phoneDeviceId, out _))
+        {
+            // Warned once, at the moment it becomes true, because every consequence downstream is
+            // silent: ReadLinkStatusAsync will answer Unknown for this id forever, the link will read
+            // Absent forever, and the app will be indistinguishable from one whose phone is out of
+            // range. The id is named because the id is the thing that has to be corrected.
+            Log.Warn($"No Bluetooth address can be read from the watched id '{phoneDeviceId}'. "
+                     + "Every link status read for it will answer Unknown, which reads as an absent "
+                     + "phone - check what was persisted in Settings.");
+        }
     }
 
     public void StopWatching()
     {
+        // First, so that a callback which has not yet reached its id check fails it.
         _watchedDeviceId = null;
 
-        // Cleared without raising DeviceRemoved. This is the caller asking to stop looking, not the
-        // radio reporting a departure; a caller that just said "stop" does not need to be told the
-        // phone is gone, and ConnectionManager would act on the edge as though it were one.
-        _devicePresent = false;
-
-        if (_watcher is null)
+        if (_watcher is not null)
         {
-            return;
+            DeviceWatcher watcher = _watcher;
+            _watcher = null;
+
+            // Unsubscribe before stopping. Stop() is asynchronous - the watcher passes through
+            // Stopping on its way to Stopped - so a handler left attached can still be invoked after
+            // this method returns.
+            watcher.Added -= OnAdded;
+            watcher.Removed -= OnRemoved;
+
+            // Guarded and absorbed. Stop() is only legal from Started or EnumerationCompleted and
+            // answers anything else with E_ILLEGAL_METHOD_CALL; a watcher that aborted on its own
+            // reaches here in exactly that state. Teardown.Quietly rather than a silent catch because
+            // this runs on the path to TrayContext.Dispose, where a throw escapes Main and Windows
+            // answers with a WER dialog - a window, in an app whose premise is not to have one.
+            Teardown.Quietly(
+                () =>
+                {
+                    if (watcher.Status is DeviceWatcherStatus.Started or DeviceWatcherStatus.EnumerationCompleted)
+                    {
+                        watcher.Stop();
+                    }
+                },
+                "stop the Bluetooth link watcher");
         }
 
-        DeviceWatcher watcher = _watcher;
-        _watcher = null;
-
-        // Unsubscribe before stopping. Stop() is asynchronous - the watcher passes through Stopping
-        // on its way to Stopped - so a handler left attached can still be invoked after this method
-        // returns, raising an edge for a phone nobody is watching any more.
-        watcher.Added -= OnAdded;
-        watcher.Removed -= OnRemoved;
-
-        // Guarded and absorbed. Stop() is only legal from Started or EnumerationCompleted and answers
-        // anything else with E_ILLEGAL_METHOD_CALL; a watcher that aborted on its own reaches here in
-        // exactly that state. Teardown.Quietly rather than a silent catch because this runs on the
-        // path to TrayContext.Dispose, where a throw escapes Main and Windows answers with a WER
-        // dialog - a window, in an app whose premise is not to have one.
-        Teardown.Quietly(
-            () =>
-            {
-                if (watcher.Status is DeviceWatcherStatus.Started or DeviceWatcherStatus.EnumerationCompleted)
-                {
-                    watcher.Stop();
-                }
-            },
-            "stop the Bluetooth link watcher");
+        // Last, after the unsubscribe, and on every path through this method. Clearing it first left
+        // a callback that was already past its id check free to set it back to true after this
+        // returned, latching DevicePresent for a device nobody is watching - and unlike a stale edge,
+        // which LinkMachine drops, nothing anywhere corrects a stale level.
+        //
+        // This narrows that window to a callback already inside the assignment; it cannot close it
+        // without a lock, and the design forbids one. What remains is corrected by the next
+        // SetWatchTarget and by the reconcile's own level read.
+        //
+        // Cleared without raising DeviceRemoved: this is the caller asking to stop looking, not the
+        // radio reporting a departure, and ConnectionManager would act on the edge as though it were.
+        _devicePresent = false;
     }
 
     /// <summary>
@@ -138,16 +187,24 @@ public sealed class LinkMonitor : ILinkMonitor
     /// </summary>
     public static async Task<BluetoothLinkStatus> ReadLinkStatusAsync(string? deviceId)
     {
-        if (!TryParseAddress(deviceId, out ulong address))
-        {
-            // Not logged. With no phone selected this is the ordinary answer, and the reconcile asks
-            // every 30 s - an entry here would be 2,880 lines a day saying nothing happened.
-            return BluetoothLinkStatus.Unknown;
-        }
+        // Declared out here only so the catch can name the address it failed on.
+        ulong address = 0;
 
         BluetoothDevice? device = null;
         try
         {
+            // Inside the try, not before it. TryExtractAddress cannot throw today - it guards null and
+            // whitespace and then runs three bounded GeneratedRegex patterns - but "never throws" is
+            // this method's contract and TryExtractAddress belongs to another class, which is free to
+            // change. Structural is worth more than currently-true.
+            if (!TryParseAddress(deviceId, out address))
+            {
+                // Not logged. With no phone selected this is the ordinary answer, and the reconcile
+                // asks every 30 s - an entry here would be 2,880 lines a day saying nothing happened.
+                // A watched id that cannot yield an address is warned about once, in SetWatchTarget.
+                return BluetoothLinkStatus.Unknown;
+            }
+
             device = await BluetoothDevice.FromBluetoothAddressAsync(address);
 
             // Unknown rather than Disconnected on null: "no answer" and "answered, not connected" are
@@ -235,10 +292,21 @@ public sealed class LinkMonitor : ILinkMonitor
             : BluetoothLinkStatus.Disconnected;
 
     // --- watcher callbacks: WinRT's thread, deliberately not marshalled -----------------------
+    //
+    // The WinRT handlers are adapters and nothing else. DeviceInformation and DeviceInformationUpdate
+    // cannot be constructed outside WinRT, so a filter or a presence transition written inside them
+    // is a filter no test can reach - and the whole edge-triggered half of this class would then rest
+    // on one hardware probe that does not run again. Both handlers read a single string, so the
+    // string is the seam.
 
-    private void OnAdded(DeviceWatcher sender, DeviceInformation info)
+    private void OnAdded(DeviceWatcher sender, DeviceInformation info) => OnCandidateAdded(info.Id);
+
+    private void OnRemoved(DeviceWatcher sender, DeviceInformationUpdate update) => OnCandidateRemoved(update.Id);
+
+    /// <summary>The watcher offered a device. Public for the reason above; call it only as a test.</summary>
+    public void OnCandidateAdded(string candidateDeviceId)
     {
-        if (!IsWatchedDevice(_watchedDeviceId, info.Id))
+        if (!IsWatchedDevice(_watchedDeviceId, candidateDeviceId))
         {
             return;
         }
@@ -249,23 +317,24 @@ public sealed class LinkMonitor : ILinkMonitor
         // phone arriving, and phone-initiated reconnect is one of the two paths CLAUDE.md names as
         // historically fragile. A log that only records what the state machine concluded cannot show
         // whether the edge arrived at all.
-        Log.Info($"Bluetooth link watcher: device appeared, id={info.Id}");
+        Log.Info($"Bluetooth link watcher: device appeared, id={candidateDeviceId}");
 
         // Raised on the calling thread. ConnectionManager posts through IUiDispatcher; do not add a
         // second marshalling layer here.
         DeviceAppeared?.Invoke(this, EventArgs.Empty);
     }
 
-    private void OnRemoved(DeviceWatcher sender, DeviceInformationUpdate update)
+    /// <summary>The watcher withdrew a device. Public for the reason above; call it only as a test.</summary>
+    public void OnCandidateRemoved(string candidateDeviceId)
     {
-        if (!IsWatchedDevice(_watchedDeviceId, update.Id))
+        if (!IsWatchedDevice(_watchedDeviceId, candidateDeviceId))
         {
             return;
         }
 
         _devicePresent = false;
 
-        Log.Info($"Bluetooth link watcher: device removed, id={update.Id}");
+        Log.Info($"Bluetooth link watcher: device removed, id={candidateDeviceId}");
 
         // Raised on the calling thread, for the reason above.
         DeviceRemoved?.Invoke(this, EventArgs.Empty);
