@@ -15,12 +15,13 @@ public readonly record struct AudioOutputDevice(string Id, string Name);
 /// <summary>
 /// One capture endpoint, reduced to what <see cref="AudioRouter"/> asks of it.
 ///
-/// Implementations must raise both events with <c>this</c> as the sender. The router compares
-/// <c>sender</c> against the instance it is holding and drops anything else as stale - see
-/// <see cref="AudioRouter"/>'s recording-stopped handler - so an adapter that forwarded the inner
-/// NAudio object as sender would fail that comparison on every raise, and a dead capture would
-/// never tear the route down. That failure is silent: nothing throws, the tray keeps claiming it
-/// is routing, and the A2DP endpoint stays held open.
+/// There is deliberately no contract on the sender an implementation raises these events with. The
+/// router drops stopped events from an endpoint it is no longer holding, and it used to identify
+/// that endpoint by the sender - which made an adapter forwarding its inner NAudio object through a
+/// silent kill switch for teardown, and one no test could reach, because a test double is the
+/// adapter. It now closes over the endpoint at the point it subscribes; see
+/// <see cref="AudioRouter"/>'s recording-stopped handler. Implementations are free to raise with
+/// whatever they like.
 /// </summary>
 public interface ICaptureSource : IDisposable
 {
@@ -35,8 +36,7 @@ public interface ICaptureSource : IDisposable
 /// <summary>
 /// One render endpoint, reduced to what <see cref="AudioRouter"/> asks of it.
 ///
-/// The same sender contract as <see cref="ICaptureSource"/> applies to
-/// <see cref="PlaybackStopped"/>, and for the same reason.
+/// The note on <see cref="ICaptureSource"/> about senders applies here too: none is required.
 ///
 /// <see cref="MixFormat"/> is a property rather than something the factory reads once because
 /// reading it is itself a plausible failure point - it activates the audio client on first touch -

@@ -79,11 +79,10 @@ public sealed class WasapiDeviceFactory : IAudioDeviceFactory
 /// <summary>
 /// <see cref="WasapiCapture"/> behind <see cref="ICaptureSource"/>.
 ///
-/// Note the sender on the re-raises. NAudio raises its events with the <see cref="WasapiCapture"/>
-/// as sender, but the router is holding this adapter, and its stale-sender guard is a reference
-/// comparison against what it holds. Forwarding <c>sender</c> through unchanged would make that
-/// guard reject every event NAudio ever raises - no exception, no log line, just a route that never
-/// notices its own capture died. Raise with <c>this</c>.
+/// The re-raises pass <c>this</c> because that is what an event raised by this object should say,
+/// and for no other reason. Nothing downstream reads it: the router closes over the endpoint when it
+/// subscribes rather than trusting the sender, precisely so that this line cannot quietly disable
+/// teardown. See <see cref="ICaptureSource"/>.
 /// </summary>
 internal sealed class WasapiCaptureSource : ICaptureSource
 {
@@ -126,7 +125,7 @@ internal sealed class WasapiCaptureSource : ICaptureSource
 /// called <c>Start</c> - the UI thread in this app - so the captured context is the same one as
 /// before. Do not move this construction onto a threadpool thread.
 ///
-/// The sender note on <see cref="WasapiCaptureSource"/> applies here in full.
+/// The sender note on <see cref="WasapiCaptureSource"/> applies here too.
 /// </summary>
 internal sealed class WasapiRenderSink : IRenderSink
 {

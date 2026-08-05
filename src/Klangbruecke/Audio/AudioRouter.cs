@@ -49,6 +49,17 @@ public sealed class AudioRouter : IAudioRouter
     /// </summary>
     private volatile Session? _session;
 
+    /// <summary>
+    /// The two stopped subscriptions, kept only so <see cref="Stop"/> can take them off again.
+    ///
+    /// They are closures rather than method groups because each one carries the endpoint it was
+    /// subscribed for into the handler; see <see cref="OnRecordingStopped"/> for why that identity
+    /// must not come from the event's own sender. Written and read on the thread that runs Start and
+    /// Stop, and on no other, so unlike the endpoint fields above they need no volatile.
+    /// </summary>
+    private EventHandler<StoppedEventArgs>? _onRecordingStopped;
+    private EventHandler<StoppedEventArgs>? _onPlaybackStopped;
+
     private bool _disposed;
 
     /// <summary>
@@ -142,7 +153,11 @@ public sealed class AudioRouter : IAudioRouter
             };
 
             source.DataAvailable += OnDataAvailable;
-            source.RecordingStopped += OnRecordingStopped;
+
+            // The capture goes into the handler from here rather than out of the event's sender.
+            // See OnRecordingStopped.
+            _onRecordingStopped = (_, e) => OnRecordingStopped(source, e);
+            source.RecordingStopped += _onRecordingStopped;
 
             outputFormat = sink.MixFormat;
 
@@ -155,7 +170,8 @@ public sealed class AudioRouter : IAudioRouter
                          ? " - differ, WASAPI shared mode is converting."
                          : " - matched."));
 
-            sink.PlaybackStopped += OnPlaybackStopped;
+            _onPlaybackStopped = (_, e) => OnPlaybackStopped(sink, e);
+            sink.PlaybackStopped += _onPlaybackStopped;
             sink.Init(_buffer);
 
             // Before either worker thread exists, so no stopped event can be raised against a session
@@ -200,14 +216,26 @@ public sealed class AudioRouter : IAudioRouter
         _buffer?.AddSamples(e.Buffer, 0, e.BytesRecorded);
     }
 
-    private void OnRecordingStopped(object? sender, StoppedEventArgs e)
+    /// <summary>
+    /// <paramref name="source"/> is the capture this handler was subscribed for, closed over by the
+    /// subscription in <see cref="Start"/> rather than read out of the event's own sender.
+    ///
+    /// Taken from the event, the identity would be whatever the implementation chose to pass, and the
+    /// guard below would be resting on a convention no compiler checks: an adapter that forwarded its
+    /// inner NAudio object through - a one-character edit, <c>(s, e)</c> for <c>(_, e)</c> - would
+    /// fail the comparison on every raise it ever made. Nothing throws when that happens. The route
+    /// just never notices its own capture died, the tray goes on claiming it is routing, and the A2DP
+    /// endpoint stays held open. Supplied from the subscription it cannot be wrong, and the guard says
+    /// exactly what it reads as: is this from the capture I am holding now?
+    /// </summary>
+    private void OnRecordingStopped(ICaptureSource source, StoppedEventArgs e)
     {
         // Mirrors the playback guard below: this can be raised after Stop dropped this capture or a
         // later Start replaced it, and reporting that session dead would describe the wrong one.
         // NAudio snapshots the delegate before raising, so unsubscribing in Stop does not reliably
         // prevent this call - which is why the guard exists at all, and why _capture is volatile:
         // this is the one check the session token cannot back up, because it runs before it.
-        if (!ReferenceEquals(sender, _capture))
+        if (!ReferenceEquals(source, _capture))
         {
             return;
         }
@@ -229,13 +257,16 @@ public sealed class AudioRouter : IAudioRouter
     /// <summary>
     /// WasapiOut turns play-thread failures into this event and nothing else. Unhandled, a dead
     /// stream leaves IsRunning set and the tray still claiming it is routing.
+    ///
+    /// <paramref name="sink"/> comes from the subscription, for the reason given on the capture
+    /// handler above.
     /// </summary>
-    private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
+    private void OnPlaybackStopped(IRenderSink sink, StoppedEventArgs e)
     {
         // Raised via SynchronizationContext.Post, so it can arrive after Stop dropped this output
         // or a later Start replaced it. Reporting then would describe the wrong session as dead.
         // Volatile for the same reason as the capture guard above.
-        if (!ReferenceEquals(sender, _output))
+        if (!ReferenceEquals(sink, _output))
         {
             return;
         }
@@ -371,7 +402,8 @@ public sealed class AudioRouter : IAudioRouter
         if (_capture is not null)
         {
             _capture.DataAvailable -= OnDataAvailable;
-            _capture.RecordingStopped -= OnRecordingStopped;
+            _capture.RecordingStopped -= _onRecordingStopped;
+            _onRecordingStopped = null;
 
             // Already stopped, or the endpoint vanished with the connection.
             Teardown.Quietly(_capture.StopRecording, "stop capture");
@@ -383,7 +415,8 @@ public sealed class AudioRouter : IAudioRouter
         {
             // Before Dispose, which joins the play thread that raises it. A deliberate teardown is
             // not a failure, and reporting it as one would overwrite the real status.
-            _output.PlaybackStopped -= OnPlaybackStopped;
+            _output.PlaybackStopped -= _onPlaybackStopped;
+            _onPlaybackStopped = null;
 
             Teardown.Quietly(_output.Dispose, "dispose output");
             _output = null;
