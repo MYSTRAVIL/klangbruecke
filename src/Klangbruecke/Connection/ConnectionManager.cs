@@ -335,7 +335,7 @@ public sealed class ConnectionManager : IDisposable
         // Through the reconcile rather than straight into a connect: the phone's presence is a
         // question only the radio can answer, the pass already asks it, and routing this through the
         // same five checks as everything else is what keeps one connect path in the class.
-        _ = ReconcileAsync("phone selected");
+        _ = ReconcileAsync("phone selected", userAsked: true);
     }
 
     public void DeselectPhone()
@@ -691,7 +691,11 @@ public sealed class ConnectionManager : IDisposable
 
     // --- the reconcile: the spec's five checks, in order -----------------------------------------
 
-    private async Task ReconcileAsync(string trigger)
+    /// <param name="userAsked">
+    /// True when this pass descends from the user naming a phone. It changes exactly one thing -
+    /// check 2 - and see there for why.
+    /// </param>
+    private async Task ReconcileAsync(string trigger, bool userAsked = false)
     {
         if (_disposed)
         {
@@ -708,6 +712,11 @@ public sealed class ConnectionManager : IDisposable
 
         try
         {
+            // Three things in this method outlive an await on purpose, and they are the only three:
+            // this snapshot, whose whole job is to be from before; startedAt, which is the token the
+            // supersession check compares against; and the trigger string, which is a constant.
+            // Everything else - permission most of all - is read at the point it is used. See the
+            // note on ConnectHalvesAsync's first await for what a hoisted permission flag costs.
             Drift before = TakeDrift();
 
             // 1. The link, level-triggered. This is the backstop for a watcher edge that never
@@ -731,26 +740,49 @@ public sealed class ConnectionManager : IDisposable
             // most of all - and this level read is the only thing that would notice.
             if (!_sink.IsConnected && _music.State is MusicState.Linked or MusicState.Up)
             {
-                OnConnectionClosed();
+                if (userAsked)
+                {
+                    // The user has just named this phone, so there is nothing here to adjudicate: a
+                    // half that still believes in a connection the sink no longer has is stale, not
+                    // ambiguous. Opening a window would answer "the link is up, so the audio profile
+                    // was dropped deliberately" and suppress the app three seconds after the click -
+                    // and SelectPhone cancelling the previous window is what made that reachable.
+                    //
+                    // OnSuppressed is the teardown, not a claim about why: the half offers no
+                    // "start again" input, and every other route out of Linked in this class ends at
+                    // the same call. Standing it down here is what lets the link-present report below
+                    // reconnect it inside this same pass, which is what the click asked for.
+                    _music.OnSuppressed();
+                }
+                else
+                {
+                    OnConnectionClosed();
 
-                // Nothing else this pass. What just opened is a question with a 3 s answer, and
-                // correcting the halves against a connection that is already gone would start a route
-                // over it in the meantime.
-                ReportDrift(before, trigger);
-                return;
+                    // Nothing else this pass. What just opened is a question with a 3 s answer, and
+                    // correcting the halves against a connection that is already gone would start a
+                    // route over it in the meantime.
+                    ReportDrift(before, trigger);
+                    return;
+                }
             }
-
-            bool permitted = ConnectPermitted;
 
             // 3, 4 and 5 - the capture endpoint, the route, and the registration - are each discharged
             // inside the half that owns them. Reading any of them here would be a second opinion that
             // could disagree with the machine acting on it.
-            if (!await StillOurs(_music.ReconcileAsync(permitted), startedAt))
+            //
+            // Permission is read per half and never hoisted into a local above these awaits. The
+            // first of them can be a real ConnectAsync round trip to a radio, and the tray's
+            // Disconnect during it sets the latch - which StillOurs cannot see, because nothing on
+            // the Disconnect path touches _reconcilingSince, and which EnforceConnectPermission below
+            // cannot repair, because it stands down only when the latch is *not* set. A hoisted flag
+            // therefore claims the hands-free role seconds after the user disconnected, while the
+            // tray reports Suppressed.
+            if (!await StillOurs(_music.ReconcileAsync(ConnectPermitted), startedAt))
             {
                 return;
             }
 
-            if (!await StillOurs(_calls.ReconcileAsync(permitted), startedAt))
+            if (!await StillOurs(_calls.ReconcileAsync(ConnectPermitted), startedAt))
             {
                 return;
             }
@@ -760,12 +792,12 @@ public sealed class ConnectionManager : IDisposable
                 // Level-triggered, like everything else in the pass: both halves ignore this unless
                 // they are Off, so saying it every 30 s costs nothing and saying it never is how an
                 // app that missed one edge stays down for the rest of the session.
-                if (!await StillOurs(_music.OnLinkPresentAsync(permitted), startedAt))
+                if (!await StillOurs(_music.OnLinkPresentAsync(ConnectPermitted), startedAt))
                 {
                     return;
                 }
 
-                if (!await StillOurs(_calls.OnLinkPresentAsync(permitted), startedAt))
+                if (!await StillOurs(_calls.OnLinkPresentAsync(ConnectPermitted), startedAt))
                 {
                     return;
                 }

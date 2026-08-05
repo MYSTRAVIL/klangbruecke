@@ -1526,6 +1526,83 @@ public sealed class ConnectionManagerTests : IDisposable
     }
 
     /// <summary>
+    /// The same defect as <c>A_disconnect_during_a_connect_stops_the_other_half_registering</c>, in
+    /// the reconcile - which reaches the halves through the same two calls and used to read
+    /// permission once, above both.
+    ///
+    /// The pass's own supersession guard cannot cover this: nothing on the Disconnect path touches
+    /// <c>_reconcilingSince</c>, so the pass is still legitimately the current one. It is only the
+    /// <em>permission</em> that changed.
+    /// </summary>
+    [Fact]
+    public void A_disconnect_during_a_reconcile_connect_stops_the_other_half_registering()
+    {
+        using Harness h = new(enableCalls: true);
+
+        // A pass that finds the phone present with both halves off, and hands off to a connect that
+        // does not answer.
+        h.Sink.DeferConnect = true;
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Equal(1, h.Sink.PendingConnects);
+        Assert.Empty(h.Calls.ConnectCalls);
+
+        h.Manager.RequestDisconnect();
+
+        h.Sink.CompleteConnect(true);
+
+        Assert.Empty(h.Calls.ConnectCalls);
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+    }
+
+    /// <summary>
+    /// The residual of cancelling the window on a phone selection: if the window being cancelled came
+    /// from check 2 rather than from a sink event, the pass the click starts immediately arms an
+    /// identical one - and it suppresses three seconds after the user clicked Connect.
+    ///
+    /// A half that still believes in a connection the sink no longer has is stale, not ambiguous, and
+    /// the click is the user saying which phone they mean. So the pass stands the half down and
+    /// reconnects it rather than opening a window to ask why it went.
+    /// </summary>
+    [Fact]
+    public void Picking_a_phone_reconnects_a_stale_connection_instead_of_suppressing()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        // The connection object goes away with no event at all - the across-a-suspend case.
+        h.Sink.Disconnect();
+
+        h.Manager.SelectPhone(PhoneId);
+
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        // And nothing was left armed to suppress three seconds after the click.
+        h.Scheduler.Advance(Grace);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    /// <summary>
+    /// And the carve-out is exactly one click wide: a tick that finds the same drift on its own still
+    /// opens the window, because nobody has said anything about intent and the difference between a
+    /// deliberate drop and a range exit is still worth three seconds to establish.
+    /// </summary>
+    [Fact]
+    public void A_reconcile_nobody_asked_for_still_opens_the_window()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        h.Sink.Disconnect();
+
+        h.Scheduler.Advance(Seconds(30));
+        Assert.Single(h.Sink.ConnectCalls);
+
+        h.Scheduler.Advance(Grace);
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+    }
+
+    /// <summary>
     /// The same shutdown race on the other turn that awaits. The calls switch has one await and no
     /// guard between it and the tail, so the tail's own disposal check is the only thing standing
     /// between a registration that answers late and a tray that has already gone.
