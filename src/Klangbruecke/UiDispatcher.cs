@@ -45,6 +45,16 @@ public sealed class ControlUiDispatcher : IUiDispatcher, IDisposable
     {
         // Disposal destroys the handle, after which InvokeRequired reports false and the action
         // would run inline on whichever background thread posted it - the bug this class removes.
+        //
+        // <b>What this deliberately does not close.</b> Control.Dispose destroys the handle and only
+        // then sets IsDisposed, so there is a window a few instructions wide in which this check
+        // passes and the handle is already gone - and a Post landing in it runs inline on the
+        // caller's thread. It is left open rather than closed with a flag of this class's own,
+        // because a flag no test can force is a guard nothing can prove is there. What closes it
+        // instead is ordering, and the ordering is stated at both ends: Program.Main disposes this
+        // after TrayContext, which disposes ConnectionManager, which is the only thing in the app
+        // that posts from a threadpool thread - and the one action it posts re-checks its own
+        // disposal before touching anything. See ConnectionManager.ApplyEndpointPresence.
         if (_marshaller.IsDisposed)
         {
             return;

@@ -97,4 +97,33 @@ public static class CallsPolicy
     /// <summary>Register and connect only when nothing structural is in the way.</summary>
     public static bool ShouldRegister(CallsAvailability availability) =>
         availability == CallsAvailability.Enabled;
+
+    /// <summary>
+    /// The tray's "Route calls to PC" item: what it says, whether it can be clicked, and whether it
+    /// reads as on.
+    ///
+    /// <b>Three values from one call, because the two ways of getting this wrong are combinations.</b>
+    /// An item that says "(needs MSIX)" and is still clickable invites a click that writes a setting
+    /// nothing can honour; an item that reads as ticked while no registration can ever succeed is the
+    /// shape this replaces - the user sees the switch as on, the calls half goes on retrying, and
+    /// nothing anywhere names the reason. Returned together, neither is representable.
+    ///
+    /// <b>Gated on package identity, deliberately not on <see cref="Decide"/>.</b> The verdict answers
+    /// <see cref="CallsAvailability.DisabledBySetting"/> the moment calls are switched off, so an item
+    /// disabled on that would disable itself on the click that turned it off - a switch with exactly
+    /// one use. The setting decides only the tick.
+    ///
+    /// The unpackaged text is the packaged one plus the reason, so the item stays recognisable as the
+    /// same switch rather than reading as two unrelated entries. "(needs MSIX)" and not
+    /// <see cref="Explain"/>: that runs to a couple of hundred characters, which is a menu entry
+    /// wider than the screen, and the log is where it belongs.
+    /// </summary>
+    public static (string Text, bool Enabled, bool Checked) MenuItem(bool isPackaged, bool enableCalls) =>
+        isPackaged
+            ? ("Route calls to PC", true, enableCalls)
+
+            // Unticked as well as disabled. The setting may well be true - it defaults to true and an
+            // unpackaged run never gets to change it - but the tick is the app's claim about what it
+            // is doing, and unpackaged it is doing nothing.
+            : ("Route calls to PC (needs MSIX)", false, false);
 }

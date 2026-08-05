@@ -79,13 +79,23 @@ public sealed class AudioSinkServiceContractTests : IDisposable
         Assert.False(_sink.IsConnected);
         Assert.Null(_sink.ConnectedDeviceId);
 
-        // Named, because the line exists to tell a reader that a caller skipped the policy rather
-        // than that the machine is unpackaged - the two are different defects and only one is a bug
-        // in this codebase. Warn regardless of AudioSinkPolicy.LevelFor: TrayContext returns before
-        // ever calling here, so this entry and the tray's own verdict can never appear in one run.
-        Assert.Contains(
-            _log.Entries,
-            e => e.Level == LogLevel.Warn && e.Message.Contains("AudioSinkPolicy"));
+        // The policy's own sentence, at the policy's own level, and exactly once.
+        //
+        // This assertion used to require the line to name AudioSinkPolicy and accuse the caller of
+        // not having consulted it. That was true while TrayContext held a second gate in front of
+        // this one; Task 17 moved the connect path into MusicHalf and this became the only gate, so
+        // the accusation is now aimed at a caller with no way to ask - ConnectionManager deliberately
+        // reads no process-wide static. What is worth pinning instead is that the refusal reads the
+        // same as the copy Program.Main writes once at startup: the music and calls gates have
+        // already drifted to different wordings and different severities once, which left anyone
+        // grepping [WRN] with half the story about one root cause.
+        (LogLevel Level, string Message, Exception? Exception) refusal =
+            Assert.Single(_log.Entries, e => e.Message == AudioSinkPolicy.Explain(isPackaged: false));
+
+        // Warn, spelled out rather than taken from LevelFor: asserting the source against itself
+        // would let a level change pass on both sides at once. A half that cannot run at all is the
+        // loud case - see CallsPolicyTests.LevelFor_AgreesWithTheMusicHalfOnMissingPackageIdentity.
+        Assert.Equal(LogLevel.Warn, refusal.Level);
     }
 
     // A contract marker, labelled as one because it cannot currently fail. Deleting the

@@ -230,12 +230,20 @@ public sealed class EndpointMonitor : IAudioEndpointMonitor
     public event EventHandler? EndpointsChanged;
 
     /// <summary>
-    /// A lock-free read, and the name exists to mark that as deliberate. The two places that must not
-    /// race - <see cref="Start"/> and <see cref="Dispose"/> - read <c>_disposed</c> inside
-    /// <see cref="_gate"/>. This one is for the two that must never block on it: the notification
-    /// handler, which runs on MMDevAPI's worker threads and must not be able to wait on the UI thread,
-    /// and the level, which is read on the reconcile tick. Both are advisory guards where a read that
-    /// is one instant stale is harmless.
+    /// A lock-free read of <see cref="_disposed"/>, and the name exists to mark that as deliberate.
+    /// The two places that must not race - <see cref="Start"/> and <see cref="Dispose"/> - do their
+    /// check-then-act inside <see cref="_gate"/>, and it is the lock rather than this accessor that
+    /// makes those atomic.
+    ///
+    /// <b>Three readers go through here, for two different reasons</b>, and the count is worth stating
+    /// because this comment named two while a third read the field directly. Two of them must never be
+    /// able to block on the lock: the notification handler, which runs on MMDevAPI's worker threads
+    /// and must not be able to wait on the UI thread, and the level, which is read on the reconcile
+    /// tick and would otherwise hold up a 152-282 ms enumeration behind a teardown. The third is
+    /// <see cref="Start"/>'s entry guard, which is not a claim at all: it refuses the sequential
+    /// misuse - a Start after a Dispose - before the lock is taken, and the re-check inside the lock
+    /// is what actually decides. All three are advisory, all three tolerate a read that is one instant
+    /// stale, and the volatile field is what makes them see a write at all.
     /// </summary>
     private bool IsDisposed => _disposed;
 
@@ -298,7 +306,11 @@ public sealed class EndpointMonitor : IAudioEndpointMonitor
         // registration taken after the first Dispose would never be unregistered; the monitor would then
         // be dropped, the client with it, and the next notification into a collected client is the
         // 0xC0000005 above.
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        //
+        // Through the accessor rather than the raw field, like the other two lock-free readers, so
+        // that every read of _disposed outside the lock goes through the one place documented as
+        // doing it.
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
 
         lock (_gate)
         {

@@ -120,6 +120,42 @@ public sealed class UiDispatcherTests
         });
     }
 
+    /// <summary>
+    /// The premise the whole single-threaded design rests on, and the one a comment in
+    /// <c>IPowerNotifier</c> used to get wrong.
+    ///
+    /// Constructing any <see cref="Control"/> calls <c>WindowsFormsSynchronizationContext.InstallIfNeeded</c>,
+    /// so the WinForms context is current from the moment this dispatcher exists - which in
+    /// <c>Program.Main</c> is <b>before</b> <c>Application.Run</c> is entered, not after. Two things
+    /// downstream depend on exactly that and on nothing else:
+    ///
+    /// <list type="number">
+    /// <item><c>ConnectionManager</c> has no <c>ConfigureAwait</c> anywhere, so every one of its awaits
+    /// resumes on whatever context was current when it was reached. Started on this thread, that is
+    /// this context, and the no-locks contract holds. With no context installed the continuations
+    /// would land on the threadpool and four state machines would be racing with nothing to show for
+    /// it.</item>
+    /// <item><c>SystemEvents</c> captures the context current at <c>+=</c> time, so a
+    /// <c>PowerNotifier.Start()</c> reached from a constructor that runs before <c>Application.Run</c>
+    /// still lands its <c>Resumed</c> on the UI thread. The "before Run gives the SystemEvents thread"
+    /// shorthand was false for this app for precisely this reason.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public void Control_InstallsTheWinFormsSynchronizationContextOnTheThreadThatBuildsIt()
+    {
+        OnStaThread(() =>
+        {
+            // A freshly started thread has none. Asserted rather than assumed, because without it a
+            // context installed by something else entirely would satisfy the check below.
+            Assert.Null(SynchronizationContext.Current);
+
+            using var dispatcher = new ControlUiDispatcher();
+
+            Assert.IsType<WindowsFormsSynchronizationContext>(SynchronizationContext.Current);
+        });
+    }
+
     [Fact]
     public void Control_LetsExceptionsFromTheActionEscape()
     {

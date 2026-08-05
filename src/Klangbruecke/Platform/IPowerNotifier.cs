@@ -34,8 +34,14 @@ namespace Klangbruecke.Platform;
 /// <item>With no context installed, <c>SystemEvents</c> captures a plain
 /// <see cref="System.Threading.SynchronizationContext"/> whose <c>Send</c> runs inline - i.e. on the
 /// <c>SystemEvents</c> window thread. Because <see cref="Start"/> is deliberately not called from the
-/// constructor, <b>the delivery thread depends on where startup calls it</b>: before
-/// <c>Application.Run</c> gives the <c>SystemEvents</c> thread, after gives the UI thread.</item>
+/// constructor, <b>the delivery thread depends on where startup calls it</b> - and the test is
+/// whether the WinForms context has been installed by then, <b>not</b> whether <c>Application.Run</c>
+/// has been entered. This sentence used to say the latter, and it was false for this app: the context
+/// is installed by the first <c>Control</c> constructed, which is <c>ControlUiDispatcher</c>'s
+/// marshalling control in <c>Program.Main</c>, and <c>ConnectionManager.Start</c> is reached from
+/// <c>TrayContext</c>'s constructor. Both run before <c>Application.Run</c> is entered and both are
+/// on the UI thread with the context already current, so this app gets consequence 1 above. Pinned by
+/// <c>UiDispatcherTests.Control_InstallsTheWinFormsSynchronizationContextOnTheThreadThatBuildsIt</c>.</item>
 /// </list>
 ///
 /// Either way <c>ConnectionManager</c> posts every inbound event through <c>IUiDispatcher</c> before

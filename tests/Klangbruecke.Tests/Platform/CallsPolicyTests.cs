@@ -151,4 +151,73 @@ public sealed class CallsPolicyTests
     {
         Assert.Equal(LogLevel.Warn, CallsPolicy.LevelFor((CallsAvailability)99));
     }
+
+    // --- the tray's own item (Task 17) ---
+    //
+    // Three values from one call rather than three rules the call site combines, because the two ways
+    // of getting it wrong are both combinations: an item that says "(needs MSIX)" while still being
+    // clickable, and one that reads as switched on while nothing can ever register. Returned together,
+    // neither is representable.
+
+    [Fact]
+    public void MenuItem_NamesMsix_AndRefusesTheClick_WhenUnpackaged()
+    {
+        // The whole of what an unpackaged run can honestly offer here. The predecessor of this item
+        // showed checked and did nothing, which is the worst of the three: the user reads the switch
+        // as on, the calls half retries forever, and nothing anywhere names the reason.
+        Assert.Equal(
+            ("Route calls to PC (needs MSIX)", false, false),
+            CallsPolicy.MenuItem(isPackaged: false, enableCalls: true));
+    }
+
+    [Fact]
+    public void MenuItem_IsPlainAndClickable_WhenPackaged()
+    {
+        Assert.Equal(
+            ("Route calls to PC", true, true),
+            CallsPolicy.MenuItem(isPackaged: true, enableCalls: true));
+    }
+
+    // The tick follows the setting, and only the setting. It is the one of the three that has to move
+    // when the user clicks, and an item whose tick came from anywhere else would be one they could
+    // switch off and never switch back on.
+    [Fact]
+    public void MenuItem_UnticksWhenTheUserTurnsCallsOff_ButStaysClickable()
+    {
+        Assert.Equal(
+            ("Route calls to PC", true, false),
+            CallsPolicy.MenuItem(isPackaged: true, enableCalls: false));
+    }
+
+    // Package identity, never the availability verdict. Decide() answers DisabledBySetting the moment
+    // calls are switched off, so an item gated on that would disable itself on the click that turned
+    // it off - a switch with exactly one use.
+    [Fact]
+    public void MenuItem_StaysClickable_ForEverySettingWhenPackaged()
+    {
+        Assert.True(CallsPolicy.MenuItem(isPackaged: true, enableCalls: true).Enabled);
+        Assert.True(CallsPolicy.MenuItem(isPackaged: true, enableCalls: false).Enabled);
+    }
+
+    // Unpackaged, the setting cannot rescue the item - the restricted capability is not something a
+    // preference can grant. Asserted for both settings so a call site that ORed the two could not pass.
+    [Fact]
+    public void MenuItem_IsRefused_ForEverySettingWhenUnpackaged()
+    {
+        Assert.False(CallsPolicy.MenuItem(isPackaged: false, enableCalls: true).Enabled);
+        Assert.False(CallsPolicy.MenuItem(isPackaged: false, enableCalls: false).Enabled);
+    }
+
+    // The suffix is the only part of the two texts that differs, so the item cannot start naming a
+    // cause it has not been given. Pinned separately from the exact strings above because "the
+    // packaged text is a prefix of the unpackaged one" is what makes the pair read as one item in two
+    // conditions rather than as two unrelated labels.
+    [Fact]
+    public void MenuItem_SaysTheSameThing_AndOnlyAddsTheReason()
+    {
+        Assert.StartsWith(
+            CallsPolicy.MenuItem(isPackaged: true, enableCalls: true).Text,
+            CallsPolicy.MenuItem(isPackaged: false, enableCalls: true).Text,
+            StringComparison.Ordinal);
+    }
 }

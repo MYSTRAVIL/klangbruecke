@@ -75,23 +75,32 @@ public sealed class AudioSinkService : IAudioSinkService
 
     public async Task<bool> ConnectAsync(string deviceId)
     {
-        // Backstop, not the primary gate - TrayContext checks the same policy so it can log the
-        // reason once and skip the attempt cleanly. This one guards the call itself, because the
-        // failure mode is process death rather than a false return: a Stage 1 reconnect watcher that
-        // called straight into here without asking would silently reintroduce a bricked startup.
+        // <b>The gate.</b> It was written as a backstop behind a tray-side check that logged the
+        // reason once and skipped the attempt cleanly; Task 17 moved the connect path into
+        // MusicHalf, and this is now the only place the policy is asked before the call. That is by
+        // design rather than by omission - ConnectionManager deliberately reads no process-wide
+        // static, because a manager that did could not be tested at all - so the caller above has no
+        // way to ask and is not at fault for arriving here.
+        //
+        // What it guards is not a failed connect. Unpackaged, TryCreateFromId below takes the process
+        // down with an AccessViolationException that no managed handler sees, so "let it try and
+        // return false" is process death, not a false return.
+        //
         // Read once and passed to both, so the reason logged is provably the reason decided on. The
         // literal that used to sit in the Explain call was right only because the policy currently
-        // takes one input; this call site exists for a caller that does not exist yet.
+        // takes one input.
         bool isPackaged = PackageIdentity.IsPackaged;
         if (!AudioSinkPolicy.CanOpenConnection(isPackaged))
         {
-            // Warn regardless of what AudioSinkPolicy.LevelFor says, unlike the same verdict in
-            // TrayContext.ConnectMusicAsync, because this is not the same event. TrayContext returns
-            // before ever calling here, so reaching this line means a caller went straight to the
-            // service without asking the policy - a defect in the caller, not the expected unpackaged
-            // path. The two can never appear in one run.
-            Log.Warn("Reached AudioSinkService.ConnectAsync with the music gate shut: the caller did "
-                     + "not consult AudioSinkPolicy. " + AudioSinkPolicy.Explain(isPackaged));
+            // The policy's own level, not a fixed Warn. Program.Main writes this same explanation
+            // once at startup, and the two music and calls gates drifting to different severities for
+            // the identical root cause is a mistake this project has already made once - it left
+            // anyone grepping [WRN] with half the story.
+            //
+            // Repeated per attempt on purpose, and the repetition is the report: the music half backs
+            // off and tries again, so an unpackaged run really is retrying something that cannot
+            // succeed, and a line a minute saying so is the only instrument that shows it.
+            Log.Write(AudioSinkPolicy.LevelFor(isPackaged), AudioSinkPolicy.Explain(isPackaged));
             return false;
         }
 

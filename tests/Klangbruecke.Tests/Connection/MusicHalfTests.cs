@@ -1017,6 +1017,61 @@ public sealed class MusicHalfTests
     }
 
     /// <summary>
+    /// <b>The half never holds <see cref="MusicState.Linked"/> or <see cref="MusicState.Up"/> over a
+    /// sink that is not connected</b>, whichever input it is given.
+    ///
+    /// This is the premise <c>ConnectionManager</c>'s reconcile check 2 rests on, asserted where it is
+    /// actually established rather than where it is relied on. <c>TearDown</c> is the one exit here
+    /// that calls <c>IAudioSinkService.Disconnect</c>, and it is also the one that lands on
+    /// <see cref="MusicState.Off"/> - so a sink that has gone is never a sink this half still believes
+    /// in, and check 2 is a guard between two seams rather than a detector of a connection that died
+    /// silently. That distinction is only true while this holds: an input that disconnected the sink
+    /// without leaving Linked or Up would make check 2 live, and it would fail here first.
+    ///
+    /// Every input from a half that is <see cref="MusicState.Up"/>, which is the state with the most
+    /// to lose, and each from its own harness so no input can be covered for by the one before it.
+    /// </summary>
+    [Fact]
+    public async Task Linked_and_Up_are_only_ever_held_over_a_connected_sink()
+    {
+        (string Name, Func<Harness, Task> Apply)[] inputs =
+        {
+            ("switched off", h => Done(() => h.Half.Configure(false, PhoneId, OutputId))),
+            ("a different phone", h => Done(() => h.Half.Configure(true, OtherPhoneId, OutputId))),
+            ("a different output", h => Done(() => h.Half.Configure(true, PhoneId, "output-2"))),
+            ("link present again", h => h.Half.OnLinkPresentAsync(connectPermitted: true)),
+            ("link absent", h => Done(h.Half.OnLinkAbsent)),
+            ("suppressed", h => Done(h.Half.OnSuppressed)),
+            ("the connection closed", h => Done(h.Half.OnConnectionClosed)),
+            ("the endpoint went away", h => Done(() => h.SetEndpoint(false))),
+            ("the route stopped", h => Done(h.Half.OnRouteStopped)),
+            ("a reconcile", h => h.Half.ReconcileAsync(connectPermitted: true)),
+        };
+
+        foreach ((string name, Func<Harness, Task> apply) in inputs)
+        {
+            Harness half = new();
+            await half.ReachUpAsync();
+
+            // The starting point is itself part of the claim: Up is reached over a connected sink.
+            Assert.True(half.Sink.IsConnected);
+
+            await apply(half);
+
+            Assert.True(
+                half.Half.State is not (MusicState.Linked or MusicState.Up) || half.Sink.IsConnected,
+                $"after '{name}' the half is {half.Half.State} over a sink reporting IsConnected=false");
+        }
+    }
+
+    /// <summary>Runs a synchronous input and hands back a completed task, so the table above is one shape.</summary>
+    private static Task Done(Action input)
+    {
+        input();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
     /// The half plus its four doubles, wired the way <c>ConnectionManager</c> will wire them.
     ///
     /// The one thing worth noticing is the <c>Stopped</c> subscription: <see cref="MusicHalf"/>

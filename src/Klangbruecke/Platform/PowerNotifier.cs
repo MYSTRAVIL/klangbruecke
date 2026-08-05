@@ -16,11 +16,13 @@ namespace Klangbruecke.Platform;
 /// file claimed the handler arrives on a dedicated <c>SystemEvents</c> thread, never the UI thread.
 /// That is false, so the correction is stated with the measurement behind it.
 ///
-/// <c>SystemEvents</c> does own a window thread, but it does not hand the handler to you on it. Each
-/// subscription captures the <see cref="System.Threading.SynchronizationContext"/> current on the
-/// thread that called <see cref="Start"/> - kept in the internal
-/// <c>SystemEventInvokeInfo._syncContext</c> - and dispatches through
-/// <c>SynchronizationContext.Send</c>. Measured on this machine, .NET 8 / SDK 8.0.417:
+/// <c>SystemEvents</c> does own a window thread, and that is where a notification <em>originates</em> -
+/// but it is not necessarily where the handler runs. Each subscription captures the
+/// <see cref="System.Threading.SynchronizationContext"/> current on the thread that called
+/// <see cref="Start"/> - kept in the internal <c>SystemEventInvokeInfo._syncContext</c> - and
+/// dispatches through <c>SynchronizationContext.Send</c>. Whether that is a hop or not depends
+/// entirely on what was captured, and bullet three below is the case where it is not one. Measured on
+/// this machine, .NET 8 / SDK 8.0.417:
 ///
 /// <list type="bullet">
 /// <item>Subscribing under a custom context and reading the private field back: the captured context
@@ -35,8 +37,14 @@ namespace Klangbruecke.Platform;
 ///
 /// So the delivery thread is <b>whichever context was current when <see cref="Start"/> ran</b>, and
 /// since <see cref="Start"/> is deliberately not called from the constructor, that depends on where
-/// startup wires it: before <c>Application.Run</c> gives the <c>SystemEvents</c> thread, after gives
-/// the UI thread. <see cref="OnPowerModeChanged"/> re-raises on whatever thread it was entered on and
+/// startup wires it - specifically, on whether the WinForms context has been installed by then.
+/// <b>Not on whether <c>Application.Run</c> has been entered</b>; an earlier version of this sentence
+/// said exactly that, and it was false for this app. The context is installed by the first
+/// <c>Control</c> constructed, which in <c>Program.Main</c> is <c>ControlUiDispatcher</c>'s
+/// marshalling control, and <c>ConnectionManager.Start</c> is reached from <c>TrayContext</c>'s
+/// constructor - both of them before <c>Application.Run</c>, and resumes land on the UI thread
+/// regardless. See <c>UiDispatcherTests.Control_InstallsTheWinFormsSynchronizationContextOnTheThreadThatBuildsIt</c>.
+/// <see cref="OnPowerModeChanged"/> re-raises on whatever thread it was entered on and
 /// adds nothing. <c>ConnectionManager</c> posts every inbound event through <c>IUiDispatcher</c>
 /// before touching state, which is what makes it single-threaded by contract either way - so a second
 /// marshalling layer here would add a hop and buy nothing. <c>LinkMonitor</c> reaches the same
@@ -156,10 +164,13 @@ public sealed class PowerNotifier : IPowerNotifier
             // list forever: the object is never collected and every later resume is still delivered
             // to it.
             //
-            // What this deliberately does not close: SystemEvents raises on its own thread, so a
-            // notification can already be in flight when this runs, and no check-then-act here could
-            // prevent that - the check would race the raise just as this does. A late Resumed is
-            // handled where it can be: ConnectionManager posts it and its own teardown decides.
+            // What this deliberately does not close: a notification can already be in flight when
+            // this runs, and no check-then-act here could prevent that - the check would race the
+            // raise just as this does. The raise originates on the SystemEvents window thread
+            // whatever thread it is finally dispatched to, and it snapshots the handler list before
+            // it dispatches, so even a Send that lands on this very thread can be one that was taken
+            // before this line ran. A late Resumed is handled where it can be: ConnectionManager
+            // posts it and its own teardown decides.
             SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         }
     }

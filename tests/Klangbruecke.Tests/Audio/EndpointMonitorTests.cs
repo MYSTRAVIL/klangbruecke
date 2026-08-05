@@ -292,16 +292,18 @@ public sealed class EndpointMonitorTests : IDisposable
     [Fact]
     public void Concurrent_Starts_register_exactly_one_client()
     {
-        // A plain `if (_started) return;` is check-then-act. Two threads that both pass it each build a
-        // client and register it, and the second overwrites the field holding the first - leaving a
-        // registered client rooted by nothing, one GC from the 0xC0000005. Interlocked is what makes the
-        // claim atomic.
+        // A lock-free `if (_started) return;` is check-then-act. Two threads that both pass it each build
+        // a client and register it, and the second overwrites the field holding the first - leaving a
+        // registered client rooted by nothing, one GC from the 0xC0000005. The lock Start takes around
+        // the check and the registration is what makes the claim atomic; an earlier design tried to do
+        // it with Interlocked alone and was wrong for a reason that had nothing to do with atomicity -
+        // see the comment on EndpointMonitor._gate.
         //
         // Repeated rather than run once, and read that honestly: this is a probabilistic detector, not a
         // proof. The window is a couple of instructions wide, so a single race almost never lands in it -
         // measured, while mutating this very guard. What makes the repetition worth its cost is that the
         // mutation was caught here at these numbers; what the repetition cannot do is promise it always
-        // will be. The guarantee comes from the Interlocked pair itself, not from this loop.
+        // will be. The guarantee comes from the lock itself, not from this loop.
         for (int attempt = 0; attempt < 100; attempt++)
         {
             int rootedBefore = EndpointMonitor.LiveClientCount;

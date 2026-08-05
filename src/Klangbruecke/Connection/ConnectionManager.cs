@@ -736,8 +736,30 @@ public sealed class ConnectionManager : IDisposable
 
             RefreshEndpointLevel();
 
-            // 2. The connection object can go away without ever reporting Closed - across a suspend,
-            // most of all - and this level read is the only thing that would notice.
+            // 2. A consistency check between two seams - and deliberately not described as more than
+            // that any more.
+            //
+            // It was written for "the connection object can go away without ever reporting Closed,
+            // across a suspend most of all". <b>It cannot see that case</b>, and the honest version of
+            // the comment is worth more than the reassuring one. <c>AudioSinkService.IsConnected</c>
+            // answers from two fields that only this app writes - the connection reference and the
+            // connected id - and a WinRT object killed underneath them leaves both set. The one
+            // in-process caller that clears them is <c>MusicHalf.TearDown</c>, which lands on
+            // <see cref="MusicState.Off"/> in the same call, so with the shipping sink this condition
+            // is not reachable at all. Task 17 removed the last caller that could reach it: the tray's
+            // own Disconnect, which stopped the sink without telling the half.
+            //
+            // It stays, as the seam guard it actually is. <see cref="IAudioSinkService"/> is an
+            // interface, and an implementation whose IsConnected tracked the connection rather than
+            // this app's bookkeeping would make this live again - which is the direction to fix it in
+            // if the suspend case is ever measured. That fix needs a guarded tri-state in the shape of
+            // <c>ICallTransportService.ReadRegistration</c>, never a bool: reading the live WinRT
+            // State is an ABI call that can throw or fail to answer, and "could not tell" read as
+            // "gone" tears down a working connection. What does back the suspend case up today is the
+            // link status read above and the endpoint level below.
+            //
+            // The premise is pinned by
+            // MusicHalfTests.Linked_and_Up_are_only_ever_held_over_a_connected_sink.
             if (!_sink.IsConnected && _music.State is MusicState.Linked or MusicState.Up)
             {
                 if (userAsked)
