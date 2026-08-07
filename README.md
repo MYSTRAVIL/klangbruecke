@@ -1,47 +1,30 @@
 # Klangbruecke
 
-One Windows tray app that bridges phone audio to the PC:
+Windows tray app that bridges phone audio to the PC over the built-in Bluetooth radio — no Phone
+Link, no dongle.
 
-- **Music / notifications** — the phone streams to the PC over Bluetooth A2DP; the PC renders it to any output device you pick.
-- **Calls** — cellular calls on the phone route to the PC's headset (speakers + mic).
-
-No Phone Link. No dongle. Runs on the machine's built-in Bluetooth radio.
+- **Music / notifications** — the phone streams to the PC over A2DP; the PC renders it to any output you pick.
+- **Calls** — cellular calls route to the PC's headset (speakers + mic) via the HFP hands-free role.
 
 ## Status
 
-**Both halves work.** Verified 2026-08-04 on the target machine with the packaged build.
+Both halves and unattended reconnect work, validated on hardware with the packaged build.
 
-- **Music** — connects the A2DP sink, correlates the transport to the right phone by Bluetooth
-  address, routes to a chosen output, and tears the route down cleanly when the phone reclaims the
-  radio for a call.
-- **Calls** — claims the HFP hands-free role, so the phone offers the PC as a call audio device,
-  and a real cellular call routes to the PC with audio in both directions.
+- **Music** (Stage 0, 2026-08-04) — connects the A2DP sink, correlates the transport to the phone by
+  Bluetooth address, routes to a chosen output.
+- **Calls** (Stage 0, 2026-08-04) — claims the HFP hands-free role; a real call routes to the PC with
+  audio in both directions.
+- **Reconnect** (Stage 1, 2026-08-07) — a `ConnectionManager` state machine recovers unattended from
+  a call ending, a range exit and return, sleep/resume, reboot, and a phone-initiated disconnect. It
+  also restarts the route when the A2DP capture endpoint appears late — a case the connect path alone
+  silently missed. This was the predecessor app's defining bug; it is fixed. FINDINGS §13, §14.
 
-One app, both halves, on the built-in radio. That is what this project existed to do.
+Not yet done: the full Stage 2 reconnect matrix (hand-verified scenarios) and tray selection of the
+call audio device.
 
-What is done: the connect path, transport-to-phone correlation, and a rolling log at
-`%LOCALAPPDATA%\Klangbruecke\logs\` that is the app's only diagnostic surface and the reason the
-first packaged run was debuggable at all.
-
-What is not done:
-
-- **Reconnect.** There is no state machine yet — no `DeviceWatcher`, no retry, no sleep/resume
-  handling. The app connects when told to and stays connected until something stops it. Reconnect
-  after reboot and phone-initiated reconnect are the predecessor app's defining bug and remain
-  unaddressed. Designed in
-  [the connection lifecycle spec](docs/superpowers/specs/2026-08-04-connection-lifecycle-design.md).
-- **Outgoing call audio quality.** Degraded relative to holding the phone directly, and identical
-  under Thy Phone — so it is a property of the Bluetooth SCO link, not of any app. Ruled out by
-  direct test: VoiceMeeter, the microphone, and the cellular network. The leading suspect is a
-  narrowband codec forced by a 2021 MediaTek radio driver. Measure with
-  `packaging/Measure-CallBandwidth.ps1` over a **wideband** call — a cellular call reads as
-  narrowband whatever Bluetooth negotiated. FINDINGS §11.
-- **`ConnectAsync` returns False** after a successful registration. Calls work regardless; the
-  reason is unexplained. FINDINGS §12.
-
-**Requires the packaged build.** `dotnet run` is not a development loop for the music half:
-`AudioPlaybackConnection.TryCreateFromId` terminates an unpackaged process with an access
-violation no managed handler can catch. FINDINGS §8.
+**Requires the packaged build.** `dotnet run` is not a dev loop for the music half —
+`AudioPlaybackConnection.TryCreateFromId` kills an unpackaged process with an uncatchable access
+violation (FINDINGS §8).
 
 ## Why this exists
 
@@ -58,29 +41,19 @@ violation no managed handler can catch. FINDINGS §8.
 - Windows SDK 10.0.19041.0 (for `makeappx` / `signtool`)
 - A Bluetooth radio the Windows stack owns (no Zadig / WinUSB rebinding)
 
-## Build
+## Build, package, install
+
+MSIX packaging is load-bearing: package identity keeps `TryCreateFromId` from killing the process
+(§8) and carries the `phoneLineTransportManagement` capability the calls half needs. Sideloading
+needs no Microsoft approval.
 
 ```powershell
 dotnet build src/Klangbruecke/Klangbruecke.csproj -c Release
-```
-
-## Package and install
-
-MSIX packaging is required — not cosmetic, and not only for the reason originally believed. Package
-identity is what keeps `AudioPlaybackConnection.TryCreateFromId` from killing the process outright
-(FINDINGS §8), so the music half needs it regardless.
-
-It also carries the `phoneLineTransportManagement` restricted capability the calls half needs.
-**Sideloading it requires no Microsoft approval** — that premise was doubted for several hours and
-then confirmed: registration works from a self-signed sideloaded package. The blocker was a missing
-`RequestAccessAsync()` call, not signing. FINDINGS §12.
-
-```powershell
 ./packaging/New-DevCert.ps1      # once: create + trust a self-signed dev cert
 ./packaging/Build-Msix.ps1       # build, package, sign
 ```
 
-Then install the produced `.msix` and enable sideloading in Windows Settings
+Install the produced `.msix` with sideloading enabled
 (Settings → Update & Security → For developers → Sideload apps).
 
 ## Architecture
@@ -89,33 +62,36 @@ Then install the produced `.msix` and enable sideloading in Windows Settings
         Bluetooth (built-in radio, Windows stack)
                         |
     +-------------------+--------------------+
-    |                                        |
   A2DP sink                            HFP hands-free
   AudioPlaybackConnection              PhoneLineTransportDevice
     |                                        |
-  "Line (<phone> A2DP SNK)"            call audio in/out
-  capture endpoint                           |
-    |                                        |
-  WASAPI capture --> BufferedWaveProvider --> WASAPI render
-                                             |
-                                      selected output device
+  "Line (<phone> A2DP SNK)"            call audio in/out (Windows owns the path)
+  capture endpoint
+    |
+  WASAPI capture -> BufferedWaveProvider -> WASAPI render -> selected output
+
+  ConnectionManager owns the lifecycle: a DeviceWatcher, an endpoint monitor,
+  and a 30s reconcile loop drive connect / route / retry / reconnect.
 ```
 
 ## Layout
 
 ```
 src/Klangbruecke/
-  Program.cs                      entry point, single-instance guard
-  TrayContext.cs                  tray icon, menu, wiring
-  Bluetooth/AudioSinkService.cs   A2DP sink lifecycle
-  Bluetooth/CallTransportService.cs  HFP call transport lifecycle
-  Audio/AudioRouter.cs            WASAPI capture -> render bridge
-  Config/Settings.cs              persisted settings
-packaging/
-  AppxManifest.xml                package identity + capabilities
-  New-DevCert.ps1                 self-signed cert for sideloading
-  Build-Msix.ps1                  build + package + sign
-docs/FINDINGS.md                  research record; read before changing approach
+  Program.cs                         entry point, single-instance guard
+  TrayContext.cs                     tray icon + menu (view only)
+  Connection/ConnectionManager.cs    reconnect state machine
+  Connection/                        LinkMachine, SuppressionLatch, MusicHalf,
+                                     CallsHalf, ConnectionState, BackoffSchedule
+  Bluetooth/AudioSinkService.cs      A2DP sink lifecycle
+  Bluetooth/CallTransportService.cs  HFP call transport
+  Bluetooth/LinkMonitor.cs           DeviceWatcher + ConnectionStatus
+  Audio/AudioRouter.cs               WASAPI capture -> render bridge
+  Audio/EndpointMonitor.cs           IMMNotificationClient: A2DP endpoint arrival
+  Platform/                          scheduler, power notifier, package identity
+tests/Klangbruecke.Tests/            4,200+ unit tests
+packaging/                           AppxManifest, dev cert, MSIX build scripts
+docs/FINDINGS.md                     research record; read before changing approach
 ```
 
 ## Licence
