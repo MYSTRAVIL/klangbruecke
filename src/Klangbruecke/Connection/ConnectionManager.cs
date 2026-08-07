@@ -7,9 +7,9 @@ using Klangbruecke.Platform;
 namespace Klangbruecke.Connection;
 
 /// <summary>
-/// The one object that owns the connection lifecycle: intent, wiring, and the three timings that
-/// make an unattended recovery possible - the 3 s grace window, the 30 s reconcile, and the 5 s
-/// settle after a resume.
+/// The one object that owns the connection lifecycle: intent, wiring, and the timings that make an
+/// unattended recovery possible. It delegates the 3 s grace window to <see cref="GraceWindow"/> and
+/// the 30 s reconcile to <see cref="Reconciler"/>, and owns the 5 s settle after a resume.
 ///
 /// <b>It assembles rather than decides.</b> Everything that could be a state machine already is one:
 /// <see cref="LinkMachine"/> answers "is the phone there", <see cref="SuppressionLatch"/> remembers
@@ -28,15 +28,16 @@ namespace Klangbruecke.Connection;
 /// <see cref="_endpointProbe"/> - because the thing they guard is deliberately <em>not</em> on this
 /// thread.
 ///
-/// <b>Never add <c>ConfigureAwait(false)</c> to anything in here or in the two halves.</b> It reads
-/// like a tidy-up and it is the one token that takes the whole design apart: four machines that hold
-/// no lock start sharing state across threads. Which thread it leaks onto depends on the await, and
-/// both cases are real - the five that await a seam resume <em>on the answering thread</em>, because
-/// a radio's own thread carries no <c>SynchronizationContext</c> and the runtime inlines there; the
-/// nine that await one of our own methods resume <em>on the threadpool</em>, because the runtime
-/// refuses to inline while a custom context is installed, which is always the case on the UI thread.
+/// <b>Never add <c>ConfigureAwait(false)</c> to anything in here, in the two seams, or in the two
+/// halves.</b> It reads like a tidy-up and it is the one token that takes the whole design apart:
+/// four machines that hold no lock start sharing state across threads. Which thread it leaks onto
+/// depends on the await, and both cases are real - the five that await a seam resume <em>on the
+/// answering thread</em>, because a radio's own thread carries no <c>SynchronizationContext</c> and
+/// the runtime inlines there; the nine that await one of our own methods resume <em>on the
+/// threadpool</em>, because the runtime refuses to inline while a custom context is installed, which
+/// is always the case on the UI thread.
 ///
-/// Eleven of the fourteen awaits in these three classes have a named test that goes red for that site
+/// Eleven of the fourteen awaits in these five classes have a named test that goes red for that site
 /// alone; the eight tests are in <c>ConnectionManagerTests</c> under "the captured context", which maps
 /// every site to its test and names the three it cannot cover and why. Do not read the prohibition as
 /// covered by one test, and do not read an aggregate mutant as covering the sites inside it: earlier
