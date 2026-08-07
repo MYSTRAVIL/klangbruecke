@@ -7,8 +7,9 @@ is the living status rather than a stage report._
 
 | | |
 |---|---|
-| Branch | `main`, clean. **Nothing pushed to any remote.** |
+| Branch | `main`, clean, **pushed to `origin/main`** (github.com/MYSTRAVIL/klangbruecke). |
 | Stage 1 (reconnect) | **Merged and validated on hardware.** Both halves work; the connection lifecycle recovers unattended. |
+| Stage 2 (seam extraction) | **Merged (`796839d`) and pushed.** Grace window + reconcile split into their own seams; behaviour unchanged. Not yet re-validated on hardware — it is a pure refactor, but the reconnect paths deserve one live pass. |
 | Installed build | **0.2.1.0** (MSIX, sideloaded, self-signed), running in the tray |
 | Tests | **4258, all green, zero warnings** |
 
@@ -47,15 +48,17 @@ is the living status rather than a stage report._
 ## What's next
 
 The quick-win well is dry — the Stage-1 deferred-minors ledger was triaged and nothing safe-and-small
-remains. The two substantive items, each with one prerequisite:
+remains. The review's #1 Stage-2 priority — **refactoring `ConnectionManager`** — shipped this session
+(the grace window and reconcile are now the `GraceWindow`/`Reconciler` seams reaching the hub through
+`IConnectionCoordinator`; see `docs/superpowers/specs/2026-08-07-connection-manager-seam-extraction-design.md`
+and the plan beside it). One substantive item remains, with its prerequisite:
 
-1. **Refactor `ConnectionManager`** — split the 3 s grace window and the 30 s reconcile out of the
-   ~1,290-line file into their own seams. The review's **#1 Stage-2 priority**: the seam is exactly where
-   a past Critical bug lived, so it turns that class of bug into a compile-time obligation instead of a
-   grep. It is the most load-bearing file in the app — **write a plan before touching it.**
-2. **Tray call-output picker** — a requested feature. Routing HFP call audio to a chosen PC output means
+1. **Tray call-output picker** — a requested feature. Routing HFP call audio to a chosen PC output means
    changing the **system-wide default communications device** via the undocumented `IPolicyConfig` — a
    global side effect on every app's comms audio. **Decide that footprint before building.**
+
+And re-validate the Stage-2 refactor on hardware once — it is behaviour-preserving and fully green, but
+the reconnect-after-reboot and phone-initiated-reconnect paths are the historically fragile ones.
 
 Not blockers: `ConnectAsync` returns False (§12, likely benign, untestable until it matters); the
 outgoing-call ringback does not reach the PC (§6, cosmetic).
