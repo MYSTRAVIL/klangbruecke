@@ -129,6 +129,12 @@ internal static class Program
         // torn-down state machine.
         using var scheduler = new UiScheduler();
 
+        // The three state glyphs, owned here and borrowed by the tray. Here rather than lower down
+        // because the NotifyIcon below needs one to start with. Disposed after Application.Run
+        // returns - i.e. after the tray has already torn the icon down - because disposing a glyph the
+        // shell is still drawing would blank the notification area.
+        using var trayIcons = new TrayIcons();
+
         Settings settings = Settings.Load();
 
         // Read once, and written here rather than where the two gates fire.
@@ -171,7 +177,10 @@ internal static class Program
         // failure leaves nothing on screen at all.
         var icon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            // The dormant glyph to start; TrayContext repaints it to the real state in its
+            // constructor, before the icon is made visible below. Was SystemIcons.Application - the
+            // generic Windows default - which is what the tray showed for the whole of the app's life.
+            Icon = trayIcons.For(TrayIconStatus.Idle),
             Text = "Klangbruecke",
             Visible = false,
         };
@@ -190,7 +199,7 @@ internal static class Program
         router.Status += (_, m) => status.Show(m);
         connection.Status += (_, m) => status.Show(m);
 
-        var tray = new TrayContext(icon, status, connection, settings);
+        var tray = new TrayContext(icon, trayIcons, status, connection, settings);
 
         // Only now. Everything that could throw on the way up has run, and from here the icon has an
         // owner whose Dispose hides it. See the note where it was built.

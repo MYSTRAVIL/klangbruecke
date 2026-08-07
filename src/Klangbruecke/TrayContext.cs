@@ -31,15 +31,16 @@ namespace Klangbruecke;
 /// stays out of the manager on purpose - see its class comment - which is why the labels are the only
 /// place the flag surfaces at all.
 ///
-/// <b>Four things reach it, and none of them is a seam.</b> The icon it writes to, the presenter that
-/// writes to it, the manager it asks, and the settings - read only, for the ticks beside the menu
-/// items. Every write to those settings goes through the manager, which saves them; a view that wrote
-/// them directly would be a second author of the same file and the manager's own copy would be stale
-/// the moment it did.
+/// <b>Five things reach it, and none of them is a seam.</b> The icon it writes to, the set of glyphs
+/// it chooses one from, the presenter that writes to it, the manager it asks, and the settings - read
+/// only, for the ticks beside the menu items. Every write to those settings goes through the manager,
+/// which saves them; a view that wrote them directly would be a second author of the same file and the
+/// manager's own copy would be stale the moment it did.
 /// </summary>
 internal sealed class TrayContext : ApplicationContext
 {
     private readonly NotifyIcon _icon;
+    private readonly TrayIcons _icons;
     private readonly ContextMenuStrip _menu;
     private readonly StatusPresenter _status;
     private readonly ConnectionManager _connection;
@@ -55,9 +56,16 @@ internal sealed class TrayContext : ApplicationContext
     /// </summary>
     private bool _menuRebuilt;
 
-    public TrayContext(NotifyIcon icon, StatusPresenter status, ConnectionManager connection, Settings settings)
+    /// <summary>
+    /// The glyph bucket the tray is currently showing, so <see cref="UpdateIcon"/> repaints only when
+    /// it actually changes. Null until the first paint. UI thread only, like everything else here.
+    /// </summary>
+    private TrayIconStatus? _lastIconStatus;
+
+    public TrayContext(NotifyIcon icon, TrayIcons icons, StatusPresenter status, ConnectionManager connection, Settings settings)
     {
         _icon = icon;
+        _icons = icons;
         _status = status;
         _connection = connection;
         _settings = settings;
@@ -95,6 +103,10 @@ internal sealed class TrayContext : ApplicationContext
         // "Klangbruecke" until something changed, which for a phone that is simply out of range is
         // the whole session.
         ShowConnectionState();
+
+        // Same reason for the glyph: without this the icon keeps the Idle mark Program built the
+        // NotifyIcon with until the first state change, which for a phone out of range never comes.
+        UpdateIcon();
     }
 
     /// <summary>
@@ -102,12 +114,43 @@ internal sealed class TrayContext : ApplicationContext
     /// from the event, which carries only the state - a detail read from anywhere else could describe
     /// a different instant, and "Connected" beside "retrying in 8s" is worse than either alone.
     /// </summary>
-    private void OnConnectionStateChanged(object? sender, ConnectionState state) => ShowConnectionState();
+    private void OnConnectionStateChanged(object? sender, ConnectionState state)
+    {
+        ShowConnectionState();
+        UpdateIcon();
+    }
 
-    /// <summary>The name held still and the phrase moved. Same sentence, same repaint.</summary>
+    /// <summary>
+    /// The name held still and the phrase moved. Same sentence, same repaint - but not the glyph: the
+    /// icon reflects the state, and the detail can move under a state that does not (Connected going
+    /// from "waiting for phone audio" to "music and calls up"), so <see cref="UpdateIcon"/> is not
+    /// called here. It would be a no-op anyway - it guards on the bucket - but leaving it out says why.
+    /// </summary>
     private void OnConnectionDetailChanged(object? sender, EventArgs e) => ShowConnectionState();
 
     private void ShowConnectionState() => _status.Show(_connection.State, _connection.Detail);
+
+    /// <summary>
+    /// Repaints the tray glyph, but only when the state crosses into a different
+    /// <see cref="TrayIconStatus"/>. Guarded on the bucket, not the state, so the amber mark is not
+    /// reassigned as the app moves Discovering -> Connecting -> RetryBackoff; and on the last bucket,
+    /// so an unchanged assignment does not make the notification area flicker.
+    ///
+    /// Reads <c>_connection.State</c> rather than trusting a passed-in value, as
+    /// <see cref="ShowConnectionState"/> does, so the glyph and the tooltip cannot describe different
+    /// instants. UI thread, like every caller.
+    /// </summary>
+    private void UpdateIcon()
+    {
+        TrayIconStatus status = TrayIconPolicy.For(_connection.State);
+        if (status == _lastIconStatus)
+        {
+            return;
+        }
+
+        _lastIconStatus = status;
+        _icon.Icon = _icons.For(status);
+    }
 
     /// <summary>
     /// The menu lists devices, which must be enumerated, which is async - but Opening is a
