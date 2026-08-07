@@ -676,7 +676,7 @@ mechanism. Both diagnostic scripts (`Measure-CallBandwidth.ps1`, `Watch-HfpAudio
 for the wrong hypothesis and could not have caught the real cause — one measures the good direction,
 the other reads endpoints that never go `Active` in the enumerator during a call.
 
-## 15. OPEN (Stage 2): call audio does not auto-route to the PC the way a headset does
+## 15. Call audio does not auto-route to the PC the way a headset does — spike → WONTFIX on Win10 (see 15.1)
 
 A plain Bluetooth headset (earbuds) paired to the phone gets call audio **automatically** — answer
 the call anywhere, on the phone screen or the earbud, and the audio follows the headset. The PC via
@@ -702,3 +702,50 @@ UX; if it does not, this is a limit of the transport, not a bug.
 method; and check what Sefirah and MyPhone do with the same transport — they will have hit this exact
 wall and either solved it or documented it. Do not confuse this with `HANDOFF.md` item 4 (tray
 selection of the *PC-side* output device via `IPolicyConfig`) — that is the opposite direction.
+
+### 15.1 Spike result (2026-08-07): the auto-route lever exists, but not on Windows 10 — WONTFIX on the current stack
+
+The spike found the lever and then found it out of reach on this OS. Both halves matter.
+
+**The lever (real).** `PhoneCall.ChangeAudioDevice(PhoneCallAudioDevice.LocalDevice)` pulls an active
+call's audio from the phone (`RemoteDevice`) to the PC (`LocalDevice`). You reach the call via
+`PhoneLine.GetAllActivePhoneCalls()` on the line whose `TransportDeviceId` matches the transport this
+app already registers, and `PhoneLineTransportDevice.AudioRoutingStatus`
+(`CanRouteToLocalDevice` / `CannotRouteToLocalDevice`) says when a pull is permitted. Sefirah
+(`shrimqy/Sefirah`) uses exactly this API — auto for *outgoing* calls (dial on the PC, then
+`ChangeAudioDeviceAsync(LocalDevice)`) plus a manual mid-call toggle. Neither Sefirah nor MyPhone
+auto-routes a call *answered on the phone*; MyPhone (`BestOwl/MyPhone`) never got call audio at all. So
+the §15 gap is specifically "no one auto-fires `ChangeAudioDevice` on a phone-answered incoming call",
+not a missing API.
+
+**The wall (measured).** That whole surface is `CallsPhoneContract` v6, which shipped with Windows 11. It
+is **absent at runtime on this machine (Win10 19045)**, so no SDK-projection change reaches it — the OS
+does not implement it. Measured with `ApiInformation` by string, so no projection bump was needed to ask
+(`scratchpad/apiprobe`, an unpackaged net8.0-windows10.0.19041.0 console):
+
+```
+OS build 10.0.19045.0
+CallsPhoneContract present through v5; v6 / v7 / v8 = False
+type PhoneCall                              = False
+PhoneCall.ChangeAudioDevice[Async]          = False
+PhoneLine.GetAllActivePhoneCalls[Async]     = False
+PhoneLineTransportDevice.AudioRoutingStatus = False
+```
+
+No Windows 10 *client* build ships `CallsPhoneContract` v6 (it is a Win11 / Server-2022-era contract), so
+this is not one 19045 update away — it does not exist on Win10 at all. Reflecting the 19041 SDK the app
+targets confirmed it never projected these types either (`PhoneCall`, `PhoneCallAudioDevice`,
+`GetAllActivePhoneCalls`, `AudioRoutingStatus` all absent), which is why it did not surface until the
+spike.
+
+**The bind.** v6 *is* present on Windows 11 (the friend's 26200 — see the Win11 handoff / §2, §12) — but
+on Win11 the app cannot register the transport at all (`RequestAccessAsync` → `DeniedBySystem` for
+sideloaded apps, MyPhone #26). So there is no configuration in reach where the routing API exists **and**
+calls work: Win10 has working calls but no routing API; Win11 has the routing API but no working calls.
+
+**Conclusion: WONTFIX on the current stack.** A platform ceiling, not a code problem. No prototype was
+built and the build config was left at 19041 — raising the projection would compile but call an API the
+OS answers "not present". Reopen only if the platform moves: a Store-signed package that gets past the
+Win11 denial (itself unverified, and a different distribution model than this project's sideload premise)
+running on a Win11 build that carries v6. Do **not** treat "just upgrade to Win11" as the fix — it trades
+a working call path for a broken one (CLAUDE.md trap 3, and the friend's report confirms it).
