@@ -9,14 +9,16 @@ namespace Klangbruecke.Platform;
 /// The restricted capability <c>phoneLineTransportManagement</c> only applies with identity, so an
 /// unpackaged run cannot claim the hands-free role.
 ///
-/// <b>That is currently said rather than acted on, and the difference matters.</b> This class's
-/// answer reaches two log lines in <c>Program.Main</c> and two menu labels -
+/// <b>Acted on, now that it is injected rather than read there.</b> This class's static answer
+/// reaches two log lines in <c>Program.Main</c> and two menu labels -
 /// <see cref="Klangbruecke.Bluetooth.AudioSinkPolicy.MenuItem"/> and
-/// <see cref="CallsPolicy.MenuItem"/> - and nothing else. It does <em>not</em> reach
-/// <c>ConnectionManager</c>, which deliberately reads no process-wide static, so <b>an unpackaged run
-/// does sit in a permanent error state, retrying both halves at the 60 s ceiling for the life of the
-/// process.</b> This comment used to claim the opposite, and it was true while the tray held the
-/// connect path and gated it here. <see cref="CallsPolicy.ShouldEnumerate"/> carries the fix.
+/// <see cref="CallsPolicy.MenuItem"/>. <c>Program.Main</c> also passes it into
+/// <c>ConnectionManager</c>'s constructor as a bool - the manager still must not read this static
+/// itself, which is why it is handed the answer - and the manager gates both halves on it, so an
+/// unpackaged run reports both halves disabled instead of retrying both at the 60 s ceiling for the
+/// life of the process. That retry was real; an earlier version of this comment named it the state
+/// to fix, and it is fixed (<see cref="CallsPolicy.ShouldRegister"/> and
+/// <see cref="Klangbruecke.Bluetooth.AudioSinkPolicy.CanOpenConnection"/>).
 ///
 /// Since the §8 finding this carries more than that: <c>AudioSinkPolicy</c> gates
 /// <c>AudioPlaybackConnection.TryCreateFromId</c> on this answer, and that call kills an unpackaged

@@ -164,7 +164,7 @@ internal static class Program
         // registration, no timer - because Start() is called from the tray's constructor, on the UI
         // thread, with the context above already installed.
         var connection = new ConnectionManager(
-            settings, sink, callTransport, router, endpoints, link, scheduler, power, ui);
+            settings, sink, callTransport, router, endpoints, link, scheduler, power, ui, isPackaged);
 
         // Built hidden. It is shown below, after the tray exists to hide it again.
         //

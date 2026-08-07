@@ -45,8 +45,10 @@ namespace Klangbruecke.Connection;
 /// <b>What it does not do.</b> It never reads <c>ICallTransportService.IsRegistered</c>: that is a
 /// live CsWinRT ABI call, and a throw out of a timer callback reaches
 /// <c>Application.ThreadException</c> where no ordering helps. <see cref="CallsHalf"/> reads the
-/// guarded tri-state instead. It never asks <c>PackageIdentity</c> anything either - the sink service
-/// owns that gate, and a manager that read a process-wide static could not be tested at all.
+/// guarded tri-state instead. It never reads the <c>PackageIdentity</c> static either - a manager
+/// that did could not be tested at all - but it is <em>told</em> the answer once through the
+/// constructor and gates both halves on it in <see cref="ApplySettingsToHalves"/>, so an unpackaged
+/// run reports both halves disabled instead of retrying what it cannot do.
 /// </summary>
 public sealed class ConnectionManager : IDisposable
 {
@@ -99,6 +101,16 @@ public sealed class ConnectionManager : IDisposable
     private readonly IScheduler _scheduler;
     private readonly IPowerNotifier _power;
     private readonly IUiDispatcher _ui;
+
+    /// <summary>
+    /// Whether this process has MSIX package identity. <b>Injected, never read from the
+    /// <c>PackageIdentity</c> static</b> - that is the whole reason a bool is passed rather than the
+    /// static consulted, since a manager that read the static could not be tested at all. It reaches
+    /// exactly one place, <see cref="ApplySettingsToHalves"/>, where it gates both halves off in an
+    /// unpackaged run. See <see cref="AudioSinkPolicy.CanOpenConnection"/> and
+    /// <see cref="CallsPolicy.ShouldRegister"/> for the per-half rules.
+    /// </summary>
+    private readonly bool _isPackaged;
 
     private readonly LinkMachine _linkMachine = new();
     private readonly SuppressionLatch _latch = new();
@@ -207,7 +219,8 @@ public sealed class ConnectionManager : IDisposable
         ILinkMonitor link,
         IScheduler scheduler,
         IPowerNotifier power,
-        IUiDispatcher ui)
+        IUiDispatcher ui,
+        bool isPackaged)
     {
         _settings = settings;
         _sink = sink;
@@ -218,6 +231,7 @@ public sealed class ConnectionManager : IDisposable
         _scheduler = scheduler;
         _power = power;
         _ui = ui;
+        _isPackaged = isPackaged;
 
         // The cache, not the monitor. See EndpointPresenceCache for the 282 ms this is about.
         _music = new MusicHalf(sink, router, _presence, scheduler);
@@ -1124,18 +1138,33 @@ public sealed class ConnectionManager : IDisposable
     // --- the halves -------------------------------------------------------------------------------
 
     /// <summary>
-    /// The settings, pushed at both halves. Music is enabled by a phone being picked - there is no
-    /// separate switch for it - and neither half is told anything about package identity: the sink
-    /// service owns that gate (<c>AudioSinkPolicy</c>), and a manager that read the process-wide
-    /// static would report a different state on a developer's machine than in the installed build,
-    /// with no test able to tell.
+    /// The settings, pushed at both halves - each gated on package identity so an unpackaged run
+    /// reports both halves disabled and retries nothing, rather than sitting in a permanent error
+    /// state hammering the calls half's <c>RegisterApp</c> and a music connect its own service refuses,
+    /// once a minute for the life of the process. Music is otherwise enabled by a phone being picked;
+    /// there is no separate switch for it.
+    ///
+    /// The gate reads <see cref="_isPackaged"/>, which is injected, not the <c>PackageIdentity</c>
+    /// static. An earlier version of this comment justified telling the halves nothing on the grounds
+    /// that a manager reading the static could not be tested - true of the static, false of an injected
+    /// bool. Each half's rule stays in its own policy - <see cref="AudioSinkPolicy.CanOpenConnection"/>
+    /// and <see cref="CallsPolicy.ShouldRegister"/> - so the two gates cannot drift.
+    ///
+    /// <b><see cref="AudioSinkService"/>'s own gate stays regardless, and is not this one's redundant
+    /// twin.</b> Unpackaged, <c>AudioPlaybackConnection.TryCreateFromId</c> takes the process down with
+    /// an uncatchable access violation (docs/FINDINGS.md §8), so the last line of defence has to sit at
+    /// the call. This gate stops the half ever reaching it; that gate stops the crash if anything ever
+    /// does.
     /// </summary>
     private void ApplySettingsToHalves()
     {
         string? phoneDeviceId = _settings.PhoneDeviceId;
 
-        _music.Configure(phoneDeviceId is not null, phoneDeviceId, _settings.OutputDeviceId);
-        _calls.Configure(_settings.EnableCalls, phoneDeviceId);
+        bool musicEnabled = phoneDeviceId is not null && AudioSinkPolicy.CanOpenConnection(_isPackaged);
+        _music.Configure(musicEnabled, phoneDeviceId, _settings.OutputDeviceId);
+
+        CallsAvailability calls = CallsPolicy.Decide(_settings.EnableCalls, _isPackaged);
+        _calls.Configure(CallsPolicy.ShouldRegister(calls), phoneDeviceId);
     }
 
     private async Task ConnectHalvesAsync()

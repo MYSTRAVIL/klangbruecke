@@ -82,16 +82,13 @@ public sealed class CallsPolicyTests
 
     // --- how far a verdict lets a run go (was CallTransportPlan, folded in here) ---
     //
-    // <b>ShouldEnumerate and ShouldRegister have had no caller since Task 17.</b> Their only one was
-    // TrayContext.ConnectCallsAsync, and the connect path is CallsHalf's now - which asks neither. The
-    // tests below still pin the rule and are worth keeping for that, because the rule is what the fix
-    // needs; but read every "does", "costs" and "still enumerates" in them as a description of the
-    // rule, not of the running app.
-    //
-    // What the app actually does today: an unpackaged run attempts RegisterApp, fails, backs off and
-    // retries at the 60 s ceiling for the life of the process, because ShouldRegister is exactly the
-    // gate that used to stop it. The banner on CallsPolicy.ShouldEnumerate carries the whole story and
-    // the fix; this note exists because a reader who lands here first would otherwise get the old one.
+    // <b>ShouldRegister is now wired; ShouldEnumerate is not.</b> ConnectionManager.ApplySettingsToHalves
+    // passes ShouldRegister's verdict to CallsHalf.Configure as the half's enabled bit, so unpackaged
+    // the calls half reports Enabled == false and attempts nothing - the permanent 60 s RegisterApp
+    // retry an unpackaged run used to sit in is gone. ShouldEnumerate stays as the unadopted, more
+    // granular alternative (enumerate-but-don't-register); the design gates the half as a whole, so
+    // read "still enumerates" in its test below as the rule, not the running app. The banner on
+    // CallsPolicy.ShouldEnumerate carries the whole story.
 
     [Fact]
     public void Enabled_DoesBothSteps()
@@ -105,7 +102,7 @@ public sealed class CallsPolicyTests
     // the restricted capability. Skipping enumeration as well would cost a development run the one
     // calls-side fact it can establish - whether the phone's transport is discoverable at all.
     //
-    // Conditional, not current: nothing consults either verdict today. See the note above.
+    // Conditional for ShouldEnumerate, which nothing consults; ShouldRegister is now wired. See above.
     [Fact]
     public void NoPackageIdentity_StillEnumerates_ButDoesNotRegister()
     {

@@ -75,16 +75,14 @@ public sealed class AudioSinkService : IAudioSinkService
 
     public async Task<bool> ConnectAsync(string deviceId)
     {
-        // <b>The gate.</b> It was written as a backstop behind a tray-side check that logged the
-        // reason once and skipped the attempt cleanly; Task 17 moved the connect path into
-        // MusicHalf, and this is now the only place the policy is asked before the call. That is by
-        // design rather than by omission - ConnectionManager deliberately reads no process-wide
-        // static, because a manager that did could not be tested at all - so the caller above has no
-        // way to ask and is not at fault for arriving here.
-        //
-        // What it guards is not a failed connect. Unpackaged, TryCreateFromId below takes the process
-        // down with an AccessViolationException that no managed handler sees, so "let it try and
-        // return false" is process death, not a false return.
+        // <b>The gate, now a backstop.</b> ConnectionManager gates the music half off in an unpackaged
+        // run - ApplySettingsToHalves reads its injected package-identity bit through
+        // AudioSinkPolicy.CanOpenConnection - so the half no longer reaches here every 60 s. This check
+        // stays because it must be the last line of defence, not because the caller cannot ask: the
+        // caller now does. Unpackaged, TryCreateFromId below takes the process down with an
+        // AccessViolationException that no managed handler sees, so "let it try and return false" is
+        // process death, not a false return - the guard has to sit at the call, not only at the manager
+        // that now also stops the half arriving.
         //
         // Read once and passed to both, so the reason logged is provably the reason decided on. The
         // literal that used to sit in the Explain call was right only because the policy currently
@@ -97,9 +95,9 @@ public sealed class AudioSinkService : IAudioSinkService
             // the identical root cause is a mistake this project has already made once - it left
             // anyone grepping [WRN] with half the story.
             //
-            // Repeated per attempt on purpose, and the repetition is the report: the music half backs
-            // off and tries again, so an unpackaged run really is retrying something that cannot
-            // succeed, and a line a minute saying so is the only instrument that shows it.
+            // Now rarely reached: with the manager gating the half off unpackaged, a dev run gets the
+            // one startup line rather than one a minute. If something bypasses that gate and arrives
+            // here anyway, this line is still the record of why the connect was refused.
             Log.Write(AudioSinkPolicy.LevelFor(isPackaged), AudioSinkPolicy.Explain(isPackaged));
             return false;
         }

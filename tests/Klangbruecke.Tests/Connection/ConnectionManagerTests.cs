@@ -126,6 +126,46 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
     }
 
+    // --- the package-identity gate (docs/FINDINGS.md §8; CallsPolicy.ShouldRegister) ------------
+
+    /// <summary>
+    /// Unpackaged, neither half may run: the music half's connect reaches a call that takes the
+    /// process down (§8), and the calls half's <c>RegisterApp</c> cannot claim the restricted
+    /// capability. The manager gates both off on its injected package-identity bit, so the phone
+    /// appearing attempts nothing rather than failing - both halves report disabled, and the tray is
+    /// Idle rather than the permanent RetryBackoff an unpackaged run used to show.
+    /// </summary>
+    [Fact]
+    public void Unpackaged_neither_half_attempts_when_the_phone_appears()
+    {
+        using Harness h = new(isPackaged: false);
+
+        h.Link.RaiseAppeared();
+
+        Assert.Empty(h.Sink.ConnectCalls);
+        Assert.Empty(h.Calls.ConnectCalls);
+        Assert.Equal(ConnectionState.Idle, h.Manager.State);
+    }
+
+    /// <summary>
+    /// And it never starts: five minutes of reconcile ticks - the backstop that re-arms a real retry -
+    /// leave both halves still having attempted nothing. This is the whole of the fix. The permanent
+    /// error state an unpackaged run used to sit in was both halves failing once a minute against a
+    /// wall that does not move; gating them off is somewhere to stop.
+    /// </summary>
+    [Fact]
+    public void Unpackaged_never_retries_across_reconciles()
+    {
+        using Harness h = new(isPackaged: false);
+        h.Link.RaiseAppeared();
+
+        h.Scheduler.Advance(Seconds(300));
+
+        Assert.Empty(h.Sink.ConnectCalls);
+        Assert.Empty(h.Calls.ConnectCalls);
+        Assert.Equal(ConnectionState.Idle, h.Manager.State);
+    }
+
     // --- selection -----------------------------------------------------------------------------
 
     /// <summary>
@@ -2388,7 +2428,8 @@ public sealed class ConnectionManagerTests : IDisposable
             string? phoneDeviceId = PhoneId,
             bool autoReconnect = true,
             bool enableCalls = true,
-            IUiDispatcher? ui = null)
+            IUiDispatcher? ui = null,
+            bool isPackaged = true)
         {
             Settings = new RecordingSettings
             {
@@ -2414,7 +2455,7 @@ public sealed class ConnectionManagerTests : IDisposable
             Marshaller = ui as MarshallingUiDispatcher ?? (ui is null ? new MarshallingUiDispatcher() : null);
             Ui = ui ?? Marshaller!;
 
-            Manager = new ConnectionManager(Settings, Sink, Calls, Router, Endpoints, Link, Scheduler, Power, Ui);
+            Manager = new ConnectionManager(Settings, Sink, Calls, Router, Endpoints, Link, Scheduler, Power, Ui, isPackaged);
             Manager.StateChanged += (_, state) =>
             {
                 States.Add(state);

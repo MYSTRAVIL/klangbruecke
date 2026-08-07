@@ -77,48 +77,39 @@ public static class CallsPolicy
     };
 
     /// <summary>
-    /// <b>NOTHING CALLS THIS OR <see cref="ShouldRegister"/> TODAY.</b> Read the next two paragraphs
-    /// before reading either of them as a description of what the app does.
+    /// <b><see cref="ShouldRegister"/> is now wired; this one is not.</b> Read the next two paragraphs
+    /// before reading either as a description of what the app does.
     ///
-    /// Their only call site was <c>TrayContext.ConnectCallsAsync</c>, and Task 17 moved the connect
-    /// path into <c>CallsHalf</c>, which asks neither. The consequence is not cosmetic and belongs
-    /// here rather than only in a report: <b>an unpackaged run now attempts <c>RegisterApp</c>, fails,
-    /// backs off and retries at the 60 s ceiling for the life of the process</b>, because
-    /// <see cref="ShouldRegister"/> is precisely the gate that used to stop it and nothing consults
-    /// it. <see cref="MenuItem"/> tells the <em>user</em> why; it does not gate the half.
+    /// <see cref="ShouldRegister"/> is consulted by <c>ConnectionManager.ApplySettingsToHalves</c>,
+    /// which hands its verdict to <c>CallsHalf.Configure</c> as the half's enabled bit. Unpackaged,
+    /// where it is false, the calls half reports <c>Enabled == false</c> and attempts nothing - not the
+    /// <c>RegisterApp</c> that used to fail, back off, and retry at the 60 s ceiling for the life of the
+    /// process while nothing consulted this. That was the fix this pair existed to state, and it is
+    /// applied. <see cref="MenuItem"/> still tells the <em>user</em> why; the gate itself is the
+    /// manager's.
     ///
-    /// They are kept rather than deleted because they are the statement of the rule the fix needs, and
-    /// the fix is known: hand <see cref="Decide"/>'s verdict to <c>ConnectionManager</c>'s constructor
-    /// and fold <see cref="ShouldRegister"/> into <c>ApplySettingsToHalves</c>, so a structurally
-    /// unavailable half reports <c>Enabled == false</c> instead of counting down to an attempt that
-    /// cannot succeed. Deleting them would delete the rule and leave whoever does that work to
-    /// rediscover the asymmetry below from the probe notes. Their tests stay for the same reason: the
-    /// rule is still pinned, it is only unwired.
+    /// <see cref="ShouldEnumerate"/> is the more granular rule that was <em>not</em> adopted. It says
+    /// an unpackaged run could still enumerate and log the transport - discovery works with no package
+    /// identity (GetDeviceSelector, FindAllAsync, FromId, IsRegistered were all exercised against the
+    /// real phone), and only RegisterApp needs the restricted capability. But <c>CallsHalf</c> couples
+    /// enumerate and register in one flow, and the design gates the half as a whole
+    /// (<c>Enabled iff Decide == Enabled</c>), so unpackaged it now does neither. It is kept, with its
+    /// tests, as the documented alternative: wiring it would mean splitting enumerate from register in
+    /// <c>CallsHalf</c> and giving the half a terminal "enumerated, cannot register" state instead of
+    /// the Backoff it no longer reaches.
     ///
     /// <hr/>
     ///
     /// Enumerate unless the user turned calls off, in which case looking is pure noise.
-    ///
-    /// Not the same question as <see cref="ShouldRegister"/>, and that is the point. Discovery -
-    /// GetDeviceSelector, FindAllAsync, FromId, IsRegistered - was exercised against the real phone
-    /// with no package identity and all of it worked; only RegisterApp, claiming the hands-free role,
-    /// needs the restricted phoneLineTransportManagement capability. So an unpackaged run should still
-    /// enumerate and log what it found.
-    ///
-    /// Worth a named rule rather than an inline condition: gating the whole block on
-    /// <see cref="CallsAvailability.Enabled"/> is a one-line change back, it looks like a tidy-up, and
-    /// it would cost every "dotnet run" the one calls-side fact it can establish - whether the phone's
-    /// transport is discoverable at all - which the packaged build cannot be trusted to produce for
-    /// the first time under a restricted capability.
     /// </summary>
     public static bool ShouldEnumerate(CallsAvailability availability) =>
         availability != CallsAvailability.DisabledBySetting;
 
     /// <summary>
-    /// Register and connect only when nothing structural is in the way.
-    ///
-    /// <b>No caller today.</b> See <see cref="ShouldEnumerate"/> for what that costs and for what
-    /// would wire it back.
+    /// Register and connect only when nothing structural is in the way. Consulted by
+    /// <c>ConnectionManager.ApplySettingsToHalves</c>, which passes the result to
+    /// <c>CallsHalf.Configure</c> as the half's enabled bit - so unpackaged, where this is false, the
+    /// half never attempts registration. See the banner on <see cref="ShouldEnumerate"/>.
     /// </summary>
     public static bool ShouldRegister(CallsAvailability availability) =>
         availability == CallsAvailability.Enabled;
