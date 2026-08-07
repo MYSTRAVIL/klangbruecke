@@ -363,10 +363,49 @@ been executed, after the `AudioPlaybackConnection` crash (§8), the dev-cert scr
 Core-only API in a script that must run under Windows PowerShell 5.1, and the pfx password file that
 `*.pfx` did not match in `.gitignore`. **In this project, "it builds" has predicted nothing.**
 
-## 11. Outgoing call audio is degraded by the Bluetooth link, not by the PC
+## 11. RESOLVED: outgoing call audio was the comms-capture *level*, not the codec
 
-**Open issue.** Outgoing voice is intelligible but noticeably worse through the bridge than holding
-the phone directly: muffled, with harsh artifacts described as "some frequencies too high".
+**Resolved 2026-08-07. The far end heard the user badly because the PC's default *communications*
+capture device was sitting at 7.8% (-38 dB). Raising it to 100% fixed it, confirmed by ear on the
+spot. It was never the codec, never the driver, and never the headset.**
+
+The default communications capture endpoint is the device Windows encodes onto the SCO uplink. At
+-38 dB the uplink was a whisper, and a signal that quiet forces the far end's automatic gain control
+to amplify it heavily — a well-known cause of noisy, distorted outgoing audio. Whatever the exact
+perceptual mapping of "muffled / harsh / too-high frequencies", raising the level removed it.
+
+**The tell was there the whole time: the *incoming* direction sounded great.** SCO carries one codec
+in both directions, so a link clean enough for the downlink is clean enough for the uplink — the
+codec was provably fine, and every hypothesis below about narrowband CVSD was chasing a cause the
+evidence already excluded. Both diagnostic scripts kept the wrong lead alive rather than killing it:
+`packaging/Measure-CallBandwidth.ps1` measures the *downlink*, which was the good direction and
+cannot see a starved uplink; and `packaging/Watch-HfpAudio.ps1` reads the codec off the HF endpoint
+sample rate, but those endpoints never surface as `Active` in `MMDeviceEnumerator` during a call on
+this machine (the topology note below), so it read nothing. Both tools are harmless but no longer
+load-bearing.
+
+### Why the level was down, and why nobody set it
+
+Almost certainly **HFP microphone-gain sync** — a hypothesis, not caught in the act. The Audio
+Gateway (phone) can send the Hands-Free unit (PC) an `AT+VGM=<0..15>` command setting the call-mic
+gain; Windows applies it to the default communications capture endpoint and **persists** it after
+the call. Some earlier call left it at a low step (~1-2 of 15 ≈ the observed 7.8%), and every call
+after inherited the starved level. This is also why the earlier "set the comms device to the
+beyerdynamic directly" test changed nothing: the phone sets *whatever* device is the comms capture,
+so swapping the device never raised the level. A deliberate retest call did **not** pull it down
+again, so the trigger condition is unknown. If the level drifts down on its own after a call, that
+is the confirmation — and the fix is simply to raise it back.
+
+### RETRACTED below, kept for the record
+
+Everything from here down is the original investigation. It reached the wrong conclusion —
+narrowband CVSD on the SCO link, prime suspect the 2021 MediaTek driver — for a reason worth
+remembering: it reasoned from "the bridge is worse than the phone" straight to "the SCO link", and
+never asked why the *good* downlink already disproved a symmetric-codec fault. The driver was later
+updated with no change. `FINDINGS §5` still holds: the radio was fine; do not rebind or swap it.
+
+**Original write-up (wrong).** Outgoing voice is intelligible but noticeably worse through the bridge
+than holding the phone directly: muffled, with harsh artifacts described as "some frequencies too high".
 
 What has been ruled out, each by direct test:
 
@@ -391,7 +430,10 @@ which is why looking for one finds nothing.
 So the app cannot affect this. `AudioRouter` bridges the A2DP sink only; for calls the app registers
 the transport and Windows owns the entire audio path.
 
-### Leading hypothesis: the link negotiated CVSD, not mSBC
+### RETRACTED leading hypothesis: the link negotiated CVSD, not mSBC
+
+**Wrong — see the resolution at the top of this section.** The downlink sounded great, which a
+symmetric SCO codec cannot deliver if the link were CVSD, and updating the driver changed nothing.
 
 SCO carries one codec in both directions. CVSD is narrowband (~4 kHz) with slope-overload distortion
 on transients — which matches "muffled plus odd high-frequency harshness" well. mSBC is wideband.
@@ -428,7 +470,7 @@ regardless of what Bluetooth negotiated. The measurement is only conclusive over
 call — WhatsApp, Signal, Telegram, FaceTime Audio — placed from a second phone to the bridged phone.
 Run it on a cellular call and it will confirm the hypothesis whether or not the hypothesis is true.
 
-### If it is CVSD
+### If it is CVSD (moot — it was not, and the driver update below changed nothing)
 
 The lever is the driver, from the OEM support page or MediaTek. This is a normal supported update,
 not the WinUSB rebinding §5 rejects — and it is reversible via Device Manager → Roll Back Driver.
