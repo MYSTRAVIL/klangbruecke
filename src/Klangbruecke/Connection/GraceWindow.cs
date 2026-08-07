@@ -1,4 +1,3 @@
-using System.Threading.Tasks;
 using Klangbruecke.Bluetooth;
 using Klangbruecke.Diagnostics;
 using Klangbruecke.Platform;
