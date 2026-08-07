@@ -41,6 +41,24 @@ violation (FINDINGS §8).
 - Windows SDK 10.0.19041.0 (for `makeappx` / `signtool`)
 - A Bluetooth radio the Windows stack owns (no Zadig / WinUSB rebinding)
 
+## Install a release
+
+Prebuilt, signed packages are on the
+[Releases](https://github.com/MYSTRAVIL/klangbruecke/releases) page — each carries the `.msix` and the
+public `.cer` it was signed with. The certificate is self-signed, so Windows refuses the package until
+that cert is trusted; unlike a downloaded `.exe`, an MSIX has no "install anyway" prompt, so this step
+is required (once per machine):
+
+```powershell
+# elevated: trust the signing certificate
+Import-Certificate -FilePath .\Klangbruecke.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+
+# then from Windows PowerShell (not pwsh — the Appx module does not load there):
+Add-AppxPackage -Path .\Klangbruecke-<version>.msix
+```
+
+Klangbruecke starts on sign-in and lives in the tray.
+
 ## Build, package, install
 
 MSIX packaging is load-bearing: package identity keeps `TryCreateFromId` from killing the process
@@ -55,6 +73,10 @@ dotnet build src/Klangbruecke/Klangbruecke.csproj -c Release
 
 Install the produced `.msix` with sideloading enabled
 (Settings → Update & Security → For developers → Sideload apps).
+
+Cut a GitHub release (build, sign, push the commit, upload the `.msix` + `.cer` + install notes) with
+`./packaging/Publish-Release.ps1`. The tray/app icons are generated from the brand mark by
+`./packaging/Generate-Icons.ps1`.
 
 ## Architecture
 
