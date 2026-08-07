@@ -1,3 +1,4 @@
+using Klangbruecke.Connection;
 using Klangbruecke.Diagnostics;
 
 namespace Klangbruecke;
@@ -16,6 +17,14 @@ public sealed class StatusPresenter
     // and status text interpolates exception messages, so its own length is unbounded. Set well below
     // that limit because a tooltip that long is unreadable anyway.
     private const int MaxTooltip = 96;
+
+    /// <summary>
+    /// Between the state and its detail. A spaced em dash rather than a colon or a hyphen: the detail
+    /// phrases contain both - "music retrying in 8s", "disconnected until the phone leaves and
+    /// returns" - and a separator that also appears inside what it separates is one the reader has to
+    /// parse twice.
+    /// </summary>
+    private const string Separator = " — ";
 
     private readonly IUiDispatcher _ui;
     private readonly Action<string> _write;
@@ -45,6 +54,26 @@ public sealed class StatusPresenter
 
     /// <summary>Raised by a component, which brought its own severity.</summary>
     public void Show(StatusMessage status) => Show(status.Text, status.Level);
+
+    /// <summary>
+    /// The connection's own state, which leads, and the phrase that explains it.
+    ///
+    /// <b>State first because a component's last announcement is not an answer to "is it working?".</b>
+    /// "A2DP sink connected." stays in the tooltip for as long as nothing else speaks - minutes after
+    /// the phone has left the room, and for the whole of a call, which takes the capture endpoint away
+    /// without closing the connection. The projected state is the one thing that is always current,
+    /// and the detail is what it means; the two arrive together so the tooltip cannot show one
+    /// component's news beside another's state.
+    ///
+    /// Always Info, and deliberately not a parameter. Every one of the seven states is an ordinary
+    /// condition of a working app - <c>Suppressed</c> and <c>RetryBackoff</c> included, which are the
+    /// two that look like failures and are not: one is the user's own Disconnect and the other is the
+    /// app doing exactly what it should. What actually went wrong is announced by the component that
+    /// witnessed it, at the level it witnessed it at, through the overload above. Grading a projection
+    /// here would be this class deciding the severity of events it did not see, which is the mistake
+    /// <see cref="StatusMessage"/> exists to prevent.
+    /// </summary>
+    public void Show(ConnectionState state, string detail) => Show($"{state}{Separator}{detail}");
 
     /// <summary>
     /// Ordinary progress unless told otherwise. The level is a parameter rather than something

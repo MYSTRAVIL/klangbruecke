@@ -140,8 +140,27 @@ It lied twice in one session. Verify against the OS instead:
 Get-PnpDevice -Class AudioEndpoint | Where-Object { $_.FriendlyName -match 'SNK|A2DP' }
 ```
 
-If that endpoint is absent, **nothing** is holding an `AudioPlaybackConnection` open, and the phone
-physically cannot offer the PC as an audio output. That is not a bug — it is the expected state.
+**Endpoint presence is *sufficient* evidence of a live connection, never *necessary*.** This section
+used to say that if the endpoint is absent then **nothing** is holding an `AudioPlaybackConnection`
+open. That is too strong, and it was wrong in five of eight recorded runs: the connection reported
+`Opened` and the endpoint did not appear until an unbounded interval later. Absence proves nothing
+at all about the connection — use the endpoint to verify a *route*, never to infer a
+*disconnection*. `AudioSinkService.IsConnected` answers only for the WinRT connection object for
+exactly this reason, and `IAudioEndpointMonitor` owns the endpoint half separately.
+
+Presence is the stronger direction but it is not proof either, measured once on 2026-08-05: with the
+phone disconnected — `IsConnected` False on both its `BTHENUM` and `BTHLE` nodes, its two
+`Hands-Free HF Audio` endpoints gone (`Present=False`), and three consecutive
+`AudioPlaybackConnection` opens returning `UnknownFailure` — `Line (MYSTRAPIX9 A2DP SNK)` still
+enumerated `Present=True, Status=OK` with MMDevice `DeviceState=1` (Active). One observation, cause
+not isolated; the likeliest reading is an endpoint leaked by a process that exited while holding the
+capture. So when the answer matters, check the radio too:
+
+```powershell
+Get-PnpDevice -Class Bluetooth | Where-Object { $_.FriendlyName -eq '<phone>' } | ForEach-Object {
+  Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName '{83DA6326-97A6-4088-9453-A1923F573B29} 15'
+}
+```
 
 ## 5. Things deliberately NOT done, and why
 
@@ -344,10 +363,49 @@ been executed, after the `AudioPlaybackConnection` crash (§8), the dev-cert scr
 Core-only API in a script that must run under Windows PowerShell 5.1, and the pfx password file that
 `*.pfx` did not match in `.gitignore`. **In this project, "it builds" has predicted nothing.**
 
-## 11. Outgoing call audio is degraded by the Bluetooth link, not by the PC
+## 11. RESOLVED: outgoing call audio was the comms-capture *level*, not the codec
 
-**Open issue.** Outgoing voice is intelligible but noticeably worse through the bridge than holding
-the phone directly: muffled, with harsh artifacts described as "some frequencies too high".
+**Resolved 2026-08-07. The far end heard the user badly because the PC's default *communications*
+capture device was sitting at 7.8% (-38 dB). Raising it to 100% fixed it, confirmed by ear on the
+spot. It was never the codec, never the driver, and never the headset.**
+
+The default communications capture endpoint is the device Windows encodes onto the SCO uplink. At
+-38 dB the uplink was a whisper, and a signal that quiet forces the far end's automatic gain control
+to amplify it heavily — a well-known cause of noisy, distorted outgoing audio. Whatever the exact
+perceptual mapping of "muffled / harsh / too-high frequencies", raising the level removed it.
+
+**The tell was there the whole time: the *incoming* direction sounded great.** SCO carries one codec
+in both directions, so a link clean enough for the downlink is clean enough for the uplink — the
+codec was provably fine, and every hypothesis below about narrowband CVSD was chasing a cause the
+evidence already excluded. Both diagnostic scripts kept the wrong lead alive rather than killing it:
+`packaging/Measure-CallBandwidth.ps1` measures the *downlink*, which was the good direction and
+cannot see a starved uplink; and `packaging/Watch-HfpAudio.ps1` reads the codec off the HF endpoint
+sample rate, but those endpoints never surface as `Active` in `MMDeviceEnumerator` during a call on
+this machine (the topology note below), so it read nothing. Both tools are harmless but no longer
+load-bearing.
+
+### Why the level was down, and why nobody set it
+
+Almost certainly **HFP microphone-gain sync** — a hypothesis, not caught in the act. The Audio
+Gateway (phone) can send the Hands-Free unit (PC) an `AT+VGM=<0..15>` command setting the call-mic
+gain; Windows applies it to the default communications capture endpoint and **persists** it after
+the call. Some earlier call left it at a low step (~1-2 of 15 ≈ the observed 7.8%), and every call
+after inherited the starved level. This is also why the earlier "set the comms device to the
+beyerdynamic directly" test changed nothing: the phone sets *whatever* device is the comms capture,
+so swapping the device never raised the level. A deliberate retest call did **not** pull it down
+again, so the trigger condition is unknown. If the level drifts down on its own after a call, that
+is the confirmation — and the fix is simply to raise it back.
+
+### RETRACTED below, kept for the record
+
+Everything from here down is the original investigation. It reached the wrong conclusion —
+narrowband CVSD on the SCO link, prime suspect the 2021 MediaTek driver — for a reason worth
+remembering: it reasoned from "the bridge is worse than the phone" straight to "the SCO link", and
+never asked why the *good* downlink already disproved a symmetric-codec fault. The driver was later
+updated with no change. `FINDINGS §5` still holds: the radio was fine; do not rebind or swap it.
+
+**Original write-up (wrong).** Outgoing voice is intelligible but noticeably worse through the bridge
+than holding the phone directly: muffled, with harsh artifacts described as "some frequencies too high".
 
 What has been ruled out, each by direct test:
 
@@ -372,7 +430,10 @@ which is why looking for one finds nothing.
 So the app cannot affect this. `AudioRouter` bridges the A2DP sink only; for calls the app registers
 the transport and Windows owns the entire audio path.
 
-### Leading hypothesis: the link negotiated CVSD, not mSBC
+### RETRACTED leading hypothesis: the link negotiated CVSD, not mSBC
+
+**Wrong — see the resolution at the top of this section.** The downlink sounded great, which a
+symmetric SCO codec cannot deliver if the link were CVSD, and updating the driver changed nothing.
 
 SCO carries one codec in both directions. CVSD is narrowband (~4 kHz) with slope-overload distortion
 on transients — which matches "muffled plus odd high-frequency harshness" well. mSBC is wideband.
@@ -409,7 +470,7 @@ regardless of what Bluetooth negotiated. The measurement is only conclusive over
 call — WhatsApp, Signal, Telegram, FaceTime Audio — placed from a second phone to the bridged phone.
 Run it on a cellular call and it will confirm the hypothesis whether or not the hypothesis is true.
 
-### If it is CVSD
+### If it is CVSD (moot — it was not, and the driver update below changed nothing)
 
 The lever is the driver, from the OEM support page or MediaTek. This is a normal supported update,
 not the WinUSB rebinding §5 rejects — and it is reversible via Device Manager → Roll Back Driver.
@@ -551,7 +612,7 @@ accepts the package and its declared capabilities; the API rejects the call at r
   calls work on this machine — but via Thy Phone, a **Store-signed** app, which is precisely the
   difference this failure points at.
 
-## 13. A live call tears down the A2DP route, and nothing brings it back
+## 13. RESOLVED in Stage 1: a live call tears down the A2DP route; the ConnectionManager brings it back
 
 Expected Bluetooth behaviour, recorded because it looks like a bug in the log and is not:
 
@@ -568,7 +629,49 @@ The teardown is correct and is the fix from Stage 0 Task 5 working in production
 holding the endpoint open. That defect was found by a live hardware probe after surviving three
 review rounds, and this log line is it doing its job.
 
-**But nothing restarts the route after the call ends.** The user must re-pick the phone from the
-tray. That is the reconnect gap, and it belongs to the `ConnectionManager` state machine in
-`docs/superpowers/specs/2026-08-04-connection-lifecycle-design.md`. It is arguably the single most
-valuable thing Stage 1 adds: without it, one phone call silently costs you the music bridge.
+**Stage 1 closes this.** The `ConnectionManager` plus the `EndpointMonitor` (`IMMNotificationClient`)
+restart the route when the A2DP capture endpoint reappears — no tray interaction. Confirmed working
+by the user on hardware 2026-08-07 (music comes back after a call), and the log independently shows
+the driving mechanism: after a connect where the endpoint was absent (`Present at subscribe time:
+False`), `EndpointMonitor` caught its arrival as `Audio endpoint notification: DeviceStateChanged …
+state=Active` ~74 s later and started the route automatically. That was the single most valuable
+thing Stage 1 had to add, and it does it.
+
+## 14. Stage 1 validation: reconnect works on hardware, and two environment traps
+
+Verified 2026-08-07 with the packaged build (`0.2.0.0`, MSIX, sideloaded), phone `MYSTRAPIX9`, on
+the branch `stage-1-connection-manager` (19 tasks, 4244 tests, final whole-branch review clean).
+
+**Both halves, and the reconnect that is the point of Stage 1:**
+
+- **Music** — A2DP sink connects and routes. Critically, the `EndpointMonitor` restarts the route
+  when the capture endpoint appears *late*: the log shows a connect with `Present at subscribe time:
+  False`, then `DeviceStateChanged … state=Active` ~74 s later, then the route starting on its own
+  (§13). This is the finding-#2 fix — before Stage 1, the app looked once, found nothing, and
+  silently never routed. The arriving callback is `DeviceStateChanged`, previously unmeasured.
+- **Calls** — hands-free role claimed. Notably `PhoneLineTransportDevice.ConnectAsync` returned
+  **True** this session (`Hands-free role claimed and the call transport reported connected`),
+  unlike the persistent `False` recorded in §12 — so grounding the calls half in `IsRegistered()`
+  rather than that bool (Stage 1, Task 10) was the right call for a value that is not even stable.
+- **Grace window** — a real connection-close with the Bluetooth link still up was classified
+  `deliberate → Suppressed`, the intended behaviour, not a range exit.
+
+**Two environment traps found while validating — neither is an app bug, both cost time:**
+
+1. **Doubled / echoed playback.** Windows "Listen to this device" was enabled on the
+   `Line (… A2DP SNK)` capture endpoint (registry: the `{24dbb0fc-…},1` key set), so Windows
+   mirrored the phone audio to the default playback device *in addition to* Klangbruecke's route —
+   two paths, one echo. It is the music-side twin of the Thy Phone story (§12): a manual
+   proving-phase mechanism left switched on. Uncheck it in Sound → Recording → Listen. Verify with
+   the registry key, not the checkbox — the checkbox lies if the panel is stale.
+2. **Outgoing call audio "horrible" — see §11.** Resolved as the communications-capture *level*
+   pulled to −38 dB, not a codec or driver fault. Recorded there in full, including the retracted
+   CVSD hypothesis.
+
+**The debugging lesson, for the record.** The §11 chase burned hours on a codec/driver hypothesis
+that the user's own observation had already excluded: the *incoming* call audio sounded great, and a
+symmetric SCO codec cannot deliver a clean downlink while wrecking the uplink. Trust the cheap
+symptom (which direction is bad, and does the same headset sound fine elsewhere) over the exotic
+mechanism. Both diagnostic scripts (`Measure-CallBandwidth.ps1`, `Watch-HfpAudio.ps1`) were built
+for the wrong hypothesis and could not have caught the real cause — one measures the good direction,
+the other reads endpoints that never go `Active` in the enumerator during a call.

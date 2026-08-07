@@ -1,5 +1,4 @@
 using Klangbruecke.Diagnostics;
-using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
 namespace Klangbruecke.Audio;
@@ -10,7 +9,7 @@ namespace Klangbruecke.Audio;
 /// The per-app volume mixer cannot redirect this stream, which is why the routing is done
 /// in-process rather than by asking Windows to move it.
 /// </summary>
-public sealed class AudioRouter : IDisposable
+public sealed class AudioRouter : IAudioRouter
 {
     /// <summary>
     /// One Start..Stop session: both its identity and whether it is still alive.
@@ -31,14 +30,15 @@ public sealed class AudioRouter : IDisposable
     }
 
     private readonly IUiDispatcher _ui;
+    private readonly IAudioDeviceFactory _devices;
 
     // All three are volatile for the same reason: they are read on NAudio's capture and play threads -
     // _capture and _output by the sender guards below, _buffer by OnDataAvailable - and written on the
     // thread that runs Start and Stop. _buffer's stale read is the mildest of the three (samples added
     // to a dead but still-referenced buffer, which is then collected), but leaving one of three
     // unmarked would read as a considered decision that the other two were special.
-    private volatile WasapiCapture? _capture;
-    private volatile WasapiOut? _output;
+    private volatile ICaptureSource? _capture;
+    private volatile IRenderSink? _output;
     private volatile BufferedWaveProvider? _buffer;
 
     /// <summary>
@@ -49,19 +49,46 @@ public sealed class AudioRouter : IDisposable
     /// </summary>
     private volatile Session? _session;
 
+    /// <summary>
+    /// The two stopped subscriptions, kept only so <see cref="Stop"/> can take them off again.
+    ///
+    /// They are closures rather than method groups because each one carries the endpoint it was
+    /// subscribed for into the handler; see <see cref="OnRecordingStopped"/> for why that identity
+    /// must not come from the event's own sender. Written and read on the thread that runs Start and
+    /// Stop, and on no other, so unlike the endpoint fields above they need no volatile.
+    /// </summary>
+    private EventHandler<StoppedEventArgs>? _onRecordingStopped;
+    private EventHandler<StoppedEventArgs>? _onPlaybackStopped;
+
     private bool _disposed;
 
     /// <summary>
     /// The dispatcher is not a convenience. RequestTeardown is free of deadlock only because the
     /// dispatcher actually defers work off the thread that raised the stopped event - see there for
     /// what happens otherwise. <see cref="ImmediateUiDispatcher"/> runs every action inline and would
-    /// reinstate the self-join in full, so it is safe here only in a test that never starts a route.
+    /// reinstate the self-join in full, so it is safe here only in a test whose sink does not join
+    /// anything.
+    ///
+    /// The factory is the seam that keeps every COM type out of this class. Nothing below constructs
+    /// an endpoint, which is what makes the orderings in Start, the stopped handlers and Stop
+    /// reachable from a test at all.
     /// </summary>
-    public AudioRouter(IUiDispatcher ui) => _ui = ui;
+    public AudioRouter(IUiDispatcher ui, IAudioDeviceFactory devices)
+    {
+        _ui = ui;
+        _devices = devices;
+    }
 
     public bool IsRunning => _session is { Dead: false };
 
     public event EventHandler<StatusMessage>? Status;
+
+    /// <summary>
+    /// Raised after a route that died on its own has been torn down, on the dispatcher thread.
+    /// See <see cref="IAudioRouter.Stopped"/> for why it is neither raised from the stopped handlers
+    /// nor from a deliberate <see cref="Stop"/>.
+    /// </summary>
+    public event EventHandler? Stopped;
 
     /// <summary>
     /// Info unless said otherwise. The level travels with the message because this class is the only
@@ -70,44 +97,7 @@ public sealed class AudioRouter : IDisposable
     private void Report(string message, LogLevel level = LogLevel.Info) =>
         Status?.Invoke(this, new StatusMessage(message, level));
 
-    /// <summary>The capture endpoint Windows creates while an A2DP sink connection is open.</summary>
-    public static MMDevice? FindSinkCaptureEndpoint()
-    {
-        using var enumerator = new MMDeviceEnumerator();
-        return enumerator
-            .EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active)
-            .FirstOrDefault(d => d.FriendlyName.Contains("A2DP", StringComparison.OrdinalIgnoreCase)
-                              || d.FriendlyName.Contains("SNK", StringComparison.OrdinalIgnoreCase));
-    }
-
-    public static IReadOnlyList<MMDevice> GetOutputDevices()
-    {
-        using var enumerator = new MMDeviceEnumerator();
-        return enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active).ToList();
-    }
-
-    public static MMDevice? GetOutputDeviceOrDefault(string? deviceId)
-    {
-        using var enumerator = new MMDeviceEnumerator();
-
-        if (!string.IsNullOrEmpty(deviceId))
-        {
-            MMDevice? match = enumerator
-                .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-                .FirstOrDefault(d => d.ID == deviceId);
-
-            if (match is not null)
-            {
-                return match;
-            }
-        }
-
-        return enumerator.HasDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia)
-            ? enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia)
-            : null;
-    }
-
-    public bool Start(MMDevice source, MMDevice sink)
+    public bool Start(string? preferredOutputDeviceId)
     {
         Stop();
 
@@ -117,31 +107,77 @@ public sealed class AudioRouter : IDisposable
 
         try
         {
-            _capture = new WasapiCapture(source);
-            _buffer = new BufferedWaveProvider(_capture.WaveFormat)
+            // Both lookups are inside the try, not before it. Opening an endpoint is the single most
+            // failure-prone thing this method does - the phone can walk away between the enumeration
+            // and the activation - and outside the try a throw would escape Start with the capture
+            // half already open and nothing to close it.
+            ICaptureSource? source = _devices.CreateSinkCapture();
+            if (source is null)
+            {
+                // Says only what was observed. The old wording - "nothing is holding a connection
+                // open" - asserted the converse docs/FINDINGS.md section 4 now retracts, and it was
+                // wrong precisely when it fired. Two routes reach here and neither is a disconnection:
+                // MusicHalf.StartRouteIfDue, where the monitor saw the endpoint and it went away
+                // before Start could open it, i.e. while the half is Linked with the connection open;
+                // and ConnectionManager.RepointRoute, which calls Start on a running route from Up
+                // with no monitor read involved at all. Absence proves nothing about the connection
+                // either way, which is also why the A2DP connect result is logged by the caller
+                // rather than inferred here.
+                Report("No A2DP sink endpoint to capture from; not starting the route.");
+                return false;
+            }
+
+            // Published to the field immediately, before anything that can throw: the catch below
+            // names the capture format, and it can only do that from a field it can still see.
+            _capture = source;
+
+            IRenderSink? sink = _devices.CreateRender(preferredOutputDeviceId);
+            if (sink is null)
+            {
+                // Stop before Report, matching the catch below - but here it earns its place twice
+                // over, because the capture above is already open and it is the handle that holds the
+                // A2DP endpoint. Returning without it would leave the endpoint busy for a route that
+                // never started, and that endpoint is how the app proves it is connected at all.
+                Stop();
+                Report("No usable output device.");
+                return false;
+            }
+
+            _output = sink;
+
+            // Both endpoint names, before the stream starts: a route that runs silently is almost
+            // always the right source paired with the wrong sink, and a failure past this point may
+            // never reach the status line that repeats them.
+            Log.Info($"Routing source='{source.FriendlyName}' sink='{sink.FriendlyName}'.");
+
+            _buffer = new BufferedWaveProvider(source.WaveFormat)
             {
                 // Enough slack to ride out scheduling hiccups without adding audible latency.
                 BufferDuration = TimeSpan.FromMilliseconds(500),
                 DiscardOnBufferOverflow = true,
             };
 
-            _capture.DataAvailable += OnDataAvailable;
-            _capture.RecordingStopped += OnRecordingStopped;
+            source.DataAvailable += OnDataAvailable;
 
-            outputFormat = sink.AudioClient.MixFormat;
+            // The capture goes into the handler from here rather than out of the event's sender.
+            // See OnRecordingStopped.
+            _onRecordingStopped = (_, e) => OnRecordingStopped(source, e);
+            source.RecordingStopped += _onRecordingStopped;
+
+            outputFormat = sink.MixFormat;
 
             // Unconditional. This pair is the first thing anyone needs when routing misbehaves on
             // hardware that cannot be reproduced here, and it is worth as much when the formats
             // match as when they do not.
-            Log.Info($"Capture={AudioFormatBridge.Describe(_capture.WaveFormat)} " +
+            Log.Info($"Capture={AudioFormatBridge.Describe(source.WaveFormat)} " +
                      $"Render={AudioFormatBridge.Describe(outputFormat)}" +
-                     (AudioFormatBridge.Differ(_capture.WaveFormat, outputFormat)
+                     (AudioFormatBridge.Differ(source.WaveFormat, outputFormat)
                          ? " - differ, WASAPI shared mode is converting."
                          : " - matched."));
 
-            _output = new WasapiOut(sink, AudioClientShareMode.Shared, useEventSync: true, latency: 50);
-            _output.PlaybackStopped += OnPlaybackStopped;
-            _output.Init(_buffer);
+            _onPlaybackStopped = (_, e) => OnPlaybackStopped(sink, e);
+            sink.PlaybackStopped += _onPlaybackStopped;
+            sink.Init(_buffer);
 
             // Before either worker thread exists, so no stopped event can be raised against a session
             // that has not been published yet and be discarded as stale. This is also what makes
@@ -149,8 +185,8 @@ public sealed class AudioRouter : IDisposable
             // before anything can observe the difference.
             _session = new Session();
 
-            _capture.StartRecording();
-            _output.Play();
+            source.StartRecording();
+            sink.Play();
 
             Report($"Routing '{source.FriendlyName}' -> '{sink.FriendlyName}'.");
             return true;
@@ -185,14 +221,26 @@ public sealed class AudioRouter : IDisposable
         _buffer?.AddSamples(e.Buffer, 0, e.BytesRecorded);
     }
 
-    private void OnRecordingStopped(object? sender, StoppedEventArgs e)
+    /// <summary>
+    /// <paramref name="source"/> is the capture this handler was subscribed for, closed over by the
+    /// subscription in <see cref="Start"/> rather than read out of the event's own sender.
+    ///
+    /// Taken from the event, the identity would be whatever the implementation chose to pass, and the
+    /// guard below would be resting on a convention no compiler checks: an adapter that forwarded its
+    /// inner NAudio object through - a one-character edit, <c>(s, e)</c> for <c>(_, e)</c> - would
+    /// fail the comparison on every raise it ever made. Nothing throws when that happens. The route
+    /// just never notices its own capture died, the tray goes on claiming it is routing, and the A2DP
+    /// endpoint stays held open. Supplied from the subscription it cannot be wrong, and the guard says
+    /// exactly what it reads as: is this from the capture I am holding now?
+    /// </summary>
+    private void OnRecordingStopped(ICaptureSource source, StoppedEventArgs e)
     {
         // Mirrors the playback guard below: this can be raised after Stop dropped this capture or a
         // later Start replaced it, and reporting that session dead would describe the wrong one.
         // NAudio snapshots the delegate before raising, so unsubscribing in Stop does not reliably
         // prevent this call - which is why the guard exists at all, and why _capture is volatile:
         // this is the one check the session token cannot back up, because it runs before it.
-        if (!ReferenceEquals(sender, _capture))
+        if (!ReferenceEquals(source, _capture))
         {
             return;
         }
@@ -214,13 +262,16 @@ public sealed class AudioRouter : IDisposable
     /// <summary>
     /// WasapiOut turns play-thread failures into this event and nothing else. Unhandled, a dead
     /// stream leaves IsRunning set and the tray still claiming it is routing.
+    ///
+    /// <paramref name="sink"/> comes from the subscription, for the reason given on the capture
+    /// handler above.
     /// </summary>
-    private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
+    private void OnPlaybackStopped(IRenderSink sink, StoppedEventArgs e)
     {
         // Raised via SynchronizationContext.Post, so it can arrive after Stop dropped this output
         // or a later Start replaced it. Reporting then would describe the wrong session as dead.
         // Volatile for the same reason as the capture guard above.
-        if (!ReferenceEquals(sender, _output))
+        if (!ReferenceEquals(sink, _output))
         {
             return;
         }
@@ -328,8 +379,28 @@ public sealed class AudioRouter : IDisposable
 
             Log.Warn($"Tearing the route down: the {half} half stopped.");
             Stop();
+
+            // After Stop, and from here rather than from the handler that noticed the failure. Two
+            // separate reasons, and losing either one is a defect:
+            //
+            // After Stop, so a subscriber sees IsRunning false and cannot re-enter the teardown it is
+            // being told about. Raised before, a reconnect subscriber would be deciding what to do
+            // about a route that still claims to be running.
+            //
+            // From the posted lambda, so the subscriber runs on the dispatcher thread. Raised from
+            // OnPlaybackStopped it would run on NAudio's play thread, and a subscriber that stops or
+            // restarts the router from there reinstates in full the self-join this whole indirection
+            // exists to avoid - see the deadlock described above.
+            Stopped?.Invoke(this, EventArgs.Empty);
         });
     }
+
+    /// <summary>
+    /// Straight through to the factory, which is the whole point: the tray asks the router rather
+    /// than holding an <see cref="IAudioDeviceFactory"/> of its own, so no caller above this class
+    /// ever names a WASAPI type. See <see cref="IAudioRouter.ListOutputs"/>.
+    /// </summary>
+    public IReadOnlyList<AudioOutputDevice> ListOutputs() => _devices.ListOutputs();
 
     public void Stop()
     {
@@ -343,7 +414,8 @@ public sealed class AudioRouter : IDisposable
         if (_capture is not null)
         {
             _capture.DataAvailable -= OnDataAvailable;
-            _capture.RecordingStopped -= OnRecordingStopped;
+            _capture.RecordingStopped -= _onRecordingStopped;
+            _onRecordingStopped = null;
 
             // Already stopped, or the endpoint vanished with the connection.
             Teardown.Quietly(_capture.StopRecording, "stop capture");
@@ -355,7 +427,8 @@ public sealed class AudioRouter : IDisposable
         {
             // Before Dispose, which joins the play thread that raises it. A deliberate teardown is
             // not a failure, and reporting it as one would overwrite the real status.
-            _output.PlaybackStopped -= OnPlaybackStopped;
+            _output.PlaybackStopped -= _onPlaybackStopped;
+            _onPlaybackStopped = null;
 
             Teardown.Quietly(_output.Dispose, "dispose output");
             _output = null;

@@ -7,8 +7,16 @@ namespace Klangbruecke.Platform;
 /// Whether this process is running with MSIX package identity.
 ///
 /// The restricted capability <c>phoneLineTransportManagement</c> only applies with identity, so an
-/// unpackaged run cannot claim the hands-free role, and saying so quietly is what stops every
-/// development run sitting in a permanent error state retrying something that cannot succeed.
+/// unpackaged run cannot claim the hands-free role.
+///
+/// <b>That is currently said rather than acted on, and the difference matters.</b> This class's
+/// answer reaches two log lines in <c>Program.Main</c> and two menu labels -
+/// <see cref="Klangbruecke.Bluetooth.AudioSinkPolicy.MenuItem"/> and
+/// <see cref="CallsPolicy.MenuItem"/> - and nothing else. It does <em>not</em> reach
+/// <c>ConnectionManager</c>, which deliberately reads no process-wide static, so <b>an unpackaged run
+/// does sit in a permanent error state, retrying both halves at the 60 s ceiling for the life of the
+/// process.</b> This comment used to claim the opposite, and it was true while the tray held the
+/// connect path and gated it here. <see cref="CallsPolicy.ShouldEnumerate"/> carries the fix.
 ///
 /// Since the §8 finding this carries more than that: <c>AudioSinkPolicy</c> gates
 /// <c>AudioPlaybackConnection.TryCreateFromId</c> on this answer, and that call kills an unpackaged

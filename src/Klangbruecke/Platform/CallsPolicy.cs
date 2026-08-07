@@ -77,24 +77,78 @@ public static class CallsPolicy
     };
 
     /// <summary>
+    /// <b>NOTHING CALLS THIS OR <see cref="ShouldRegister"/> TODAY.</b> Read the next two paragraphs
+    /// before reading either of them as a description of what the app does.
+    ///
+    /// Their only call site was <c>TrayContext.ConnectCallsAsync</c>, and Task 17 moved the connect
+    /// path into <c>CallsHalf</c>, which asks neither. The consequence is not cosmetic and belongs
+    /// here rather than only in a report: <b>an unpackaged run now attempts <c>RegisterApp</c>, fails,
+    /// backs off and retries at the 60 s ceiling for the life of the process</b>, because
+    /// <see cref="ShouldRegister"/> is precisely the gate that used to stop it and nothing consults
+    /// it. <see cref="MenuItem"/> tells the <em>user</em> why; it does not gate the half.
+    ///
+    /// They are kept rather than deleted because they are the statement of the rule the fix needs, and
+    /// the fix is known: hand <see cref="Decide"/>'s verdict to <c>ConnectionManager</c>'s constructor
+    /// and fold <see cref="ShouldRegister"/> into <c>ApplySettingsToHalves</c>, so a structurally
+    /// unavailable half reports <c>Enabled == false</c> instead of counting down to an attempt that
+    /// cannot succeed. Deleting them would delete the rule and leave whoever does that work to
+    /// rediscover the asymmetry below from the probe notes. Their tests stay for the same reason: the
+    /// rule is still pinned, it is only unwired.
+    ///
+    /// <hr/>
+    ///
     /// Enumerate unless the user turned calls off, in which case looking is pure noise.
     ///
     /// Not the same question as <see cref="ShouldRegister"/>, and that is the point. Discovery -
     /// GetDeviceSelector, FindAllAsync, FromId, IsRegistered - was exercised against the real phone
     /// with no package identity and all of it worked; only RegisterApp, claiming the hands-free role,
-    /// needs the restricted phoneLineTransportManagement capability. So an unpackaged run still
-    /// enumerates and logs what it found.
+    /// needs the restricted phoneLineTransportManagement capability. So an unpackaged run should still
+    /// enumerate and log what it found.
     ///
     /// Worth a named rule rather than an inline condition: gating the whole block on
     /// <see cref="CallsAvailability.Enabled"/> is a one-line change back, it looks like a tidy-up, and
-    /// it costs every "dotnet run" the one calls-side fact it can establish - whether the phone's
+    /// it would cost every "dotnet run" the one calls-side fact it can establish - whether the phone's
     /// transport is discoverable at all - which the packaged build cannot be trusted to produce for
     /// the first time under a restricted capability.
     /// </summary>
     public static bool ShouldEnumerate(CallsAvailability availability) =>
         availability != CallsAvailability.DisabledBySetting;
 
-    /// <summary>Register and connect only when nothing structural is in the way.</summary>
+    /// <summary>
+    /// Register and connect only when nothing structural is in the way.
+    ///
+    /// <b>No caller today.</b> See <see cref="ShouldEnumerate"/> for what that costs and for what
+    /// would wire it back.
+    /// </summary>
     public static bool ShouldRegister(CallsAvailability availability) =>
         availability == CallsAvailability.Enabled;
+
+    /// <summary>
+    /// The tray's "Route calls to PC" item: what it says, whether it can be clicked, and whether it
+    /// reads as on.
+    ///
+    /// <b>Three values from one call, because the two ways of getting this wrong are combinations.</b>
+    /// An item that says "(needs MSIX)" and is still clickable invites a click that writes a setting
+    /// nothing can honour; an item that reads as ticked while no registration can ever succeed is the
+    /// shape this replaces - the user sees the switch as on, the calls half goes on retrying, and
+    /// nothing anywhere names the reason. Returned together, neither is representable.
+    ///
+    /// <b>Gated on package identity, deliberately not on <see cref="Decide"/>.</b> The verdict answers
+    /// <see cref="CallsAvailability.DisabledBySetting"/> the moment calls are switched off, so an item
+    /// disabled on that would disable itself on the click that turned it off - a switch with exactly
+    /// one use. The setting decides only the tick.
+    ///
+    /// The unpackaged text is the packaged one plus the reason, so the item stays recognisable as the
+    /// same switch rather than reading as two unrelated entries. "(needs MSIX)" and not
+    /// <see cref="Explain"/>: that runs to a couple of hundred characters, which is a menu entry
+    /// wider than the screen, and the log is where it belongs.
+    /// </summary>
+    public static (string Text, bool Enabled, bool Checked) MenuItem(bool isPackaged, bool enableCalls) =>
+        isPackaged
+            ? ("Route calls to PC", true, enableCalls)
+
+            // Unticked as well as disabled. The setting may well be true - it defaults to true and an
+            // unpackaged run never gets to change it - but the tick is the app's claim about what it
+            // is doing, and unpackaged it is doing nothing.
+            : ("Route calls to PC (needs MSIX)", false, false);
 }

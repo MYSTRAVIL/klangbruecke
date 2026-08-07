@@ -1,3 +1,4 @@
+using Klangbruecke.Connection;
 using Klangbruecke.Diagnostics;
 using Klangbruecke.Tests.Diagnostics;
 using Xunit;
@@ -208,5 +209,75 @@ public sealed class StatusPresenterTests
         string long_ = new('x', 500);
 
         Assert.Equal((LogLevel.Error, long_), LogOf(presenter => presenter.Show(long_, LogLevel.Error)));
+    }
+
+    // --- the state-first composition (Task 17) --------------------------------------------------
+    //
+    // The tooltip's first job is to answer "is it working?", and a component's last announcement
+    // cannot: "A2DP sink connected." is true for minutes after the phone has left the room. The
+    // connection's own state is the one thing that is always current, so it leads and the detail
+    // explains it.
+
+    [Fact]
+    public void Composes_state_then_detail()
+    {
+        StatusPresenter presenter = Presenter(new ImmediateUiDispatcher(), out List<string> written);
+
+        presenter.Show(ConnectionState.Connected, "waiting for phone audio");
+
+        Assert.Equal("Klangbruecke: Connected — waiting for phone audio", written[0]);
+    }
+
+    [Fact]
+    public void Caps_the_composed_state_and_detail_at_96_characters()
+    {
+        StatusPresenter presenter = Presenter(new ImmediateUiDispatcher(), out List<string> written);
+
+        presenter.Show(ConnectionState.RetryBackoff, new string('x', 200));
+
+        // The cap is on the whole tooltip, prefix and state name included - which is the bug the
+        // message-only path already had once: measuring one string and assigning another.
+        Assert.Equal(96, written[0].Length);
+        Assert.StartsWith("Klangbruecke: RetryBackoff — ", written[0]);
+        Assert.EndsWith("...", written[0]);
+    }
+
+    [Fact]
+    public void Logs_the_full_untruncated_state_and_detail()
+    {
+        string detail = new('x', 200);
+
+        // The log keeps what the tooltip drops, and it keeps the state with it: an entry that
+        // recorded only the detail would leave "retrying in 8s" in the file with nothing saying
+        // which half or which state it belonged to.
+        Assert.Equal(
+            (LogLevel.Info, $"RetryBackoff — {detail}"),
+            LogOf(presenter => presenter.Show(ConnectionState.RetryBackoff, detail)));
+    }
+
+    // What the menu's first item repeats. Without the state it would say "waiting for phone audio"
+    // on its own, which is the half of the sentence that cannot be read without the other half.
+    [Fact]
+    public void Last_carries_the_state_and_the_detail()
+    {
+        StatusPresenter presenter = Presenter(new ImmediateUiDispatcher(), out _);
+
+        presenter.Show(ConnectionState.Degraded, "calls are not running");
+
+        Assert.Equal("Degraded — calls are not running", presenter.Last);
+    }
+
+    [Fact]
+    public void Existing_message_only_behaviour_still_works()
+    {
+        StatusPresenter presenter = Presenter(new ImmediateUiDispatcher(), out List<string> written);
+
+        presenter.Show("A2DP sink connected.");
+        presenter.Show(new string('x', 500), LogLevel.Error);
+
+        // No state name and no dash: a component's own words still reach the tooltip exactly as they
+        // did before the overload above existed, and the cap still applies to them.
+        Assert.Equal("Klangbruecke: A2DP sink connected.", written[0]);
+        Assert.Equal(96, written[1].Length);
     }
 }
