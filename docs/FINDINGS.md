@@ -675,3 +675,30 @@ symptom (which direction is bad, and does the same headset sound fine elsewhere)
 mechanism. Both diagnostic scripts (`Measure-CallBandwidth.ps1`, `Watch-HfpAudio.ps1`) were built
 for the wrong hypothesis and could not have caught the real cause — one measures the good direction,
 the other reads endpoints that never go `Active` in the enumerator during a call.
+
+## 15. OPEN (Stage 2): call audio does not auto-route to the PC the way a headset does
+
+A plain Bluetooth headset (earbuds) paired to the phone gets call audio **automatically** — answer
+the call anywhere, on the phone screen or the earbud, and the audio follows the headset. The PC via
+Klangbruecke does **not**: the call reaches the PC only when it is *taken on the PC* (the
+incoming-call popup, or selecting the PC as the call device). Answered on the phone, the audio stays
+on the phone. The user wants the headset behaviour.
+
+**Phone-side settings are not the cause — they are already maxed.** Pixel 9, Device details for the
+PC (`MYSTRATOWER`, `14:AC:60:8B:21:5E`, 2026-08-07): *Phone calls* on, *Media audio* on, *Audio
+device type* set to **Headphones** (overriding the Computer class), contacts/call-history access on.
+Auto-route still does not happen. So it is neither the call-audio toggle nor, as far as the phone UI
+lets us influence, the device-class heuristic.
+
+**Working inference (not proven):** the `PhoneLineTransportDevice` path the app registers on is an
+*opt-in* call transport — the phone presents the PC as "take the call here", rather than putting it
+on the native auto-route path a headset sits on. The remaining lever is app-side: whether
+`Windows.ApplicationModel.Calls` (`PhoneLine` / `PhoneCall`) exposes a way to **pull** an active
+call's audio onto this transport programmatically — the software equivalent of the earbud
+audio-transfer. If it does, the app could auto-route on an incoming/active call and match the headset
+UX; if it does not, this is a limit of the transport, not a bug.
+
+**Stage 2 spike:** enumerate the `PhoneLine` / `PhoneCall` surface for an accept / route / transfer
+method; and check what Sefirah and MyPhone do with the same transport — they will have hit this exact
+wall and either solved it or documented it. Do not confuse this with `HANDOFF.md` item 4 (tray
+selection of the *PC-side* output device via `IPolicyConfig`) — that is the opposite direction.
