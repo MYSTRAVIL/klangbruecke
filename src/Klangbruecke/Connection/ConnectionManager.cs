@@ -7,9 +7,9 @@ using Klangbruecke.Platform;
 namespace Klangbruecke.Connection;
 
 /// <summary>
-/// The one object that owns the connection lifecycle: intent, wiring, and the three timings that
-/// make an unattended recovery possible - the 3 s grace window, the 30 s reconcile, and the 5 s
-/// settle after a resume.
+/// The one object that owns the connection lifecycle: intent, wiring, and the timings that make an
+/// unattended recovery possible. It delegates the 3 s grace window to <see cref="GraceWindow"/> and
+/// the 30 s reconcile to <see cref="Reconciler"/>, and owns the 5 s settle after a resume.
 ///
 /// <b>It assembles rather than decides.</b> Everything that could be a state machine already is one:
 /// <see cref="LinkMachine"/> answers "is the phone there", <see cref="SuppressionLatch"/> remembers
@@ -28,15 +28,16 @@ namespace Klangbruecke.Connection;
 /// <see cref="_endpointProbe"/> - because the thing they guard is deliberately <em>not</em> on this
 /// thread.
 ///
-/// <b>Never add <c>ConfigureAwait(false)</c> to anything in here or in the two halves.</b> It reads
-/// like a tidy-up and it is the one token that takes the whole design apart: four machines that hold
-/// no lock start sharing state across threads. Which thread it leaks onto depends on the await, and
-/// both cases are real - the five that await a seam resume <em>on the answering thread</em>, because
-/// a radio's own thread carries no <c>SynchronizationContext</c> and the runtime inlines there; the
-/// nine that await one of our own methods resume <em>on the threadpool</em>, because the runtime
-/// refuses to inline while a custom context is installed, which is always the case on the UI thread.
+/// <b>Never add <c>ConfigureAwait(false)</c> to anything in here, in the two seams, or in the two
+/// halves.</b> It reads like a tidy-up and it is the one token that takes the whole design apart:
+/// four machines that hold no lock start sharing state across threads. Which thread it leaks onto
+/// depends on the await, and both cases are real - the five that await a seam resume <em>on the
+/// answering thread</em>, because a radio's own thread carries no <c>SynchronizationContext</c> and
+/// the runtime inlines there; the nine that await one of our own methods resume <em>on the
+/// threadpool</em>, because the runtime refuses to inline while a custom context is installed, which
+/// is always the case on the UI thread.
 ///
-/// Eleven of the fourteen awaits in these three classes have a named test that goes red for that site
+/// Eleven of the fourteen awaits in these five classes have a named test that goes red for that site
 /// alone; the eight tests are in <c>ConnectionManagerTests</c> under "the captured context", which maps
 /// every site to its test and names the three it cannot cover and why. Do not read the prohibition as
 /// covered by one test, and do not read an aggregate mutant as covering the sites inside it: earlier
@@ -50,47 +51,13 @@ namespace Klangbruecke.Connection;
 /// constructor and gates both halves on it in <see cref="ApplySettingsToHalves"/>, so an unpackaged
 /// run reports both halves disabled instead of retrying what it cannot do.
 /// </summary>
-public sealed class ConnectionManager : IDisposable
+public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 {
-    /// <summary>
-    /// How long to wait before believing a closed audio connection.
-    ///
-    /// The connection closing is the same event for two opposite causes: the phone dropped the audio
-    /// profile deliberately (the ACL link stays up, and reconnecting would fight the user), or the
-    /// phone left the room. Three seconds is long enough for the radio to settle and short enough
-    /// that a real range exit is not left looking connected - and, more to the point, it is what
-    /// keeps a one-second dropout from flapping the tray, because nothing is decided until it
-    /// elapses.
-    /// </summary>
-    private static readonly TimeSpan GraceWindow = TimeSpan.FromSeconds(3);
-
-    /// <summary>
-    /// The drift correction. Level-triggered, because the events that should have told us are exactly
-    /// the ones that go missing across sleep and resume - and an edge that never arrives is what
-    /// leaves an app wrong forever, which is the predecessor app's defining bug and the reason this
-    /// project exists.
-    /// </summary>
-    private static readonly TimeSpan ReconcilePeriod = TimeSpan.FromSeconds(30);
-
     /// <summary>
     /// How long after a resume to wait before looking. The Bluetooth stack is not back at the moment
     /// the notification fires, so an immediate attempt only burns the first backoff step for nothing.
     /// </summary>
     private static readonly TimeSpan ResumeSettle = TimeSpan.FromSeconds(5);
-
-    /// <summary>
-    /// How long a pass may be running before the next one stops deferring to it.
-    /// </summary>
-    /// <remarks>
-    /// Deliberately shorter than <see cref="ReconcilePeriod"/> rather than equal to it. A pass starts
-    /// a hair <em>after</em> the tick that launched it, so with the two the same the tick one period
-    /// later would find the wedged pass a few microseconds short of the threshold and defer as well -
-    /// recovery would cost two periods instead of one, on the real timer, and never in a test where
-    /// virtual time lands exactly on the boundary. Five seconds of margin, on the same reasoning as
-    /// the resume settle: long enough that a slow-but-live read is not abandoned, short enough that
-    /// the tick that finds it does not have to be punctual.
-    /// </remarks>
-    private static readonly TimeSpan ReconcileStall = TimeSpan.FromSeconds(25);
 
     private readonly Settings _settings;
     private readonly IAudioSinkService _sink;
@@ -117,39 +84,13 @@ public sealed class ConnectionManager : IDisposable
     private readonly EndpointPresenceCache _presence = new();
     private readonly MusicHalf _music;
     private readonly CallsHalf _calls;
+    private readonly GraceWindow _graceWindow;
+    private readonly Reconciler _reconciler;
 
-    private IDisposable? _reconcileTimer;
-    private IDisposable? _graceTimer;
     private IDisposable? _resumeTimer;
-
-    /// <summary>
-    /// Bumped by every grace window that is armed, and read - never written - by the window that
-    /// finally answers. The same shape the halves spell <c>_generation</c>, and here for the same
-    /// reason: what crosses the await is a stale answer, not a data race.
-    /// </summary>
-    private int _graceGeneration;
 
     private bool _started;
     private bool _disposed;
-
-    /// <summary>
-    /// When the pass currently running started, or null when none is.
-    ///
-    /// A pass has five awaits in it and the link read is a real round trip to a radio, so a forced
-    /// pass - a phone picked, a resume, the setting coming back on - can land on top of the periodic
-    /// one. Two interleaved passes would each decide against a link status the other is still acting
-    /// on, and both would open a grace window against the same closed connection.
-    ///
-    /// A time rather than a bool, and the difference is the whole reason this app exists. A read that
-    /// never completes would leave a bool set for the life of the process and silently stop the only
-    /// backstop the app has - an app that is wrong forever with nothing to correct it, which is the
-    /// predecessor's defining bug rebuilt out of a mutex. A pass still running after
-    /// <see cref="ReconcileStall"/> has stopped being one to defer to.
-    ///
-    /// Deferring is only half the invariant; the abandoned pass must also stop acting when it finally
-    /// answers. See <see cref="Superseded"/>.
-    /// </summary>
-    private DateTimeOffset? _reconcilingSince;
 
     /// <summary>
     /// The user picked a phone and what they picked is not yet delivering.
@@ -236,6 +177,8 @@ public sealed class ConnectionManager : IDisposable
         // The cache, not the monitor. See EndpointPresenceCache for the 282 ms this is about.
         _music = new MusicHalf(sink, router, _presence, scheduler);
         _calls = new CallsHalf(calls, scheduler);
+        _graceWindow = new GraceWindow(_scheduler, _linkMonitor, _linkMachine, _latch, _music, this);
+        _reconciler = new Reconciler(_scheduler, _linkMonitor, _sink, _linkMachine, _latch, _music, _calls, _graceWindow, this);
 
         Refresh();
     }
@@ -267,7 +210,7 @@ public sealed class ConnectionManager : IDisposable
     ///
     /// <b>And only on a change.</b> <see cref="Publish"/> runs at the end of every completed reconcile
     /// pass, so an unconditional report would be one identical log entry every 30 s for the life of
-    /// the process - the same arithmetic <see cref="ReportDrift"/> refuses.
+    /// the process - the same arithmetic the reconcile refuses.
     ///
     /// No argument, unlike <see cref="StateChanged"/>: a subscriber that wants the phrase reads
     /// <see cref="Detail"/> beside <see cref="State"/>, which is the only way to get both halves of
@@ -326,7 +269,7 @@ public sealed class ConnectionManager : IDisposable
         // still Active after the process was killed (docs/FINDINGS.md section 4).
         _endpoints.Start();
 
-        _reconcileTimer = _scheduler.SchedulePeriodic(ReconcilePeriod, () => _ = ReconcileAsync("tick"));
+        _reconciler.Start();
 
         Publish();
     }
@@ -371,7 +314,7 @@ public sealed class ConnectionManager : IDisposable
 
         _latch.OnPhoneSelectionChanged();
         _clickGrant = ClickGrant.Phone;
-        CancelGraceWindow();
+        _graceWindow.Cancel();
 
         if (phoneChanged)
         {
@@ -390,7 +333,7 @@ public sealed class ConnectionManager : IDisposable
         // Through the reconcile rather than straight into a connect: the phone's presence is a
         // question only the radio can answer, the pass already asks it, and routing this through the
         // same five checks as everything else is what keeps one connect path in the class.
-        _ = ReconcileAsync("phone selected", userAsked: true);
+        _ = _reconciler.RunAsync("phone selected", userAsked: true);
 
         // The repaint this click owes the tray, because the pass above cannot be relied on for it: a
         // pass that started under ReconcileStall ago returns at the defer check without publishing,
@@ -426,7 +369,7 @@ public sealed class ConnectionManager : IDisposable
 
         _latch.OnPhoneSelectionChanged();
         _clickGrant = ClickGrant.None;
-        CancelGraceWindow();
+        _graceWindow.Cancel();
 
         _calls.OnPhoneDeselected();
         ApplySettingsToHalves();
@@ -525,7 +468,7 @@ public sealed class ConnectionManager : IDisposable
             // Straight into a pass rather than waiting for the next tick. The user has just said
             // "come back"; a switch that appears to do nothing for half a minute is one they turn off
             // again before it has had a chance to work.
-            _ = ReconcileAsync("auto-reconnect on");
+            _ = _reconciler.RunAsync("auto-reconnect on");
             return;
         }
 
@@ -571,10 +514,8 @@ public sealed class ConnectionManager : IDisposable
             _calls.Changed -= OnHalfChanged;
         }
 
-        _reconcileTimer?.Dispose();
-        _reconcileTimer = null;
-        _graceTimer?.Dispose();
-        _graceTimer = null;
+        _reconciler.Dispose();
+        _graceWindow.Dispose();
         _resumeTimer?.Dispose();
         _resumeTimer = null;
 
@@ -636,7 +577,7 @@ public sealed class ConnectionManager : IDisposable
     {
         if (state == AudioSinkConnectionState.Closed)
         {
-            OnConnectionClosed();
+            _graceWindow.OnConnectionClosed();
             return;
         }
 
@@ -658,7 +599,7 @@ public sealed class ConnectionManager : IDisposable
         _resumeTimer = _scheduler.Schedule(ResumeSettle, () =>
         {
             _resumeTimer = null;
-            _ = ReconcileAsync("resume");
+            _ = _reconciler.RunAsync("resume");
         });
     });
 
@@ -688,362 +629,6 @@ public sealed class ConnectionManager : IDisposable
         }
 
         _ = Task.Run(ProbeEndpointLevel);
-    }
-
-    // --- the grace window -----------------------------------------------------------------------
-
-    /// <summary>
-    /// The audio connection reported Closed - or the reconcile found it gone without one.
-    ///
-    /// Nothing is decided here. The half drops its route, because there is nothing to route, and
-    /// keeps everything else: which of the two causes this was is a question only a link status read
-    /// can answer, and asking it immediately gets the wrong answer for a radio that has not settled.
-    /// </summary>
-    private void OnConnectionClosed()
-    {
-        _music.OnConnectionClosed();
-
-        if (_graceTimer is null)
-        {
-            // One window at a time. A connection that reports Closed twice, or a reconcile that finds
-            // it gone on two ticks running, would otherwise arm two windows that each read the link
-            // and decide again.
-            //
-            // "At a time" only covers the wait, though. The handle is dropped the moment the window
-            // fires, so a second Closed arriving while the first window's link read is still
-            // outstanding arms a second window on top of it - which is why the generation is taken
-            // here, at the moment the question is asked.
-            int generation = ++_graceGeneration;
-
-            _graceTimer = _scheduler.Schedule(GraceWindow, () =>
-            {
-                _graceTimer = null;
-                _ = OnGraceWindowElapsedAsync(generation);
-            });
-        }
-
-        Publish();
-    }
-
-    private async Task OnGraceWindowElapsedAsync(int generation)
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        BluetoothLinkStatus status = await _linkMonitor.ReadLinkStatusAsync();
-
-        if (Superseded(generation))
-        {
-            // A newer Closed has asked the same question since, and this answer predates it. Acting
-            // on it is worse here than anywhere else in the class: this is the one read that decides
-            // deliberate-versus-out-of-range, so a stale one either latches a suppression nobody
-            // asked for - the app then sitting next to a phone it refuses to reconnect to, which is
-            // the predecessor's defining bug reached from a new direction - or records an absence
-            // that expires a suppression the user did ask for.
-            return;
-        }
-
-        if (status == BluetoothLinkStatus.Connected)
-        {
-            // The ACL link is alive and only the audio profile went, which is what the phone dropping
-            // this PC looks like. Reconnecting would fight the user, once every backoff step, for as
-            // long as they left the phone in the room.
-            Log.Info("The audio connection closed with the Bluetooth link still up: treating it as deliberate.");
-            SuppressDeliberately("The phone dropped the audio connection.");
-        }
-        else
-        {
-            // Disconnected, or a read that could not answer - and Unknown belongs here rather than
-            // with the branch above for the same reason LinkMachine collapses it to Absent: guessing
-            // the link is up leaves the app dormant next to a phone that walked out of the building.
-            Log.Info("The audio connection closed and the phone is not reachable: treating it as a range exit.");
-
-            // Immediately, not through the poll debounce. That debounce exists because one failed
-            // read is indistinguishable from the phone leaving; here two independent observations
-            // agree, which is the definite kind - the same kind as a watcher removal.
-            _linkMachine.OnDeviceRemoved();
-            _latch.OnLinkState(_linkMachine.State);
-
-            _music.OnLinkAbsent();
-            Report("The phone is out of range.");
-        }
-
-        EnforceConnectPermission();
-        Publish();
-    }
-
-    // --- the reconcile: the spec's five checks, in order -----------------------------------------
-
-    /// <param name="userAsked">
-    /// True when this pass descends from the user naming a phone. It changes exactly one thing -
-    /// check 2 - and see there for why.
-    /// </param>
-    private async Task ReconcileAsync(string trigger, bool userAsked = false)
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        if (_reconcilingSince is { } running && _scheduler.Now - running < ReconcileStall)
-        {
-            return;
-        }
-
-        DateTimeOffset startedAt = _scheduler.Now;
-        _reconcilingSince = startedAt;
-
-        try
-        {
-            // Three things in this method outlive an await on purpose, and they are the only three:
-            // this snapshot, whose whole job is to be from before; startedAt, which is the token the
-            // supersession check compares against; and the trigger string, which is a constant.
-            // Everything else - permission most of all - is read at the point it is used. See the
-            // note on ConnectHalvesAsync's first await for what a hoisted permission flag costs.
-            Drift before = TakeDrift();
-
-            // 1. The link, level-triggered. This is the backstop for a watcher edge that never
-            // arrived, which is what sleep and resume do to WinRT device events.
-            BluetoothLinkStatus status = await _linkMonitor.ReadLinkStatusAsync();
-
-            if (Superseded(startedAt))
-            {
-                // The answer is older than the pass that replaced this one, and a link status from
-                // 45 s ago is not a correction - it is drift, arriving in the machine whose job is to
-                // remove it.
-                return;
-            }
-
-            bool linkMoved = _linkMachine.OnLinkStatusRead(status);
-            _latch.OnLinkState(_linkMachine.State);
-
-            if (linkMoved && _linkMachine.State == LinkState.Absent)
-            {
-                // The backstop actually reaching the half it exists for. This poll is the only thing
-                // that ever notices a range exit whose watcher edge never arrived, and until it said
-                // so the music half went on believing in a phone that had left: measured in the
-                // packaged 0.2.0.0 run, where a false watcher Added put the half in Backoff, the poll
-                // corrected the link on its second tick, and the half went on opening the radio every
-                // 60 s while the tray read Discovering. Worse than the wasted attempts is what
-                // happens when the phone returns - OnLinkPresentAsync acts only from Off, so the
-                // watcher's Added edge is refused and recovery waits on a 60 s retry that is never
-                // reset without a success. That is the range-exit-and-return path, which is the
-                // predecessor app's defining bug.
-                //
-                // <b>Edge-triggered, off the value LinkMachine already returns, and never
-                // level-triggered.</b> The state alone is Absent on every tick for as long as the
-                // phone is away, and a teardown on each of them bumps MusicHalf._generation and
-                // cancels whatever the half had armed. That is not hypothetical: re-picking the same
-                // phone resets the link machine to Absent while MusicHalf.Configure deliberately
-                // leaves a half on the same phone alone, so the countdown the click just granted
-                // sits under ticks that have nothing to report - see
-                // A_poll_that_moves_nothing_does_not_stand_a_backing_off_half_down.
-                //
-                // The flag is also what keeps the poll debounce intact: MoveTo answers false for
-                // Absent -> Absent and OnLinkStatusRead answers false from NoPhone, so this is
-                // reachable only from Present, which is the one transition the debounce guards.
-                //
-                // Music only, for the reason OnDeviceRemoved gives: registration is not link-scoped.
-                _music.OnLinkAbsent();
-            }
-
-            // After the teardown, so a half that has just gone Off does not pay for a 282 ms probe it
-            // cannot act on.
-            RefreshEndpointLevel();
-
-            // 2. A consistency check between two seams - and deliberately not described as more than
-            // that any more.
-            //
-            // It was written for "the connection object can go away without ever reporting Closed,
-            // across a suspend most of all". <b>It cannot see that case</b>, and the honest version of
-            // the comment is worth more than the reassuring one. <c>AudioSinkService.IsConnected</c>
-            // answers from two fields that only this app writes - the connection reference and the
-            // connected id - and a WinRT object killed underneath them leaves both set. The one
-            // in-process caller that clears them is <c>MusicHalf.TearDown</c>, which lands on
-            // <see cref="MusicState.Off"/> in the same call, so with the shipping sink this condition
-            // is not reachable at all. Task 17 removed the last caller that could reach it: the tray's
-            // own Disconnect, which stopped the sink without telling the half.
-            //
-            // It stays, as the seam guard it actually is. <see cref="IAudioSinkService"/> is an
-            // interface, and an implementation whose IsConnected tracked the connection rather than
-            // this app's bookkeeping would make this live again - which is the direction to fix it in
-            // if the suspend case is ever measured. That fix needs a guarded tri-state in the shape of
-            // <c>ICallTransportService.ReadRegistration</c>, never a bool: reading the live WinRT
-            // State is an ABI call that can throw or fail to answer, and "could not tell" read as
-            // "gone" tears down a working connection. What does back the suspend case up today is the
-            // link status read above and the endpoint level below.
-            //
-            // The premise is pinned by
-            // MusicHalfTests.Linked_and_Up_are_only_ever_held_over_a_connected_sink.
-            if (!_sink.IsConnected && _music.State is MusicState.Linked or MusicState.Up)
-            {
-                if (userAsked)
-                {
-                    // The user has just named this phone, so there is nothing here to adjudicate: a
-                    // half that still believes in a connection the sink no longer has is stale, not
-                    // ambiguous. Opening a window would answer "the link is up, so the audio profile
-                    // was dropped deliberately" and suppress the app three seconds after the click -
-                    // and SelectPhone cancelling the previous window is what made that reachable.
-                    //
-                    // OnSuppressed is the teardown, not a claim about why: the half offers no
-                    // "start again" input, and every other route out of Linked in this class ends at
-                    // the same call. Standing it down here is what lets the link-present report below
-                    // reconnect it inside this same pass, which is what the click asked for.
-                    _music.OnSuppressed();
-                }
-                else
-                {
-                    OnConnectionClosed();
-
-                    // Nothing else this pass. What just opened is a question with a 3 s answer, and
-                    // correcting the halves against a connection that is already gone would start a
-                    // route over it in the meantime.
-                    ReportDrift(before, trigger);
-                    return;
-                }
-            }
-
-            // 3, 4 and 5 - the capture endpoint, the route, and the registration - are each discharged
-            // inside the half that owns them. Reading any of them here would be a second opinion that
-            // could disagree with the machine acting on it.
-            //
-            // Permission is read per half and never hoisted into a local above these awaits. The
-            // first of them can be a real ConnectAsync round trip to a radio, and the tray's
-            // Disconnect during it sets the latch - which StillOurs cannot see, because nothing on
-            // the Disconnect path touches _reconcilingSince, and which EnforceConnectPermission below
-            // cannot repair, because it stands down only when the latch is *not* set. A hoisted flag
-            // therefore claims the hands-free role seconds after the user disconnected, while the
-            // tray reports Suppressed.
-            if (!await StillOurs(_music.ReconcileAsync(ConnectPermitted), startedAt))
-            {
-                return;
-            }
-
-            if (!await StillOurs(_calls.ReconcileAsync(ConnectPermitted), startedAt))
-            {
-                return;
-            }
-
-            if (_linkMachine.State == LinkState.Present)
-            {
-                // Level-triggered, like everything else in the pass: both halves ignore this unless
-                // they are Off, so saying it every 30 s costs nothing and saying it never is how an
-                // app that missed one edge stays down for the rest of the session.
-                if (!await StillOurs(_music.OnLinkPresentAsync(ConnectPermitted), startedAt))
-                {
-                    return;
-                }
-
-                // The last await in the pass, so everything after it is the tail - which is why no
-                // test can catch a ConfigureAwait(false) here. See the map in ConnectionManagerTests
-                // under "the captured context"; the prohibition still applies, it just has no tripwire.
-                if (!await StillOurs(_calls.OnLinkPresentAsync(ConnectPermitted), startedAt))
-                {
-                    return;
-                }
-            }
-
-            EnforceConnectPermission();
-            ReportDrift(before, trigger);
-
-            // Deliberately no timeout on a half stuck in Connecting or Registering, and CallsHalf's
-            // note about "a reconcile-side timeout question" is answered here: no. The only lever
-            // this class has is a teardown, and a teardown disposes the WinRT connection object
-            // underneath an OpenAsync that has not returned - which is the class of call that takes
-            // the process out rather than failing (FINDINGS.md section 8). Both seams' shipping
-            // implementations catch their own throws and always complete, so "never completes" means
-            // the radio stack is wedged, and the honest report for that is a tray that goes on saying
-            // "connecting music" - visible, diagnosable, and not a crash.
-        }
-        finally
-        {
-            if (_reconcilingSince == startedAt)
-            {
-                // Only if it is still ours. A pass that was given up on and has now finally answered
-                // must not clear the marker of the one that replaced it - the same reason the halves
-                // capture a generation before their own awaits.
-                _reconcilingSince = null;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Has this pass been given up on and replaced?
-    ///
-    /// Asked after every await, and it is the same guard the halves spell <c>_generation</c>: what
-    /// crosses an await is not a data race - the whole class is one thread - but a stale
-    /// <em>answer</em>. Holding the marker is only half of it. A pass whose link read finally returns
-    /// 45 s late would otherwise write that status into the link machine, feed it to the latch and
-    /// run both halves against a state its replacement is halfway through establishing, which is
-    /// exactly the interleaving <see cref="_reconcilingSince"/> exists to prevent.
-    /// </summary>
-    private bool Superseded(DateTimeOffset startedAt) => _disposed || _reconcilingSince != startedAt;
-
-    /// <summary>
-    /// The same question for the grace window, which awaits the same radio and has the same hole
-    /// without it. Two overloads rather than two differently-named checks, so the two paths read
-    /// alike at the call site.
-    ///
-    /// A generation rather than a timestamp, because the two guards are answering different
-    /// questions. The reconcile also needs to know when to <em>stop waiting</em> for a pass that has
-    /// wedged - hence a time it can compare against. A window needs no such rule: it is superseded by
-    /// events, and there are exactly two - another window being armed, which happens whenever the
-    /// connection reports Closed again, and the phone selection changing, which voids the question
-    /// rather than re-asking it. See <see cref="CancelGraceWindow"/> for the second.
-    /// </summary>
-    private bool Superseded(int graceGeneration) => _disposed || _graceGeneration != graceGeneration;
-
-    /// <summary>
-    /// Awaits one step of a pass and answers whether the pass is still the current one.
-    ///
-    /// A helper rather than the check written out four times, for the reason
-    /// <c>MusicHalf.StartRouteIfDue</c> is the one place a route is started: written out, a fifth
-    /// awaited step could be added and the guard forgotten, and the two arms would agree on every
-    /// input the suite can produce - so neither could be broken without the other covering for it.
-    /// Every await inside a pass except the link read, which has a value to hand back, goes through
-    /// here.
-    /// </summary>
-    private async Task<bool> StillOurs(Task step, DateTimeOffset startedAt)
-    {
-        await step;
-
-        return !Superseded(startedAt);
-    }
-
-    /// <summary>
-    /// Everything a pass can correct, in one value, so that "did this tick change anything?" is one
-    /// comparison rather than five conditionals that can each forget to report.
-    /// </summary>
-    private readonly record struct Drift(
-        LinkState Link,
-        MusicState Music,
-        CallsState Calls,
-        SuppressionReason Suppression);
-
-    private Drift TakeDrift() => new(_linkMachine.State, _music.State, _calls.State, _latch.Reason);
-
-    /// <summary>
-    /// One line, and only when something moved.
-    ///
-    /// At 30 s an unconditional line is 2,880 entries a day, every one of them synchronous file I/O
-    /// under a lock on the UI thread - and a log where nothing stands out is one nobody reads when
-    /// the reconnect they are hunting finally fails.
-    /// </summary>
-    private void ReportDrift(Drift before, string trigger)
-    {
-        Drift after = TakeDrift();
-
-        if (after != before)
-        {
-            Log.Info(
-                $"Reconcile ({trigger}) corrected drift: link {before.Link}->{after.Link}, "
-                + $"music {before.Music}->{after.Music}, calls {before.Calls}->{after.Calls}, "
-                + $"suppression {before.Suppression}->{after.Suppression}.");
-        }
-
-        Publish();
     }
 
     // --- connect permission ---------------------------------------------------------------------
@@ -1102,26 +687,6 @@ public sealed class ConnectionManager : IDisposable
         {
             _latch.SuppressAutoReconnectOff();
         }
-    }
-
-    /// <summary>
-    /// Voids an outstanding grace window, because the question it is going to answer is about a phone
-    /// the user has just changed their mind about.
-    ///
-    /// Both halves matter. Bumping the generation alone would leave the armed timer standing, and
-    /// <see cref="OnConnectionClosed"/> declines to arm a window while one is armed - so the next
-    /// Closed would get no window at all. Disposing alone would leave a window that has already fired
-    /// and is waiting on its read free to come back and decide.
-    ///
-    /// The decision it would otherwise reach is not harmless: a window that opened before the
-    /// selection and answers Connected afterwards calls <see cref="SuppressDeliberately"/>, which
-    /// latches, drops the grant and tears down both halves - defeating the click the user just made.
-    /// </summary>
-    private void CancelGraceWindow()
-    {
-        _graceTimer?.Dispose();
-        _graceTimer = null;
-        _graceGeneration++;
     }
 
     private void SuppressDeliberately(string status)
@@ -1491,4 +1056,14 @@ public sealed class ConnectionManager : IDisposable
 
         action();
     });
+
+    // --- the coordinator the two timing seams reach back through ---------------------------------
+
+    bool IConnectionCoordinator.IsDisposed => _disposed;
+    bool IConnectionCoordinator.ConnectPermitted => ConnectPermitted;
+    void IConnectionCoordinator.RefreshEndpointLevel() => RefreshEndpointLevel();
+    void IConnectionCoordinator.EnforceConnectPermission() => EnforceConnectPermission();
+    void IConnectionCoordinator.Publish() => Publish();
+    void IConnectionCoordinator.SuppressDeliberately(string status) => SuppressDeliberately(status);
+    void IConnectionCoordinator.Report(string message) => Report(message);
 }

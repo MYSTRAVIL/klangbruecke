@@ -1462,7 +1462,7 @@ public sealed class ConnectionManagerTests : IDisposable
     // an await on an already-completed task runs its continuation inline whether the context was
     // captured or not.
     //
-    // <b>There are fourteen awaits across the three classes. The eight tests below cover eleven of
+    // <b>There are fourteen awaits across the five classes. The eight tests below cover eleven of
     // them, one site each, and the remaining three are named at the bottom with the reason.</b> The
     // map is written out and kept honest because a prohibition that names a test has to be checkable -
     // an earlier version of this section claimed twelve on the strength of one aggregate mutant, and
@@ -1470,20 +1470,20 @@ public sealed class ConnectionManagerTests : IDisposable
     //
     // Five await a seam - a task some other thread completes - and get a test each:
     //
-    //   ConnectionManager.ReconcileAsync            _linkMonitor.ReadLinkStatusAsync()   test 1
-    //   ConnectionManager.OnGraceWindowElapsedAsync _linkMonitor.ReadLinkStatusAsync()   test 2
-    //   MusicHalf.ConnectAsync                      _sink.ConnectAsync(deviceId)         test 3
-    //   CallsHalf.RegisterAsync                     _calls.FindTransportsAsync()         test 4
-    //   CallsHalf.RegisterAsync                     _calls.ConnectAsync(transport.Id)    test 5
+    //   Reconciler.RunAsync            _linkMonitor.ReadLinkStatusAsync()   test 1
+    //   GraceWindow.OnElapsedAsync     _linkMonitor.ReadLinkStatusAsync()   test 2
+    //   MusicHalf.ConnectAsync         _sink.ConnectAsync(deviceId)         test 3
+    //   CallsHalf.RegisterAsync        _calls.FindTransportsAsync()         test 4
+    //   CallsHalf.RegisterAsync        _calls.ConnectAsync(transport.Id)    test 5
     //
     // Six more await a Task one of our own async methods produced:
     //
-    //   MusicHalf.OnLinkPresentAsync   await ConnectAsync()                              test 3
-    //   ConnectHalvesAsync             first await (_music.OnLinkPresentAsync)           test 3
-    //   StillOurs                      await step                                        test 6
-    //   ReconcileAsync                 await StillOurs(_music.OnLinkPresentAsync ...)     test 6
-    //   ReconcileAsync                 await StillOurs(_music.ReconcileAsync ...)         test 7
-    //   ReconcileAsync                 await StillOurs(_calls.ReconcileAsync ...)         test 8
+    //   MusicHalf.OnLinkPresentAsync   await ConnectAsync()                                test 3
+    //   ConnectHalvesAsync             first await (_music.OnLinkPresentAsync)             test 3
+    //   Reconciler.StillOurs           await step                                          test 6
+    //   Reconciler.RunAsync            await StillOurs(_music.OnLinkPresentAsync ...)       test 6
+    //   Reconciler.RunAsync            await StillOurs(_music.ReconcileAsync ...)           test 7
+    //   Reconciler.RunAsync            await StillOurs(_calls.ReconcileAsync ...)           test 8
     //
     // <b>This was nearly got wrong in the obvious direction.</b> The intuition is that an inner await
     // returns to this thread first, so an outer one is awaiting a task that completes here and resumes
@@ -1499,7 +1499,7 @@ public sealed class ConnectionManagerTests : IDisposable
     // threadpool and changes nothing any assertion can reach. Tests 7 and 8 both had to be rebuilt for
     // this - the first versions parked correctly, passed, and killed nothing.
     //
-    // <b>The three no test can cover, named rather than glossed:</b> ReconcileAsync's fourth
+    // <b>The three no test can cover, named rather than glossed:</b> Reconciler.RunAsync's fourth
     // `await StillOurs(_calls.OnLinkPresentAsync ...)`, ConnectHalvesAsync's second await, and
     // RegisterCallsAsync's. Each is the last await in its turn, so its whole continuation is that
     // turn's tail - EnforceConnectPermission plus a Publish that recomputes from scratch, both
