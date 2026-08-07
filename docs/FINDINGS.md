@@ -612,7 +612,7 @@ accepts the package and its declared capabilities; the API rejects the call at r
   calls work on this machine — but via Thy Phone, a **Store-signed** app, which is precisely the
   difference this failure points at.
 
-## 13. A live call tears down the A2DP route, and nothing brings it back
+## 13. RESOLVED in Stage 1: a live call tears down the A2DP route; the ConnectionManager brings it back
 
 Expected Bluetooth behaviour, recorded because it looks like a bug in the log and is not:
 
@@ -629,7 +629,49 @@ The teardown is correct and is the fix from Stage 0 Task 5 working in production
 holding the endpoint open. That defect was found by a live hardware probe after surviving three
 review rounds, and this log line is it doing its job.
 
-**But nothing restarts the route after the call ends.** The user must re-pick the phone from the
-tray. That is the reconnect gap, and it belongs to the `ConnectionManager` state machine in
-`docs/superpowers/specs/2026-08-04-connection-lifecycle-design.md`. It is arguably the single most
-valuable thing Stage 1 adds: without it, one phone call silently costs you the music bridge.
+**Stage 1 closes this.** The `ConnectionManager` plus the `EndpointMonitor` (`IMMNotificationClient`)
+restart the route when the A2DP capture endpoint reappears — no tray interaction. Confirmed working
+by the user on hardware 2026-08-07 (music comes back after a call), and the log independently shows
+the driving mechanism: after a connect where the endpoint was absent (`Present at subscribe time:
+False`), `EndpointMonitor` caught its arrival as `Audio endpoint notification: DeviceStateChanged …
+state=Active` ~74 s later and started the route automatically. That was the single most valuable
+thing Stage 1 had to add, and it does it.
+
+## 14. Stage 1 validation: reconnect works on hardware, and two environment traps
+
+Verified 2026-08-07 with the packaged build (`0.2.0.0`, MSIX, sideloaded), phone `MYSTRAPIX9`, on
+the branch `stage-1-connection-manager` (19 tasks, 4244 tests, final whole-branch review clean).
+
+**Both halves, and the reconnect that is the point of Stage 1:**
+
+- **Music** — A2DP sink connects and routes. Critically, the `EndpointMonitor` restarts the route
+  when the capture endpoint appears *late*: the log shows a connect with `Present at subscribe time:
+  False`, then `DeviceStateChanged … state=Active` ~74 s later, then the route starting on its own
+  (§13). This is the finding-#2 fix — before Stage 1, the app looked once, found nothing, and
+  silently never routed. The arriving callback is `DeviceStateChanged`, previously unmeasured.
+- **Calls** — hands-free role claimed. Notably `PhoneLineTransportDevice.ConnectAsync` returned
+  **True** this session (`Hands-free role claimed and the call transport reported connected`),
+  unlike the persistent `False` recorded in §12 — so grounding the calls half in `IsRegistered()`
+  rather than that bool (Stage 1, Task 10) was the right call for a value that is not even stable.
+- **Grace window** — a real connection-close with the Bluetooth link still up was classified
+  `deliberate → Suppressed`, the intended behaviour, not a range exit.
+
+**Two environment traps found while validating — neither is an app bug, both cost time:**
+
+1. **Doubled / echoed playback.** Windows "Listen to this device" was enabled on the
+   `Line (… A2DP SNK)` capture endpoint (registry: the `{24dbb0fc-…},1` key set), so Windows
+   mirrored the phone audio to the default playback device *in addition to* Klangbruecke's route —
+   two paths, one echo. It is the music-side twin of the Thy Phone story (§12): a manual
+   proving-phase mechanism left switched on. Uncheck it in Sound → Recording → Listen. Verify with
+   the registry key, not the checkbox — the checkbox lies if the panel is stale.
+2. **Outgoing call audio "horrible" — see §11.** Resolved as the communications-capture *level*
+   pulled to −38 dB, not a codec or driver fault. Recorded there in full, including the retracted
+   CVSD hypothesis.
+
+**The debugging lesson, for the record.** The §11 chase burned hours on a codec/driver hypothesis
+that the user's own observation had already excluded: the *incoming* call audio sounded great, and a
+symmetric SCO codec cannot deliver a clean downlink while wrecking the uplink. Trust the cheap
+symptom (which direction is bad, and does the same headset sound fine elsewhere) over the exotic
+mechanism. Both diagnostic scripts (`Measure-CallBandwidth.ps1`, `Watch-HfpAudio.ps1`) were built
+for the wrong hypothesis and could not have caught the real cause — one measures the good direction,
+the other reads endpoints that never go `Active` in the enumerator during a call.
