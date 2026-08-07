@@ -53,18 +53,6 @@ namespace Klangbruecke.Connection;
 public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 {
     /// <summary>
-    /// How long to wait before believing a closed audio connection.
-    ///
-    /// The connection closing is the same event for two opposite causes: the phone dropped the audio
-    /// profile deliberately (the ACL link stays up, and reconnecting would fight the user), or the
-    /// phone left the room. Three seconds is long enough for the radio to settle and short enough
-    /// that a real range exit is not left looking connected - and, more to the point, it is what
-    /// keeps a one-second dropout from flapping the tray, because nothing is decided until it
-    /// elapses.
-    /// </summary>
-    private static readonly TimeSpan GraceWindow = TimeSpan.FromSeconds(3);
-
-    /// <summary>
     /// The drift correction. Level-triggered, because the events that should have told us are exactly
     /// the ones that go missing across sleep and resume - and an edge that never arrives is what
     /// leaves an app wrong forever, which is the predecessor app's defining bug and the reason this
@@ -117,17 +105,10 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     private readonly EndpointPresenceCache _presence = new();
     private readonly MusicHalf _music;
     private readonly CallsHalf _calls;
+    private readonly GraceWindow _graceWindow;
 
     private IDisposable? _reconcileTimer;
-    private IDisposable? _graceTimer;
     private IDisposable? _resumeTimer;
-
-    /// <summary>
-    /// Bumped by every grace window that is armed, and read - never written - by the window that
-    /// finally answers. The same shape the halves spell <c>_generation</c>, and here for the same
-    /// reason: what crosses the await is a stale answer, not a data race.
-    /// </summary>
-    private int _graceGeneration;
 
     private bool _started;
     private bool _disposed;
@@ -236,6 +217,7 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         // The cache, not the monitor. See EndpointPresenceCache for the 282 ms this is about.
         _music = new MusicHalf(sink, router, _presence, scheduler);
         _calls = new CallsHalf(calls, scheduler);
+        _graceWindow = new GraceWindow(_scheduler, _linkMonitor, _linkMachine, _latch, _music, this);
 
         Refresh();
     }
@@ -371,7 +353,7 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 
         _latch.OnPhoneSelectionChanged();
         _clickGrant = ClickGrant.Phone;
-        CancelGraceWindow();
+        _graceWindow.Cancel();
 
         if (phoneChanged)
         {
@@ -426,7 +408,7 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 
         _latch.OnPhoneSelectionChanged();
         _clickGrant = ClickGrant.None;
-        CancelGraceWindow();
+        _graceWindow.Cancel();
 
         _calls.OnPhoneDeselected();
         ApplySettingsToHalves();
@@ -573,8 +555,7 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 
         _reconcileTimer?.Dispose();
         _reconcileTimer = null;
-        _graceTimer?.Dispose();
-        _graceTimer = null;
+        _graceWindow.Dispose();
         _resumeTimer?.Dispose();
         _resumeTimer = null;
 
@@ -636,7 +617,7 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     {
         if (state == AudioSinkConnectionState.Closed)
         {
-            OnConnectionClosed();
+            _graceWindow.OnConnectionClosed();
             return;
         }
 
@@ -688,90 +669,6 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         }
 
         _ = Task.Run(ProbeEndpointLevel);
-    }
-
-    // --- the grace window -----------------------------------------------------------------------
-
-    /// <summary>
-    /// The audio connection reported Closed - or the reconcile found it gone without one.
-    ///
-    /// Nothing is decided here. The half drops its route, because there is nothing to route, and
-    /// keeps everything else: which of the two causes this was is a question only a link status read
-    /// can answer, and asking it immediately gets the wrong answer for a radio that has not settled.
-    /// </summary>
-    private void OnConnectionClosed()
-    {
-        _music.OnConnectionClosed();
-
-        if (_graceTimer is null)
-        {
-            // One window at a time. A connection that reports Closed twice, or a reconcile that finds
-            // it gone on two ticks running, would otherwise arm two windows that each read the link
-            // and decide again.
-            //
-            // "At a time" only covers the wait, though. The handle is dropped the moment the window
-            // fires, so a second Closed arriving while the first window's link read is still
-            // outstanding arms a second window on top of it - which is why the generation is taken
-            // here, at the moment the question is asked.
-            int generation = ++_graceGeneration;
-
-            _graceTimer = _scheduler.Schedule(GraceWindow, () =>
-            {
-                _graceTimer = null;
-                _ = OnGraceWindowElapsedAsync(generation);
-            });
-        }
-
-        Publish();
-    }
-
-    private async Task OnGraceWindowElapsedAsync(int generation)
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        BluetoothLinkStatus status = await _linkMonitor.ReadLinkStatusAsync();
-
-        if (Superseded(generation))
-        {
-            // A newer Closed has asked the same question since, and this answer predates it. Acting
-            // on it is worse here than anywhere else in the class: this is the one read that decides
-            // deliberate-versus-out-of-range, so a stale one either latches a suppression nobody
-            // asked for - the app then sitting next to a phone it refuses to reconnect to, which is
-            // the predecessor's defining bug reached from a new direction - or records an absence
-            // that expires a suppression the user did ask for.
-            return;
-        }
-
-        if (status == BluetoothLinkStatus.Connected)
-        {
-            // The ACL link is alive and only the audio profile went, which is what the phone dropping
-            // this PC looks like. Reconnecting would fight the user, once every backoff step, for as
-            // long as they left the phone in the room.
-            Log.Info("The audio connection closed with the Bluetooth link still up: treating it as deliberate.");
-            SuppressDeliberately("The phone dropped the audio connection.");
-        }
-        else
-        {
-            // Disconnected, or a read that could not answer - and Unknown belongs here rather than
-            // with the branch above for the same reason LinkMachine collapses it to Absent: guessing
-            // the link is up leaves the app dormant next to a phone that walked out of the building.
-            Log.Info("The audio connection closed and the phone is not reachable: treating it as a range exit.");
-
-            // Immediately, not through the poll debounce. That debounce exists because one failed
-            // read is indistinguishable from the phone leaving; here two independent observations
-            // agree, which is the definite kind - the same kind as a watcher removal.
-            _linkMachine.OnDeviceRemoved();
-            _latch.OnLinkState(_linkMachine.State);
-
-            _music.OnLinkAbsent();
-            Report("The phone is out of range.");
-        }
-
-        EnforceConnectPermission();
-        Publish();
     }
 
     // --- the reconcile: the spec's five checks, in order -----------------------------------------
@@ -895,7 +792,7 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
                 }
                 else
                 {
-                    OnConnectionClosed();
+                    _graceWindow.OnConnectionClosed();
 
                     // Nothing else this pass. What just opened is a question with a 3 s answer, and
                     // correcting the halves against a connection that is already gone would start a
@@ -980,20 +877,6 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     /// exactly the interleaving <see cref="_reconcilingSince"/> exists to prevent.
     /// </summary>
     private bool Superseded(DateTimeOffset startedAt) => _disposed || _reconcilingSince != startedAt;
-
-    /// <summary>
-    /// The same question for the grace window, which awaits the same radio and has the same hole
-    /// without it. Two overloads rather than two differently-named checks, so the two paths read
-    /// alike at the call site.
-    ///
-    /// A generation rather than a timestamp, because the two guards are answering different
-    /// questions. The reconcile also needs to know when to <em>stop waiting</em> for a pass that has
-    /// wedged - hence a time it can compare against. A window needs no such rule: it is superseded by
-    /// events, and there are exactly two - another window being armed, which happens whenever the
-    /// connection reports Closed again, and the phone selection changing, which voids the question
-    /// rather than re-asking it. See <see cref="CancelGraceWindow"/> for the second.
-    /// </summary>
-    private bool Superseded(int graceGeneration) => _disposed || _graceGeneration != graceGeneration;
 
     /// <summary>
     /// Awaits one step of a pass and answers whether the pass is still the current one.
@@ -1102,26 +985,6 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         {
             _latch.SuppressAutoReconnectOff();
         }
-    }
-
-    /// <summary>
-    /// Voids an outstanding grace window, because the question it is going to answer is about a phone
-    /// the user has just changed their mind about.
-    ///
-    /// Both halves matter. Bumping the generation alone would leave the armed timer standing, and
-    /// <see cref="OnConnectionClosed"/> declines to arm a window while one is armed - so the next
-    /// Closed would get no window at all. Disposing alone would leave a window that has already fired
-    /// and is waiting on its read free to come back and decide.
-    ///
-    /// The decision it would otherwise reach is not harmless: a window that opened before the
-    /// selection and answers Connected afterwards calls <see cref="SuppressDeliberately"/>, which
-    /// latches, drops the grant and tears down both halves - defeating the click the user just made.
-    /// </summary>
-    private void CancelGraceWindow()
-    {
-        _graceTimer?.Dispose();
-        _graceTimer = null;
-        _graceGeneration++;
     }
 
     private void SuppressDeliberately(string status)
