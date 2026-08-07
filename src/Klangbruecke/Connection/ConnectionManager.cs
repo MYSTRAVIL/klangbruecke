@@ -50,7 +50,7 @@ namespace Klangbruecke.Connection;
 /// constructor and gates both halves on it in <see cref="ApplySettingsToHalves"/>, so an unpackaged
 /// run reports both halves disabled instead of retrying what it cannot do.
 /// </summary>
-public sealed class ConnectionManager : IDisposable
+public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 {
     /// <summary>
     /// How long to wait before believing a closed audio connection.
@@ -1491,4 +1491,14 @@ public sealed class ConnectionManager : IDisposable
 
         action();
     });
+
+    // --- the coordinator the two timing seams reach back through ---------------------------------
+
+    bool IConnectionCoordinator.IsDisposed => _disposed;
+    bool IConnectionCoordinator.ConnectPermitted => ConnectPermitted;
+    void IConnectionCoordinator.RefreshEndpointLevel() => RefreshEndpointLevel();
+    void IConnectionCoordinator.EnforceConnectPermission() => EnforceConnectPermission();
+    void IConnectionCoordinator.Publish() => Publish();
+    void IConnectionCoordinator.SuppressDeliberately(string status) => SuppressDeliberately(status);
+    void IConnectionCoordinator.Report(string message) => Report(message);
 }
