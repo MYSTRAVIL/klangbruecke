@@ -30,18 +30,25 @@ public sealed class WasapiDeviceFactory : IAudioDeviceFactory
     /// <summary>
     /// Every active render endpoint, as ids and names rather than as live device objects.
     ///
-    /// The enumerator is disposed before the strings are handed back on purpose: the caller is a
-    /// menu that is rebuilt on every right-click, and holding endpoint objects open for the life of
-    /// a <c>ToolStripMenuItem</c> would be a COM reference per device per menu open.
+    /// The enumerator and every endpoint it yields are disposed before the strings are handed back:
+    /// the caller is a menu rebuilt on every right-click, and each endpoint left open is a COM
+    /// reference - a cached property store at least - held until a finalizer runs. The record copies
+    /// the id and name, so nothing here needs to outlive the loop. See <see cref="AudioOutputDevice"/>.
     /// </summary>
     public IReadOnlyList<AudioOutputDevice> ListOutputs()
     {
         using var enumerator = new MMDeviceEnumerator();
 
-        return enumerator
-            .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-            .Select(d => new AudioOutputDevice(d.ID, d.FriendlyName))
-            .ToList();
+        var outputs = new List<AudioOutputDevice>();
+        foreach (MMDevice device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+        {
+            using (device)
+            {
+                outputs.Add(new AudioOutputDevice(device.ID, device.FriendlyName));
+            }
+        }
+
+        return outputs;
     }
 
     /// <summary>
@@ -65,14 +72,35 @@ public sealed class WasapiDeviceFactory : IAudioDeviceFactory
         return device is not null;
     }
 
-    /// <summary>The capture endpoint Windows creates while an A2DP sink connection is open.</summary>
+    /// <summary>
+    /// The capture endpoint Windows creates while an A2DP sink connection is open.
+    ///
+    /// The match is the caller's to own and dispose; every other endpoint enumerated is disposed here.
+    /// A <c>FirstOrDefault</c> would leak each non-matching endpoint it iterated past to a finalizer.
+    /// </summary>
     private static MMDevice? FindSinkCaptureEndpoint()
     {
         using var enumerator = new MMDeviceEnumerator();
-        return enumerator
-            .EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active)
-            .FirstOrDefault(d => d.FriendlyName.Contains("A2DP", StringComparison.OrdinalIgnoreCase)
-                              || d.FriendlyName.Contains("SNK", StringComparison.OrdinalIgnoreCase));
+
+        MMDevice? found = null;
+        foreach (MMDevice device in enumerator.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active))
+        {
+            bool isSinkCapture =
+                found is null
+                && (device.FriendlyName.Contains("A2DP", StringComparison.OrdinalIgnoreCase)
+                    || device.FriendlyName.Contains("SNK", StringComparison.OrdinalIgnoreCase));
+
+            if (isSinkCapture)
+            {
+                found = device;
+            }
+            else
+            {
+                device.Dispose();
+            }
+        }
+
+        return found;
     }
 
     private static MMDevice? GetOutputDeviceOrDefault(string? deviceId)
@@ -81,9 +109,21 @@ public sealed class WasapiDeviceFactory : IAudioDeviceFactory
 
         if (!string.IsNullOrEmpty(deviceId))
         {
-            MMDevice? match = enumerator
-                .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-                .FirstOrDefault(d => d.ID == deviceId);
+            // The match is the caller's to own; the rest are disposed here rather than left to a
+            // finalizer. A FirstOrDefault leaks every endpoint before the match - and all of them when
+            // there is none, which is the common case once the chosen device has been unplugged.
+            MMDevice? match = null;
+            foreach (MMDevice device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+            {
+                if (match is null && device.ID == deviceId)
+                {
+                    match = device;
+                }
+                else
+                {
+                    device.Dispose();
+                }
+            }
 
             if (match is not null)
             {
@@ -131,7 +171,15 @@ internal sealed class WasapiCaptureSource : ICaptureSource
 
     public void StopRecording() => _capture.StopRecording();
 
-    public void Dispose() => _capture.Dispose();
+    // The device after the capture, not instead of it: WasapiCapture does not dispose the MMDevice it
+    // was handed (measured against NAudio 2.2.1), so the endpoint's own cached COM objects live until a
+    // finalizer without this. The capture is torn down first; MMDevice.Dispose is idempotent and safe
+    // after it.
+    public void Dispose()
+    {
+        _capture.Dispose();
+        _device.Dispose();
+    }
 }
 
 /// <summary>
@@ -176,5 +224,13 @@ internal sealed class WasapiRenderSink : IRenderSink
 
     public void Play() => _output.Play();
 
-    public void Dispose() => _output.Dispose();
+    // The device after the output. WasapiOut does not dispose the MMDevice it was handed, and it shares
+    // that device's cached AudioClient - so disposing the output first releases the client, and the
+    // later MMDevice.Dispose is a safe no-op over it (both measured against NAudio 2.2.1). Without this
+    // the endpoint's cached COM objects live until a finalizer.
+    public void Dispose()
+    {
+        _output.Dispose();
+        _device.Dispose();
+    }
 }
