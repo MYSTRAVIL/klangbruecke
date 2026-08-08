@@ -93,6 +93,20 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     private bool _disposed;
 
     /// <summary>
+    /// Set the first time the link is seen <see cref="LinkState.Present"/>, and never cleared. It
+    /// gates the reconcile's fast reconnect probe: before the app has connected even once there is
+    /// nothing to <em>re</em>-connect, and initial discovery is the watcher's enumeration edge plus
+    /// the 30 s backstop - so the probe stays off and a phone that is simply not here yet at startup
+    /// is not polled every few seconds.
+    ///
+    /// <b>App-wide, not per-phone.</b> Once any phone has connected this stays set, so re-picking a
+    /// different, never-seen phone does arm the probe for it. That is intended rather than a leak: a
+    /// tray re-pick carries a click grant and is an explicit "connect to this now", so polling for it
+    /// is what the user just asked for. See <see cref="Reconciler.Pace"/> and <see cref="Refresh"/>.
+    /// </summary>
+    private bool _everConnected;
+
+    /// <summary>
     /// The user picked a phone and what they picked is not yet delivering.
     ///
     /// This is the whole of the auto-reconnect-off carve-out. The setting removes permission to
@@ -991,6 +1005,20 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
             Calls: _calls.State,
             NextRetryIn: SoonestRetry(),
             ConnectPermitted: ConnectPermitted);
+
+        // Latched on the first connection and never cleared - see _everConnected. Before it, the
+        // probe stays off and initial discovery is the watcher edge plus the 30 s backstop.
+        if (snapshot.Link == LinkState.Present)
+        {
+            _everConnected = true;
+        }
+
+        // The fast reconnect probe reads the same snapshot the projection does: poll quickly only
+        // once the app has connected at least once and is now waiting out of range (Absent) for a
+        // reconnect it is permitted to make. Idempotent - this runs on every Refresh but arms or
+        // disarms the probe only on the transition into or out of that state. See Reconciler.Pace,
+        // and the fast-reconnect-probe tests.
+        _reconciler.Pace(_everConnected && snapshot.Link == LinkState.Absent && snapshot.ConnectPermitted);
 
         State = ConnectionStateProjection.Project(snapshot);
         Detail = ConnectionStateProjection.DetailFor(snapshot);

@@ -1164,6 +1164,116 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
     }
 
+    // --- the fast reconnect probe --------------------------------------------------------------
+    //
+    // The DeviceWatcher does not fire on a phone-initiated reconnect - the A2DP device interface
+    // stays enumerated while the phone is merely paired, so only the level read notices the link
+    // coming back (docs/FINDINGS.md). At the 30 s reconcile cadence that is a ~15-30 s wait, and the
+    // phone reports the failed A2DP bring-up to the user in the meantime. While a selected phone is
+    // out of range and reconnecting is permitted, a faster probe polls the link so the return is
+    // caught in a few seconds. It runs only in that state; the 30 s backstop is otherwise unchanged.
+
+    /// <summary>
+    /// The phone comes back a few seconds after a range exit and is reconnected by the fast probe,
+    /// well before the 30 s backstop would have looked.
+    /// </summary>
+    [Fact]
+    public void A_reconnect_while_out_of_range_is_caught_within_a_few_seconds()
+    {
+        using Harness h = new(enableCalls: false);
+        h.ReachRouting();
+
+        // A polled range exit, the same way the backstop tests reach one: two non-connected reads.
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+        h.Scheduler.Advance(Seconds(60));
+        Assert.Equal(ConnectionState.Discovering, h.Manager.State);
+
+        int connectsBefore = h.Sink.ConnectCalls.Count;
+
+        // The phone returns. With only the 30 s backstop this waits up to another half minute; the
+        // probe catches it inside five seconds.
+        h.Link.Status = BluetoothLinkStatus.Connected;
+        h.Scheduler.Advance(Seconds(5));
+
+        Assert.Equal(connectsBefore + 1, h.Sink.ConnectCalls.Count);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    /// <summary>
+    /// And the probe disarms the moment the phone is back - once reconnected it does not go on
+    /// polling the link every five seconds. This is what the level-driven arming in <c>Refresh</c>
+    /// buys, and a regression to edge-driven arming would leak the probe here: with the phone
+    /// present, only the 30 s backstop reads.
+    /// </summary>
+    [Fact]
+    public void The_fast_probe_stops_once_reconnected()
+    {
+        using Harness h = new(enableCalls: false);
+        h.ReachRouting();
+
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+        h.Scheduler.Advance(Seconds(60));            // range exit -> probe armed
+        h.Link.Status = BluetoothLinkStatus.Connected;
+        h.Scheduler.Advance(Seconds(5));             // the probe catches the return
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        // Reconnected at 65 s; the next backstop tick is at 90 s, so any read in the twenty seconds
+        // below would be a probe that failed to disarm. There must be none.
+        int reads = h.Link.ReadCount;
+        h.Scheduler.Advance(Seconds(20));
+
+        Assert.Equal(reads, h.Link.ReadCount);
+    }
+
+    /// <summary>
+    /// The probe is for <em>re</em>connecting, not for the first connection. Before the app has ever
+    /// connected there is nothing to re-establish, initial discovery is the watcher's enumeration
+    /// edge plus the 30 s backstop, and a phone that is simply not here yet must not be polled every
+    /// few seconds. So the probe stays disarmed until the first time the link is seen Present.
+    /// </summary>
+    [Fact]
+    public void The_fast_probe_does_not_run_before_the_first_connection()
+    {
+        using Harness h = new(enableCalls: false);
+
+        // A selected phone that never appears - the default Discovering state, never Present. Only
+        // the 30 s backstop reads the link.
+        h.Scheduler.Advance(Seconds(29.9));
+        Assert.Equal(0, h.Link.ReadCount);
+
+        h.Scheduler.Advance(Seconds(0.2));
+        Assert.Equal(1, h.Link.ReadCount);
+    }
+
+    /// <summary>
+    /// And the probe is disarmed while the app is deliberately dormant. Auto-reconnect off after a
+    /// drop latches suppression, and a suppressed app must not poll the radio every few seconds for a
+    /// connection it would refuse - it waits, exactly as it did before the probe existed.
+    /// </summary>
+    [Fact]
+    public void The_fast_probe_does_not_run_while_suppressed()
+    {
+        using Harness h = new(enableCalls: false);
+        h.ReachRouting();
+
+        h.Manager.SetAutoReconnect(false);
+
+        // The phone drops. Two non-connected polls land the range exit at exactly 60 s; auto-reconnect
+        // off stands the half down and latches suppression, so a reconnect is no longer permitted.
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+        h.Scheduler.Advance(Seconds(60));
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+
+        // A backstop tick has just fired at 60 s and the next is not until 90 s, so any read in the
+        // five seconds below is the probe's - and there must be none.
+        int reads = h.Link.ReadCount;
+        h.Link.Status = BluetoothLinkStatus.Connected;
+        h.Scheduler.Advance(Seconds(5));
+
+        Assert.Equal(reads, h.Link.ReadCount);
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+    }
+
     // --- resume --------------------------------------------------------------------------------
 
     /// <summary>

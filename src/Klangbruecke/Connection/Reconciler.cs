@@ -43,6 +43,25 @@ internal sealed class Reconciler
     /// </remarks>
     private static readonly TimeSpan ReconcileStall = TimeSpan.FromSeconds(25);
 
+    /// <summary>
+    /// How often to poll while a selected phone is out of range and a reconnect is permitted.
+    ///
+    /// The <see cref="ILinkMonitor"/> watcher does not fire on a phone-initiated reconnect - the A2DP
+    /// device interface stays enumerated while the phone is merely paired, so only the level read
+    /// notices the link coming back (docs/FINDINGS.md). At <see cref="ReconcilePeriod"/> that is a
+    /// 15-30 s wait, long enough that the phone reports the failed audio-profile bring-up to the user
+    /// before the app has looked. Five seconds bounds it - the same value as the resume settle, and on
+    /// the same reasoning: fast enough to feel immediate, slow enough not to hammer the radio. It runs
+    /// only in that one state; see <see cref="Pace"/>, and the 30 s backstop is otherwise untouched.
+    ///
+    /// Deliberately not capped or decayed over a long absence. A probe pass while the phone is away is
+    /// a link-status read - a local <c>ConnectionStatus</c> query, not an RF operation - and the music
+    /// half is Off, so the 152-282 ms endpoint enumeration is short-circuited. The sustained cost of
+    /// an all-day absence is one cheap read every five seconds, which does not earn the state a decay
+    /// back toward 30 s would cost.
+    /// </summary>
+    private static readonly TimeSpan FastReconnectPoll = TimeSpan.FromSeconds(5);
+
     private readonly IScheduler _scheduler;
     private readonly ILinkMonitor _linkMonitor;
     private readonly IAudioSinkService _sink;
@@ -54,6 +73,13 @@ internal sealed class Reconciler
     private readonly IConnectionCoordinator _coordinator;
 
     private IDisposable? _timer;
+
+    /// <summary>
+    /// The fast reconnect probe, or null when the app is not waiting for a reconnect it may make. A
+    /// separate handle from <see cref="_timer"/> on purpose: it is armed and disarmed on a state
+    /// transition rather than reschedule the backstop, so nothing here can shift the 30 s cadence.
+    /// </summary>
+    private IDisposable? _probe;
 
     /// <summary>
     /// When the pass currently running started, or null when none is.
@@ -102,10 +128,37 @@ internal sealed class Reconciler
         _timer = _scheduler.SchedulePeriodic(ReconcilePeriod, () => _ = RunAsync("tick"));
     }
 
+    /// <summary>
+    /// Arms or disarms the fast reconnect probe. Idempotent, and driven from the manager's
+    /// <see cref="ConnectionManager"/> <c>Refresh</c> on every state change: it starts the probe the
+    /// first time the app is left waiting for a reconnect it is permitted to make, and stops it the
+    /// moment the phone is back or the wait becomes one it may not act on - a deliberate or
+    /// auto-reconnect-off suppression, which stays dormant rather than polling for a connect it would
+    /// refuse.
+    ///
+    /// A probe pass is just a <c>RunAsync</c>, so it defers to any pass already running through the
+    /// same <see cref="_reconcilingSince"/> guard, and the phone returning is caught by the pass's
+    /// own link read and its <see cref="LinkState.Present"/> branch - the identical path the 30 s tick
+    /// takes, only sooner.
+    /// </summary>
+    public void Pace(bool waitingToReconnect)
+    {
+        if (waitingToReconnect)
+        {
+            _probe ??= _scheduler.SchedulePeriodic(FastReconnectPoll, () => _ = RunAsync("reconnect probe"));
+            return;
+        }
+
+        _probe?.Dispose();
+        _probe = null;
+    }
+
     public void Dispose()
     {
         _timer?.Dispose();
         _timer = null;
+        _probe?.Dispose();
+        _probe = null;
     }
 
     /// <summary>
