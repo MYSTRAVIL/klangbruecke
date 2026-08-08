@@ -90,6 +90,13 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     private IDisposable? _resumeTimer;
     private IDisposable? _resolverTick;
 
+    /// <summary>
+    /// Supersession token for <see cref="ResolveActivePhoneAsync"/>. Bumped by explicit intent-setting
+    /// actions (<see cref="SetActivePhone"/>, <see cref="ClearRememberedPhones"/>) so an in-flight
+    /// resolver that resumes after a newer explicit selection is superseded and does not override it.
+    /// </summary>
+    private int _resolveGeneration;
+
     private bool _started;
     private bool _disposed;
 
@@ -367,6 +374,9 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
             return;
         }
 
+        // Bump generation to supersede any in-flight resolver.
+        _resolveGeneration++;
+
         _settings.RememberedPhoneIds.Clear();
         _settings.Save();
 
@@ -414,6 +424,9 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         {
             return;
         }
+
+        // Bump generation to supersede any in-flight resolver.
+        _resolveGeneration++;
 
         bool phoneChanged = !string.Equals(_settings.PhoneDeviceId, id, StringComparison.Ordinal);
 
@@ -470,12 +483,14 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 
     /// <summary>
     /// Resolve the active phone from the remembered set: read link status for each remembered phone,
-    /// call <see cref="PhonePicker.Pick"/>, then act on the result. Null means no phones present, so
-    /// stop watching and go dormant. A pick that differs from the current active phone means switch to
-    /// it via <see cref="SetActivePhone"/>. Otherwise keep the incumbent.
+    /// call <see cref="PhonePicker.Pick"/>, then act on the result. A pick that differs from the
+    /// current active phone means switch to it via <see cref="SetActivePhone"/>. Otherwise keep the
+    /// incumbent.
     ///
     /// Runs at <see cref="Start"/>, on the active-phone-lost path, and on a 30 s periodic tick.
-    /// Re-checks <c>_disposed</c> after each await and honors the disposed/superseded discipline.
+    /// Snapshots the remembered set to avoid modification-during-enumeration. Re-checks
+    /// <c>_disposed</c> and the generation token after each await so an in-flight resolve that
+    /// resumes after disposal or after a newer explicit selection is superseded and does not act.
     /// </summary>
     private async Task ResolveActivePhoneAsync()
     {
@@ -484,14 +499,24 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
             return;
         }
 
+        // Supersession token: capture generation so an in-flight resolve that resumes after a newer
+        // explicit selection (SetActivePhone, ClearRememberedPhones) is superseded and does not act.
+        int generation = ++_resolveGeneration;
+
+        // Snapshot the remembered set to avoid modification-during-enumeration if the live set is
+        // mutated (SetPhoneRemembered, ClearRememberedPhones) while this resolve is awaiting.
+        List<string> remembered = _settings.RememberedPhoneIds.ToList();
+
         // Build a presence map by awaiting ReadLinkStatusForAsync for each remembered phone.
         Dictionary<string, bool> presenceMap = new();
 
-        foreach (string id in _settings.RememberedPhoneIds)
+        foreach (string id in remembered)
         {
             BluetoothLinkStatus status = await _linkMonitor.ReadLinkStatusForAsync(id);
 
-            if (_disposed)
+            // Re-check disposed and generation after the await: a newer resolve or explicit selection
+            // supersedes this one.
+            if (_disposed || generation != _resolveGeneration)
             {
                 return;
             }
@@ -499,34 +524,18 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
             presenceMap[id] = status == BluetoothLinkStatus.Connected;
         }
 
-        // Call the pure picker.
-        string? pick = PhonePicker.Pick(_settings.PhoneDeviceId, _settings.RememberedPhoneIds, id => presenceMap.GetValueOrDefault(id, false));
+        // Call the pure picker with the snapshot.
+        string? pick = PhonePicker.Pick(_settings.PhoneDeviceId, remembered, id => presenceMap.GetValueOrDefault(id, false));
 
-        if (_disposed)
+        // Re-check disposed and generation before acting on the pick.
+        if (_disposed || generation != _resolveGeneration)
         {
             return;
         }
 
-        // Act on the result.
-        if (pick is null)
-        {
-            // No phones present: stop watching and go dormant (similar to ClearRememberedPhones but
-            // without clearing the remembered set).
-            _settings.PhoneDeviceId = null;
-
-            _latch.OnPhoneSelectionChanged();
-            _clickGrant = ClickGrant.None;
-            _graceWindow.Cancel();
-
-            _calls.OnPhoneDeselected();
-            ApplySettingsToHalves();
-
-            _linkMachine.OnPhoneDeselected();
-            _linkMonitor.StopWatching();
-
-            Publish();
-        }
-        else if (!string.Equals(pick, _settings.PhoneDeviceId, StringComparison.Ordinal))
+        // Act on the result. Pick is never null for a non-empty remembered set (PhonePicker rule 4),
+        // but treat it as keep-incumbent if it were.
+        if (pick is not null && !string.Equals(pick, _settings.PhoneDeviceId, StringComparison.Ordinal))
         {
             // Picked phone differs from current: switch to it.
             SetActivePhone(pick);
