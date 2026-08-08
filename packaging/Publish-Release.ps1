@@ -106,8 +106,9 @@ try {
         throw 'Working tree has uncommitted changes. Commit them, or pass -Force to release anyway.'
     }
 
-    $headSha = (& git rev-parse --short HEAD).Trim()
-    $branch  = (& git rev-parse --abbrev-ref HEAD).Trim()
+    $headSha     = (& git rev-parse --short HEAD).Trim()
+    $headShaFull = (& git rev-parse HEAD).Trim()
+    $branch      = (& git rev-parse --abbrev-ref HEAD).Trim()
     Write-Host "Releasing commit $headSha on $branch"
     Write-Host ''
 
@@ -179,7 +180,9 @@ how to test music and calls.
         $msixAsset, $cerAsset,
         '--title', "Klangbruecke $tag",
         '--notes-file', $notesFile,
-        '--target', $headSha
+        # Full SHA, not $headSha: GitHub's release API rejects an abbreviated commitish with
+        # "422 Release.target_commitish is invalid". A branch name or full SHA is required.
+        '--target', $headShaFull
     )
     if ($Draft)        { $ghArgs += '--draft' }
     if ($isPrerelease) { $ghArgs += '--prerelease' }

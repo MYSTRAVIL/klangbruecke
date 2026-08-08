@@ -23,7 +23,9 @@ is the living status rather than a stage report._
 - **Releases** — `packaging/Publish-Release.ps1`: builds+signs, pushes the commit, and cuts a manual
   `gh` release with the `.msix`, the public `.cer`, and trust instructions. The `.cer` ships because a
   self-signed MSIX has **no "install anyway" prompt** — the cert must be trusted first. Commit `d9f95e8`.
-  **No release has been cut yet.**
+  **First release cut 2026-08-08: [`v0.2.2`](https://github.com/MYSTRAVIL/klangbruecke/releases/tag/v0.2.2)**
+  (prerelease, `.msix` + `.cer`). The script passed the *abbreviated* SHA as `--target`, which GitHub's
+  release API rejects (`422 target_commitish is invalid`); fixed to use the full SHA.
 - **§15 call auto-route** — investigated → **WONTFIX on Win10**; recorded in `FINDINGS §15.1`. Commit
   `a23accc`. See below.
 - **Robustness (the Stage-1 review's quick-win list, now cleared):**
@@ -54,9 +56,11 @@ remains. The review's #1 Stage-2 priority — **refactoring `ConnectionManager`*
 `IConnectionCoordinator`; see `docs/superpowers/specs/2026-08-07-connection-manager-seam-extraction-design.md`
 and the plan beside it). One substantive item remains, with its prerequisite:
 
-1. **Tray call-output picker** — a requested feature. Routing HFP call audio to a chosen PC output means
-   changing the **system-wide default communications device** via the undocumented `IPolicyConfig` — a
-   global side effect on every app's comms audio. **Decide that footprint before building.**
+1. **Tray call-output picker** — ~~a requested feature~~ **WONTFIX (decided 2026-08-08).** Routing HFP
+   call audio to a chosen PC output means changing the **system-wide default communications device** via
+   the undocumented `IPolicyConfig` — a global side effect on every app's comms audio. Too janky to be
+   worth it; call audio follows the Windows default comms device instead. Reopen only if a
+   non-global routing lever appears.
 
 Also parked: **option B for reconnect latency** — a `BluetoothDevice.ConnectionStatusChanged` subscription
 would make reconnect edge-driven (near-instant, kills the phone-side toast) but reintroduces a long-lived
