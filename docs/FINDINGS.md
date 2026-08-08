@@ -773,3 +773,32 @@ That is consistent with everything else here:
 
 Doubly out of reach — not our UI, and no app-side API — so **WONTFIX**, the same platform ceiling as
 §15. Do not re-chase it. If a call needs a keypad (phone trees), take it on the phone.
+
+## 17. What Windows does NOT expose to a Win10 A2DP-sink app — measured, so we stop guessing
+
+Probed 2026-08-08 (unpackaged console, `scratchpad/featureprobe`) with the phone connected and, for the
+AVRCP check, **actively playing music**. Three tray-feature ideas were checked against "is the data even
+there?" and three walls were found. Recorded so they are not re-chased.
+
+- **AVRCP / now-playing is not reachable.** `GlobalSystemMediaTransportControlsSessionManager` returns
+  **0 sessions even while the phone is playing music**. GSMTC aggregates media from apps running *on this
+  PC*; a phone streaming A2DP *into* the PC is not one, so its track/artist/transport never appear there.
+  Windows has an internal AVRCP controller, but it is not exposed to a WinRT app. A "now playing /
+  play-pause-next from the PC" feature is not buildable on the inbox stack.
+- **The phone's battery is not exposed.** The connected phone's `DeviceInformation.Properties` carries no
+  battery value (queried with `System.Devices.BatteryLevel` and the `{104EA319-…} 2` key), and
+  `BluetoothDevice` exposes none. The HFP battery indicator (`AT+IPHONEACCEV` / `+CIND`) does not surface
+  to WinRT. No battery-in-tooltip feature.
+- **The negotiated A2DP music codec is not obtainable.** The `Line (… A2DP SNK)` capture endpoint reports
+  a *fixed* 44100 Hz / 32-bit / stereo format — Windows resamples whatever codec (SBC/AAC/aptX) up to it,
+  so the endpoint reveals nothing about the codec. There is no WinRT API for the negotiated codec. A music
+  "codec/quality" readout is not possible.
+
+**The one sliver left open — call narrowband vs wideband — is parked, not confirmed.** During a *call* the
+SCO capture endpoint's sample rate would in principle read 8 kHz (CVSD/narrowband) vs 16 kHz (mSBC/
+wideband), which would directly answer §11's "why do outgoing calls sound bad". But it is untested (needs a
+live call to observe) and **§14 already warns the HFP endpoints "never go Active in the enumerator during a
+call"**, which would sink it too. Reopen only via a live-call probe; do not assume it works.
+
+**Net:** of the surveyed tray-feature ideas, only **remember-and-auto-pick-phone** (pure app logic, no OS
+dependency) is buildable. The rest are platform ceilings on this Win10 A2DP-sink configuration.
