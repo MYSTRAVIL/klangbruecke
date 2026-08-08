@@ -9,7 +9,10 @@ public static class AboutText
 
     // Three-part version: the packaged build carries a four-part number whose fourth part is
     // meaningless to a user (and the GitHub tag never has it).
-    public static string Build(Version version) =>
-        $"Klangbruecke {version.ToString(3)}\n" +
-        "Phone audio on your PC over Bluetooth - music and calls, in the tray.";
+    public static string Build(Version version)
+    {
+        ArgumentNullException.ThrowIfNull(version);
+        return $"Klangbruecke {version.ToString(3)}\n" +
+            "Phone audio on your PC over Bluetooth - music and calls, in the tray.";
+    }
 }

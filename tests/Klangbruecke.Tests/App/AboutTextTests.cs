@@ -14,4 +14,10 @@ public sealed class AboutTextTests
         Assert.Contains("Klangbruecke", text);
         Assert.Contains("0.2.2", text);
     }
+
+    [Fact]
+    public void Build_throws_ArgumentNullException_when_version_is_null()
+    {
+        Assert.Throws<ArgumentNullException>(() => AboutText.Build(null!));
+    }
 }
