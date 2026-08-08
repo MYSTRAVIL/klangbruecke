@@ -64,4 +64,15 @@ public interface ILinkMonitor : IDisposable
     /// which <c>LinkMachine</c> treats as disconnected.
     /// </summary>
     Task<BluetoothLinkStatus> ReadLinkStatusAsync();
+
+    /// <summary>
+    /// Read the ACL-link level for a named device on demand, independent of which device is currently
+    /// being watched. This is the presence backstop for a device that is not the watched one - used by
+    /// the auto-pick resolver to decide between multiple paired phones.
+    ///
+    /// Never throws: every failure - an id with no address, a null device from WinRT, a throw out of
+    /// the ABI - collapses to <see cref="BluetoothLinkStatus.Unknown"/>, which the resolver treats as
+    /// absent.
+    /// </summary>
+    Task<BluetoothLinkStatus> ReadLinkStatusForAsync(string deviceId);
 }
