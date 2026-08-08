@@ -78,6 +78,23 @@ Cut a GitHub release (build, sign, push the commit, upload the `.msix` + `.cer` 
 `./packaging/Publish-Release.ps1`. The tray/app icons are generated from the brand mark by
 `./packaging/Generate-Icons.ps1`.
 
+## Troubleshooting
+
+- **See what's happening.** Right-click the tray icon → **Diagnostics → Open Logs**, or open
+  `%LOCALAPPDATA%\Klangbruecke\logs` directly. **Copy Diagnostics** puts a paste-ready snapshot
+  (version, OS, state, recent log lines) on the clipboard — review it before sharing.
+- **It won't connect.** Check the pairing before suspecting the app. Klangbruecke shows "connected"
+  for its own view of the connection; verify the real endpoint with PowerShell:
+  `Get-PnpDevice -Class AudioEndpoint | Where-Object FriendlyName -like '*A2DP*'`. A stale pairing
+  (the IRK trap) presents exactly like an app failure — look at `BTHUSB` events 35 / 16 / 24 in the
+  System log first. See `docs/FINDINGS.md` §3.
+- **Force a reconnect.** Diagnostics won't help if the app is deliberately dormant — use
+  **Connect Now** to override a Disconnect or a switched-off auto-reconnect for one attempt.
+- **Reset configuration.** Delete `%LOCALAPPDATA%\Klangbruecke\settings.json` and restart; the app
+  starts from defaults (no phone selected).
+- **Check for a newer build.** Diagnostics → **Check for Updates**, or see the
+  [Releases page](https://github.com/MYSTRAVIL/klangbruecke/releases).
+
 ## Architecture
 
 ```
