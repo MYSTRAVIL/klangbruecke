@@ -506,6 +506,38 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         Publish();
     }
 
+    /// <summary>
+    /// Connect now, to the phone already selected. The manual, one-shot override: it clears the
+    /// suppression latch (whether a deliberate Disconnect or an auto-reconnect-off suppression) and grants
+    /// a connect even with auto-reconnect off - exactly as <see cref="SelectPhone"/> does - but changes
+    /// neither the selected phone, the calls role, nor the auto-reconnect setting.
+    ///
+    /// The grant is one-shot: <see cref="ReleaseClickGrantIfDelivering"/> drops it once a half is
+    /// delivering, so after the next drop with auto-reconnect off the app goes dormant again, matching the
+    /// toggle. Nothing to connect to with no phone selected, so that is a no-op.
+    /// </summary>
+    public void RequestConnect()
+    {
+        if (_disposed || _settings.PhoneDeviceId is null)
+        {
+            return;
+        }
+
+        _latch.OnPhoneSelectionChanged();
+        _clickGrant = ClickGrant.Phone;
+        _graceWindow.Cancel();
+
+        // Through the reconcile, the one connect path in the class - as SelectPhone does.
+        _ = _reconciler.RunAsync("connect requested", userAsked: true);
+
+        // Preserve the grant across the repaint, for the reason SelectPhone documents: Refresh releases it
+        // the moment every enabled half looks satisfied, which on a same-phone re-drive is true before the
+        // pass has checked either half.
+        ClickGrant granted = _clickGrant;
+        Publish();
+        _clickGrant = granted;
+    }
+
     public void Dispose()
     {
         if (_disposed)
