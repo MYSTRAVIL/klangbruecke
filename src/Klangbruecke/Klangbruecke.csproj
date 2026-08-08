@@ -38,6 +38,9 @@
     <EmbeddedResource Include="Assets\tray-active.ico" />
     <EmbeddedResource Include="Assets\tray-busy.ico" />
     <EmbeddedResource Include="Assets\tray-idle.ico" />
+    <EmbeddedResource Include="Assets\connect.wav" />
+    <EmbeddedResource Include="Assets\disconnect.wav" />
+    <EmbeddedResource Include="Assets\degraded.wav" />
   </ItemGroup>
 
 </Project>
