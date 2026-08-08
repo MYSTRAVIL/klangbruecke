@@ -3,6 +3,7 @@ obj/
 *.user
 *.suo
 .vs/
+.vscode/
 
 # build output
 artifacts/
