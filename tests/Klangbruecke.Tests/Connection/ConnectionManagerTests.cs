@@ -822,6 +822,18 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Empty(h.Sink.ConnectCalls);
     }
 
+    [Fact]
+    public void RequestConnect_logs_when_a_phone_is_selected()
+    {
+        using Harness h = new();
+
+        _log.Entries.Clear();
+
+        h.Manager.RequestConnect();
+
+        Assert.Contains(_log.Entries, e => e.Level == LogLevel.Info && e.Message == "Connect requested from the tray.");
+    }
+
     // --- the reconcile -------------------------------------------------------------------------
 
     [Fact]

@@ -18,11 +18,11 @@ namespace Klangbruecke;
 /// machine - <see cref="ConnectionManager"/> owns all of that, and every handler that changes
 /// anything calls exactly one of its methods. Exit and the Diagnostics items are the exceptions:
 /// Exit ends the message loop (which is <see cref="ApplicationContext"/>'s own job and not the
-/// manager's), and each Diagnostics handler makes one call to <see cref="IAppShell"/> instead.
-/// The rule is worth stating as a rule because the previous version of this file was the opposite:
-/// it held the sink, the call transport, the router and the device factory, and the connect sequence
-/// was 140 lines of tray code that nothing could test and that had no answer at all for a phone that
-/// came back into range.
+/// manager's), and each Diagnostics handler routes to the shell seam (<see cref="IAppShell"/>) and/or
+/// the <see cref="UpdateChecker"/> instead. The rule is worth stating as a rule because the previous
+/// version of this file was the opposite: it held the sink, the call transport, the router and the
+/// device factory, and the connect sequence was 140 lines of tray code that nothing could test and
+/// that had no answer at all for a phone that came back into range.
 ///
 /// <b>It does read <see cref="PackageIdentity.IsPackaged"/>, for two menu labels and nothing else.</b>
 /// Said plainly because the first draft of this comment claimed it read none at all, which the
@@ -257,6 +257,7 @@ internal sealed class TrayContext : ApplicationContext
 
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(BuildDiagnosticsMenu());
+        _menu.Items.Add(new ToolStripSeparator());
 
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => ExitThread();

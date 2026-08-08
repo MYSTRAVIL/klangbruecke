@@ -523,6 +523,8 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
             return;
         }
 
+        Log.Info("Connect requested from the tray.");
+
         _latch.OnPhoneSelectionChanged();
         _clickGrant = ClickGrant.Phone;
         _graceWindow.Cancel();
