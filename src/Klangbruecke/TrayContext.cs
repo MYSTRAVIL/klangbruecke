@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using Klangbruecke.App;
 using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
@@ -15,12 +16,13 @@ namespace Klangbruecke;
 /// <b>A view, and only a view.</b> It draws a menu, turns a click into one call, and writes what it
 /// is told into a tooltip. It opens no Bluetooth connection, starts no route, and holds no state
 /// machine - <see cref="ConnectionManager"/> owns all of that, and every handler that changes
-/// anything calls exactly one of its methods. (Exit is the exception, and the only one: it ends the
-/// message loop, which is <see cref="ApplicationContext"/>'s own job and not the manager's.) The rule
-/// is worth stating as a rule because the previous version of this file was the opposite: it held the
-/// sink, the call transport, the router and the device factory, and the connect sequence was 140
-/// lines of tray code that nothing could test and that had no answer at all for a phone that came
-/// back into range.
+/// anything calls exactly one of its methods. Exit and the Diagnostics items are the exceptions:
+/// Exit ends the message loop (which is <see cref="ApplicationContext"/>'s own job and not the
+/// manager's), and each Diagnostics handler routes to the shell seam (<see cref="IAppShell"/>) and/or
+/// the <see cref="UpdateChecker"/> instead. The rule is worth stating as a rule because the previous
+/// version of this file was the opposite: it held the sink, the call transport, the router and the
+/// device factory, and the connect sequence was 140 lines of tray code that nothing could test and
+/// that had no answer at all for a phone that came back into range.
 ///
 /// <b>It does read <see cref="PackageIdentity.IsPackaged"/>, for two menu labels and nothing else.</b>
 /// Said plainly because the first draft of this comment claimed it read none at all, which the
@@ -31,11 +33,13 @@ namespace Klangbruecke;
 /// stays out of the manager on purpose - see its class comment - which is why the labels are the only
 /// place the flag surfaces at all.
 ///
-/// <b>Five things reach it, and none of them is a seam.</b> The icon it writes to, the set of glyphs
-/// it chooses one from, the presenter that writes to it, the manager it asks, and the settings - read
-/// only, for the ticks beside the menu items. Every write to those settings goes through the manager,
-/// which saves them; a view that wrote them directly would be a second author of the same file and the
-/// manager's own copy would be stale the moment it did.
+/// <b>Seven things reach it: the icon, the glyphs, the presenter, the manager, the settings, the shell,
+/// and the update checker.</b> One of them - the shell - is a seam, used only for the Diagnostics items:
+/// opening a folder, copying text, confirming a dialog, and opening a URL. The icon it writes to, the
+/// glyphs it chooses one from, the presenter that writes to it, the manager it asks, and the settings
+/// are all read-only here - for the ticks beside the menu items and the state sentence. Every write to
+/// those settings goes through the manager, which saves them; a view that wrote them directly would be a
+/// second author of the same file and the manager's own copy would be stale the moment it did.
 /// </summary>
 internal sealed class TrayContext : ApplicationContext
 {
@@ -44,6 +48,8 @@ internal sealed class TrayContext : ApplicationContext
     private readonly ContextMenuStrip _menu;
     private readonly StatusPresenter _status;
     private readonly ConnectionManager _connection;
+    private readonly IAppShell _shell;
+    private readonly UpdateChecker _updateChecker;
 
     /// <summary>
     /// The user's choices, for the ticks only. <b>Never written here.</b> See the class summary.
@@ -62,13 +68,22 @@ internal sealed class TrayContext : ApplicationContext
     /// </summary>
     private TrayIconStatus? _lastIconStatus;
 
-    public TrayContext(NotifyIcon icon, TrayIcons icons, StatusPresenter status, ConnectionManager connection, Settings settings)
+    public TrayContext(
+        NotifyIcon icon,
+        TrayIcons icons,
+        StatusPresenter status,
+        ConnectionManager connection,
+        Settings settings,
+        IAppShell shell,
+        UpdateChecker updateChecker)
     {
         _icon = icon;
         _icons = icons;
         _status = status;
         _connection = connection;
         _settings = settings;
+        _shell = shell;
+        _updateChecker = updateChecker;
 
         // Built here rather than handed in, so the field is non-null by construction and the three
         // places below that use it need no assertion. Attaching it is all NotifyIcon needs.
@@ -217,6 +232,16 @@ internal sealed class TrayContext : ApplicationContext
         _menu.Items.Add(BuildOutputMenu());
         _menu.Items.Add(new ToolStripSeparator());
 
+        var connect = new ToolStripMenuItem("Connect Now") { Enabled = _settings.PhoneDeviceId is not null };
+        connect.Click += (_, _) => _connection.RequestConnect();
+        _menu.Items.Add(connect);
+
+        var disconnect = new ToolStripMenuItem("Disconnect") { Enabled = _settings.PhoneDeviceId is not null };
+        disconnect.Click += (_, _) => _connection.RequestDisconnect();
+        _menu.Items.Add(disconnect);
+
+        _menu.Items.Add(new ToolStripSeparator());
+
         // Text, clickability and tick together, from one rule - see CallsPolicy.MenuItem. Unpackaged
         // this item used to read as switched on while nothing could ever claim the hands-free role.
         (string callsText, bool callsEnabled, bool callsTicked) =
@@ -231,15 +256,8 @@ internal sealed class TrayContext : ApplicationContext
         _menu.Items.Add(autoReconnect);
 
         _menu.Items.Add(new ToolStripSeparator());
-
-        // On the selection, not on anything live. Disconnect is a decision about the phone the user
-        // picked - it latches until that phone leaves and returns - so it is offerable exactly when
-        // there is a phone to make it about. The old test asked the call transport whether it held
-        // the hands-free role, which is a live ABI call on the menu-building path and answered for
-        // only one of the two halves.
-        var disconnect = new ToolStripMenuItem("Disconnect") { Enabled = _settings.PhoneDeviceId is not null };
-        disconnect.Click += (_, _) => _connection.RequestDisconnect();
-        _menu.Items.Add(disconnect);
+        _menu.Items.Add(BuildDiagnosticsMenu());
+        _menu.Items.Add(new ToolStripSeparator());
 
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => ExitThread();
@@ -337,6 +355,77 @@ internal sealed class TrayContext : ApplicationContext
         }
 
         return outputMenu;
+    }
+
+    private ToolStripMenuItem BuildDiagnosticsMenu()
+    {
+        var menu = new ToolStripMenuItem("Diagnostics");
+
+        var openLogs = new ToolStripMenuItem("Open Logs");
+        openLogs.Click += (_, _) => _shell.OpenFolder(FileLog.DefaultDirectory);
+        menu.DropDownItems.Add(openLogs);
+
+        var copy = new ToolStripMenuItem("Copy Diagnostics");
+        copy.Click += (_, _) => CopyDiagnostics();
+        menu.DropDownItems.Add(copy);
+
+        menu.DropDownItems.Add(new ToolStripSeparator());
+
+        var updates = new ToolStripMenuItem("Check for Updates...");
+        updates.Click += async (_, _) => await CheckForUpdatesAsync();
+        menu.DropDownItems.Add(updates);
+
+        var about = new ToolStripMenuItem("About Klangbruecke");
+        about.Click += (_, _) => ShowAbout();
+        menu.DropDownItems.Add(about);
+
+        return menu;
+    }
+
+    private void ShowAbout()
+    {
+        string body = AboutText.Build(AppVersion.Current);
+        if (_shell.Confirm("About Klangbruecke", body + "\n\nOpen the project page on GitHub?"))
+        {
+            _shell.OpenUrl(AboutText.RepoUrl);
+        }
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        UpdateCheckResult result = await _updateChecker.CheckAsync();
+
+        switch (result.Status)
+        {
+            case UpdateStatus.UpdateAvailable:
+                if (_shell.Confirm("Update available", $"{result.Latest} is available. Open the release page?"))
+                {
+                    _shell.OpenUrl(result.ReleaseUrl!);
+                }
+                break;
+
+            case UpdateStatus.UpToDate:
+                _shell.ShowInfo("You're up to date", $"Klangbruecke {result.Latest} is the latest release.");
+                break;
+
+            default:
+                _shell.ShowInfo("Couldn't check for updates", result.Message!);
+                break;
+        }
+    }
+
+    private void CopyDiagnostics()
+    {
+        IReadOnlyList<string> tail = LogTail.ReadRecent(FileLog.DefaultDirectory, DateTimeOffset.Now, 30);
+        string report = DiagnosticsReport.Build(
+            AppVersion.Current,
+            Environment.OSVersion.ToString(),
+            _connection.State.ToString(),
+            _connection.Detail,
+            tail);
+
+        _shell.CopyToClipboard(report);
+        _shell.ShowInfo("Diagnostics copied", "A diagnostics snapshot is on your clipboard. Review it before sharing.");
     }
 
     protected override void Dispose(bool disposing)

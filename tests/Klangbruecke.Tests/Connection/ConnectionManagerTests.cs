@@ -780,6 +780,60 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
     }
 
+    // --- connect now ---------------------------------------------------------------------------
+
+    [Fact]
+    public void RequestConnect_clears_a_deliberate_disconnect_and_reconnects()
+    {
+        using Harness h = new();
+
+        h.Link.RaiseAppeared();
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        h.Manager.RequestDisconnect();
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+
+        h.Manager.RequestConnect();
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    [Fact]
+    public void RequestConnect_reconnects_even_with_auto_reconnect_off()
+    {
+        using Harness h = new(autoReconnect: false);
+
+        // Present, but not connected: with auto-reconnect off and no click grant, the appear is not
+        // permitted to connect.
+        h.Link.RaiseAppeared();
+        Assert.Empty(h.Sink.ConnectCalls);
+
+        h.Manager.RequestConnect();
+        Assert.Equal(new[] { PhoneId }, h.Sink.ConnectCalls);
+    }
+
+    [Fact]
+    public void RequestConnect_with_no_phone_selected_does_nothing()
+    {
+        using Harness h = new(phoneDeviceId: null);
+
+        h.Manager.RequestConnect();
+
+        Assert.Equal(ConnectionState.Idle, h.Manager.State);
+        Assert.Empty(h.Sink.ConnectCalls);
+    }
+
+    [Fact]
+    public void RequestConnect_logs_when_a_phone_is_selected()
+    {
+        using Harness h = new();
+
+        _log.Entries.Clear();
+
+        h.Manager.RequestConnect();
+
+        Assert.Contains(_log.Entries, e => e.Level == LogLevel.Info && e.Message == "Connect requested from the tray.");
+    }
+
     // --- the reconcile -------------------------------------------------------------------------
 
     [Fact]

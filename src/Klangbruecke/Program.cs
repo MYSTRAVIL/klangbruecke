@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Net.Http;
 using System.Reflection;
+using Klangbruecke.App;
 using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
@@ -199,7 +201,13 @@ internal static class Program
         router.Status += (_, m) => status.Show(m);
         connection.Status += (_, m) => status.Show(m);
 
-        var tray = new TrayContext(icon, trayIcons, status, connection, settings);
+        var shell = new AppShell();
+
+        // One long-lived HttpClient for the process, the recommended lifetime. Not disposed - it lives as
+        // long as the tray.
+        var updateChecker = new UpdateChecker(new GitHubReleaseFeed(new HttpClient()), AppVersion.Current);
+
+        var tray = new TrayContext(icon, trayIcons, status, connection, settings, shell, updateChecker);
 
         // Only now. Everything that could throw on the way up has run, and from here the icon has an
         // owner whose Dispose hides it. See the note where it was built.
