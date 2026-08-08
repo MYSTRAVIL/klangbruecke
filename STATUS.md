@@ -9,9 +9,10 @@ is the living status rather than a stage report._
 |---|---|
 | Branch | `main`, clean, **pushed to `origin/main`** (github.com/MYSTRAVIL/klangbruecke). |
 | Stage 1 (reconnect) | **Merged and validated on hardware.** Both halves work; the connection lifecycle recovers unattended. |
-| Stage 2 (seam extraction) | **Merged (`796839d`) and pushed.** Grace window + reconcile split into their own seams; behaviour unchanged. Not yet re-validated on hardware — it is a pure refactor, but the reconnect paths deserve one live pass. |
-| Installed build | **0.2.1.0** (MSIX, sideloaded, self-signed), running in the tray |
-| Tests | **4258, all green, zero warnings** |
+| Stage 2 (seam extraction) | **Merged (`796839d`) and pushed.** Grace window + reconcile split into their own seams; behaviour unchanged. Validated on hardware in the `0.2.2.0` build below (both halves come up, reconnect works). |
+| Fast reconnect probe | **Merged (`d17da8c`) and pushed.** A 5 s probe in the reconcile bounds phone-initiated reconnect to ~5 s (was ~15–30 s: the `DeviceWatcher` never fires on reconnect, so only the poll notices). Reviewed (Opus) and validated on hardware. |
+| Installed build | **0.2.2.0** (MSIX, sideloaded, self-signed), running in the tray |
+| Tests | **4262, all green, zero warnings** |
 
 ## Shipped 2026-08-07 (this session)
 
@@ -57,8 +58,10 @@ and the plan beside it). One substantive item remains, with its prerequisite:
    changing the **system-wide default communications device** via the undocumented `IPolicyConfig` — a
    global side effect on every app's comms audio. **Decide that footprint before building.**
 
-And re-validate the Stage-2 refactor on hardware once — it is behaviour-preserving and fully green, but
-the reconnect-after-reboot and phone-initiated-reconnect paths are the historically fragile ones.
+Also parked: **option B for reconnect latency** — a `BluetoothDevice.ConnectionStatusChanged` subscription
+would make reconnect edge-driven (near-instant, kills the phone-side toast) but reintroduces a long-lived
+WinRT object the `LinkMonitor` design deliberately avoids. Only worth it if the ~5 s probe proves not
+fast enough in daily use; needs a hardware probe to confirm the event fires and survives sleep/resume.
 
 Not blockers: `ConnectAsync` returns False (§12, likely benign, untestable until it matters); the
 outgoing-call ringback does not reach the PC (§6, cosmetic).
