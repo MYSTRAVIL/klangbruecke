@@ -1,7 +1,6 @@
 using System;
 using System.IO;
 using System.Linq;
-using System.Media;
 using System.Reflection;
 using Klangbruecke.Diagnostics;
 
@@ -47,8 +46,9 @@ public sealed class SoundPlayer : ISoundPlayer
     private static System.Media.SoundPlayer Load(string fileName)
     {
         Assembly assembly = typeof(SoundPlayer).Assembly;
+        // Match "." + fileName so "connect.wav" doesn't also match "disconnect.wav" (which ends with "connect.wav").
         string name = assembly.GetManifestResourceNames()
-            .Single(n => n.EndsWith(fileName, StringComparison.Ordinal));
+            .Single(n => n.EndsWith("." + fileName, StringComparison.Ordinal));
         // Copy to a MemoryStream the SoundPlayer keeps; the manifest stream is not seekable-for-replay.
         using Stream stream = assembly.GetManifestResourceStream(name)
             ?? throw new InvalidOperationException($"Embedded chime '{name}' was null.");

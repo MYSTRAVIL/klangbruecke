@@ -204,7 +204,8 @@ public sealed class ConnectionManagerTests : IDisposable
 
     /// <summary>
     /// The one release that is neither a Disconnect nor a switch: the role would otherwise sit on a
-    /// handset the user has stopped using and go on offering this PC there.
+    /// handset the user has stopped using and go on offering this PC there. Multi-remember switch:
+    /// add the new phone first (so the set never empties), then remove the old.
     /// </summary>
     [Fact]
     public void Selecting_a_different_phone_moves_the_hands_free_role()
@@ -213,9 +214,14 @@ public sealed class ConnectionManagerTests : IDisposable
         h.ReachConnected();
         h.Calls.Transports = new[] { PhoneTransport, OtherTransport };
 
-        // To switch phones, remove the old one and add the new one.
-        h.Manager.SetPhoneRemembered(PhoneId, false);
+        // OtherPhoneId is not present yet, so adding it to the remembered set keeps the incumbent.
+        h.Link.StatusById[OtherPhoneId] = BluetoothLinkStatus.Disconnected;
+
+        // Multi-remember switch: add the new phone, then drop the old. The set never empties, so the
+        // resolver moves the active phone (and the hands-free role) exactly once - unlike removing the
+        // only remembered phone, which is "turn auto-pick off" and tears down (see the last-phone test).
         h.Manager.SetPhoneRemembered(OtherPhoneId, true);
+        h.Manager.SetPhoneRemembered(PhoneId, false);
         h.Marshaller!.Drain(); // Drain resolver before asserting connects.
 
         Assert.Equal(1, h.Calls.DisconnectCount);
@@ -940,6 +946,25 @@ public sealed class ConnectionManagerTests : IDisposable
         h.ReachConnected();
 
         h.Manager.ClearRememberedPhones();
+
+        Assert.Null(h.Settings.PhoneDeviceId);
+        Assert.Equal(ConnectionState.Idle, h.Manager.State);
+        Assert.Equal(1, h.Link.StopWatchingCount);
+    }
+
+    /// <summary>
+    /// Unchecking the last remembered phone should tear down exactly like "None" (ClearRememberedPhones).
+    /// Regression: the remove branch called ResolveActivePhoneAsync, which early-returned on an empty set,
+    /// leaving PhoneDeviceId set (bridge up) and Migrate resurrecting it next load.
+    /// </summary>
+    [Fact]
+    public void Removing_the_last_remembered_phone_tears_down_like_None()
+    {
+        using Harness h = new(phoneDeviceId: PhoneId);
+        h.ReachConnected();
+
+        h.Manager.SetPhoneRemembered(PhoneId, false);
+        h.Marshaller!.Drain(); // Drain resolver before asserting.
 
         Assert.Null(h.Settings.PhoneDeviceId);
         Assert.Equal(ConnectionState.Idle, h.Manager.State);

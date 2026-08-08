@@ -348,7 +348,9 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
             }
             else
             {
-                // Re-remembering an already-remembered phone: force reconnect to it (tray re-pick).
+                // Re-remembering an already-remembered phone: force reconnect to it. This path is reached
+                // by an explicit re-pick (the grant re-pick tests; a possible future "reconnect" affordance)
+                // — the checkable submenu always passes !Contains(id), so it removes rather than re-adds.
                 SetActivePhone(id);
             }
         }
@@ -356,6 +358,16 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         {
             if (_settings.RememberedPhoneIds.Remove(id))
             {
+                if (_settings.RememberedPhoneIds.Count == 0)
+                {
+                    // Removing the last remembered phone is the same intent as "None": stop caring about phones.
+                    // The resolver early-returns on an empty set, so it would leave PhoneDeviceId set (bridge up,
+                    // and Migrate would resurrect it next load) — delegate to the full teardown, which clears
+                    // PhoneDeviceId, stops watching, resets latch/grant, and publishes.
+                    ClearRememberedPhones();
+                    return;
+                }
+
                 _settings.Save();
                 // Removed a phone: let the resolver pick from what's left.
                 _ = ResolveActivePhoneAsync();
