@@ -13,7 +13,7 @@ stage report._
 | Fast reconnect probe | **Merged (`d17da8c`) and pushed.** A 5 s probe in the reconcile bounds phone-initiated reconnect to ~5 s. Reviewed (Opus) and validated on hardware. |
 | Tray UX bundle | **Merged (`c9ff72e`) and pushed.** Connect Now, Open Logs, About, Check for Updates, Copy Diagnostics, README troubleshooting — behind one `IAppShell` seam. Subagent-driven, whole-branch review clean. Installed as `0.2.3.0` and validated on hardware (both halves reconnected after the upgrade). |
 | Installed build | **0.2.3.0** (MSIX, sideloaded, self-signed), running in the tray |
-| Tests | **4282, all green, zero warnings** |
+| Tests | **4290, all green, zero warnings** |
 
 ## Shipped 2026-08-08 (tray UX bundle)
 
@@ -60,15 +60,11 @@ HFP call audio to a chosen PC output means changing the **system-wide default co
 the undocumented `IPolicyConfig` — a global side effect on every app's comms audio. Reopen only if a
 non-global routing lever appears.
 
-Immediate follow-ups from the bundle's whole-branch review (small, non-blocking polish):
-
-1. **Copy Diagnostics spans only today's log.** `LogTail.ReadRecent` reads a single day, so a snapshot
-   taken shortly after midnight misses the prior evening — on the exact path the snapshot exists to debug.
-   Make it span the day boundary.
-2. **Null-guard consistency** across the pure units (`AboutText.Build` guards; `DiagnosticsReport.Build`
-   does not — inputs are never null in practice).
-3. **A few edge-case tests** — `LogTail` (count=0 / negative / empty file), `AboutText` (RepoUrl), broader
-   `DiagnosticsReport`.
+The bundle's whole-branch-review follow-ups are **done** (2026-08-08, `0.2.4.0` in dev, commit `dbdbc22`):
+`LogTail.ReadRecent` now spans the day boundary (Copy Diagnostics no longer loses the prior evening across
+midnight); `DiagnosticsReport.Build` gained null guards for parity with `AboutText`; and the deferred
+edge-case tests were added (suite now 4290). **Not yet released — the last release and installed build are
+`0.2.3.0`.**
 
 Also parked: **option B for reconnect latency** — a `BluetoothDevice.ConnectionStatusChanged` subscription
 would make reconnect edge-driven but reintroduces a long-lived WinRT object `LinkMonitor` avoids. Only
@@ -82,7 +78,8 @@ the PC (§6, cosmetic).
 - **Run the suite unfiltered** (or `--logger "console;verbosity=detailed"`). A rare flake was seen
   historically and its name was lost to a `grep` pipe both times; unfiltered, a flake names itself.
 - **Bump the version in both `Klangbruecke.csproj` and `packaging/AppxManifest.xml`** or `Add-AppxPackage`
-  will not upgrade. Currently `0.2.3.0`. `Add-AppxPackage` runs from **Windows PowerShell**, not pwsh.
+  will not upgrade. Currently `0.2.4.0` in dev; the last release and installed build are `0.2.3.0`.
+  `Add-AppxPackage` runs from **Windows PowerShell**, not pwsh.
 
 ## Where the record lives
 

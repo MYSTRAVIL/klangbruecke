@@ -16,7 +16,7 @@
          and Task 9 reads that log to tell one installed build from another. Unset, the SDK defaults
          to 1.0.0.0 and the banner reports a version the package has never carried. Two files, no
          enforcement: bump both. -->
-    <Version>0.2.3.0</Version>
+    <Version>0.2.4.0</Version>
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <!-- The .exe's Win32 icon - taskbar, Alt+Tab, Explorer. The tray glyphs are separate (embedded
