@@ -749,3 +749,27 @@ OS answers "not present". Reopen only if the platform moves: a Store-signed pack
 Win11 denial (itself unverified, and a different distribution model than this project's sideload premise)
 running on a Win11 build that carries v6. Do **not** treat "just upgrade to Win11" as the fix — it trades
 a working call path for a broken one (CLAUDE.md trap 3, and the friend's report confirms it).
+
+## 16. Call control is Windows', not ours — and the in-call keypad (DTMF) is out of reach on Win10
+
+Observed 2026-08-08: with the hands-free transport registered, an incoming call raises Windows' own
+call UI — an accept/decline popup, then an in-call window with mute, hang-up and a keypad. **None of
+this is Klangbruecke code.** `CallTransportService` registers the `PhoneLineTransportDevice` role and
+routes the *audio*; it draws no UI (grep for accept/decline/keypad/DTMF in `src` returns nothing). The
+shell supplies the entire call-control experience on top of any registered phone-line transport. So
+"call control from the PC" is not a feature to build — the OS already provides it, for free, the moment
+this app claims the role.
+
+The one control that does **not** work is the **keypad**: pressing digits sends no DTMF to the phone.
+That is consistent with everything else here:
+
+- It is the one control that needs tones *injected* (HFP `AT+VTS` down to the phone), not just the call
+  steered — so it depends on the inbox HFP client landing `AT+VTS` through the 2021 MediaTek RZ616
+  driver (§11's lone non-Microsoft component), which it evidently does not.
+- There is no app-side lever either: the `Windows.ApplicationModel.Calls` surface an app would use to
+  touch a call programmatically (`PhoneCall` / `PhoneLine`) is **absent on Win10 19045** — the same
+  `CallsPhoneContract` v6 ceiling measured in §15.1. So the shell's keypad cannot be worked around from
+  WinRT on this OS.
+
+Doubly out of reach — not our UI, and no app-side API — so **WONTFIX**, the same platform ceiling as
+§15. Do not re-chase it. If a call needs a keypad (phone trees), take it on the phone.
