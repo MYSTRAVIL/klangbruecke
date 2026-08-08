@@ -331,7 +331,7 @@ internal sealed class TrayContext : ApplicationContext
         // Mirrors the Output submenu's "System default", and it is the only way to tell the app to
         // stop caring about phones at all - Disconnect is a latch that expires when the phone leaves
         // and returns, which is a different thing.
-        var none = new ToolStripMenuItem("None") { Checked = _settings.PhoneDeviceId is null };
+        var none = new ToolStripMenuItem("None") { Checked = _settings.RememberedPhoneIds.Count == 0 };
         none.Click += (_, _) => _connection.ClearRememberedPhones();
         phoneMenu.DropDownItems.Add(none);
         phoneMenu.DropDownItems.Add(new ToolStripSeparator());
@@ -347,17 +347,19 @@ internal sealed class TrayContext : ApplicationContext
 
             foreach (PhoneDevice device in devices)
             {
-                // The selected phone, not the connected one. They differ for the whole of every
-                // range exit and every reconnect, and the old reading left the menu with no tick at
-                // all while the tray was reporting "waiting for the phone to appear" - so the one
-                // screen that could have said which phone it was waiting for did not.
-                var item = new ToolStripMenuItem(device.Name)
+                // Checked = remembered (a member of the auto-pick set). The " (connected)" suffix marks
+                // the one that is actually up right now - read from the manager's state, not a live ABI
+                // call on the menu path.
+                bool isConnected = device.Id == _settings.PhoneDeviceId
+                    && _connection.State is ConnectionState.Connected or ConnectionState.Degraded;
+                string label = isConnected ? $"{device.Name} (connected)" : device.Name;
+                var item = new ToolStripMenuItem(label)
                 {
-                    Checked = device.Id == _settings.PhoneDeviceId,
+                    Checked = _settings.RememberedPhoneIds.Contains(device.Id),
                 };
 
                 string id = device.Id;
-                item.Click += (_, _) => _connection.SetPhoneRemembered(id, true);
+                item.Click += (_, _) => _connection.SetPhoneRemembered(id, !_settings.RememberedPhoneIds.Contains(id));
                 phoneMenu.DropDownItems.Add(item);
             }
         }
