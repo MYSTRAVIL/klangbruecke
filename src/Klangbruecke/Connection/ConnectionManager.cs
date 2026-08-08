@@ -88,6 +88,7 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     private readonly Reconciler _reconciler;
 
     private IDisposable? _resumeTimer;
+    private IDisposable? _resolverTick;
 
     private bool _started;
     private bool _disposed;
@@ -266,6 +267,9 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 
         ApplySettingsToHalves();
 
+        // If there's an active phone already (from settings), set up watching before the resolver runs.
+        // The resolver's "incumbent kept" path doesn't start watching, so this ensures an initial
+        // PhoneDeviceId is watched even if the resolver keeps it.
         if (_settings.PhoneDeviceId is { } phoneDeviceId)
         {
             // Absent, not Present: selection is an intent and nothing has looked for the phone yet.
@@ -284,6 +288,13 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         _endpoints.Start();
 
         _reconciler.Start();
+
+        // The resolver picks the active phone from the remembered set. Run it at startup so an upgraded
+        // user whose single PhoneDeviceId was migrated into RememberedPhoneIds behaves as before.
+        _ = ResolveActivePhoneAsync();
+
+        // And schedule the 30 s periodic tick. Disposed in Dispose.
+        _resolverTick = _scheduler.SchedulePeriodic(TimeSpan.FromSeconds(30), () => _ = ResolveActivePhoneAsync());
 
         Publish();
     }
@@ -307,23 +318,109 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         : _router.ListOutputs();
 
     /// <summary>
-    /// The user picked a phone. The most explicit "connect to this" the app has: it clears the
-    /// suppression latch whatever the reason, and it grants permission to connect even with
-    /// auto-reconnect off.
+    /// Add or remove a phone from the remembered set. When adding a phone that's already remembered,
+    /// forces a reconnect to it (like a tray re-pick). When adding a new phone, the resolver picks
+    /// based on presence.
     /// </summary>
-    public void SelectPhone(string deviceId)
+    public void SetPhoneRemembered(string id, bool remembered)
     {
         if (_disposed)
         {
             return;
         }
 
-        bool phoneChanged = !string.Equals(_settings.PhoneDeviceId, deviceId, StringComparison.Ordinal);
+        if (remembered)
+        {
+            bool alreadyRemembered = _settings.RememberedPhoneIds.Contains(id);
+            if (!alreadyRemembered)
+            {
+                _settings.RememberedPhoneIds.Add(id);
+                _settings.Save();
+                // Adding a new phone: let the resolver pick based on presence.
+                _ = ResolveActivePhoneAsync();
+            }
+            else
+            {
+                // Re-remembering an already-remembered phone: force reconnect to it (tray re-pick).
+                SetActivePhone(id);
+            }
+        }
+        else
+        {
+            if (_settings.RememberedPhoneIds.Remove(id))
+            {
+                _settings.Save();
+                // Removed a phone: let the resolver pick from what's left.
+                _ = ResolveActivePhoneAsync();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Clear the remembered phone set and stop watching. The app goes dormant until a phone is
+    /// remembered again.
+    /// </summary>
+    public void ClearRememberedPhones()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _settings.RememberedPhoneIds.Clear();
+        _settings.Save();
+
+        _settings.PhoneDeviceId = null;
+
+        _latch.OnPhoneSelectionChanged();
+        _clickGrant = ClickGrant.None;
+        _graceWindow.Cancel();
+
+        _calls.OnPhoneDeselected();
+        ApplySettingsToHalves();
+
+        _linkMachine.OnPhoneDeselected();
+        _linkMonitor.StopWatching();
+
+        Publish();
+    }
+
+    /// <summary>
+    /// Enable or disable event sounds (connection/disconnection notifications). Saved and
+    /// published.
+    /// </summary>
+    public void SetEventSounds(bool enabled)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _settings.EventSounds = enabled;
+        _settings.Save();
+
+        Publish();
+    }
+
+    /// <summary>
+    /// Make the given phone active: set <c>PhoneDeviceId</c>, clear the suppression latch, grant
+    /// permission, cancel the grace window, handle calls-role on change, notify the link machine, start
+    /// watching, and run the reconcile. This is the generalized old <c>SelectPhone</c> body, now called
+    /// by the resolver when it picks a phone from the remembered set.
+    /// </summary>
+    private void SetActivePhone(string id)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        bool phoneChanged = !string.Equals(_settings.PhoneDeviceId, id, StringComparison.Ordinal);
 
         // Saved before anything is attempted, and deliberately saved even if everything below fails:
         // this is the user's answer to "which phone", not a record of what happened to connect, and
         // the packaged build has to be able to come back to it after a reboot (FINDINGS.md section 8).
-        _settings.PhoneDeviceId = deviceId;
+        _settings.PhoneDeviceId = id;
         _settings.Save();
 
         _latch.OnPhoneSelectionChanged();
@@ -342,12 +439,12 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         ApplySettingsToHalves();
 
         _linkMachine.OnPhoneSelected();
-        _linkMonitor.Watch(deviceId);
+        _linkMonitor.Watch(id);
 
         // Through the reconcile rather than straight into a connect: the phone's presence is a
         // question only the radio can answer, the pass already asks it, and routing this through the
         // same five checks as everything else is what keeps one connect path in the class.
-        _ = _reconciler.RunAsync("phone selected", userAsked: true);
+        _ = _reconciler.RunAsync("phone resolved", userAsked: true);
 
         // The repaint this click owes the tray, because the pass above cannot be relied on for it: a
         // pass that started under ReconcileStall ago returns at the defer check without publishing,
@@ -371,27 +468,70 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         _clickGrant = granted;
     }
 
-    public void DeselectPhone()
+    /// <summary>
+    /// Resolve the active phone from the remembered set: read link status for each remembered phone,
+    /// call <see cref="PhonePicker.Pick"/>, then act on the result. Null means no phones present, so
+    /// stop watching and go dormant. A pick that differs from the current active phone means switch to
+    /// it via <see cref="SetActivePhone"/>. Otherwise keep the incumbent.
+    ///
+    /// Runs at <see cref="Start"/>, on the active-phone-lost path, and on a 30 s periodic tick.
+    /// Re-checks <c>_disposed</c> after each await and honors the disposed/superseded discipline.
+    /// </summary>
+    private async Task ResolveActivePhoneAsync()
     {
+        if (_disposed || _settings.RememberedPhoneIds.Count == 0)
+        {
+            return;
+        }
+
+        // Build a presence map by awaiting ReadLinkStatusForAsync for each remembered phone.
+        Dictionary<string, bool> presenceMap = new();
+
+        foreach (string id in _settings.RememberedPhoneIds)
+        {
+            BluetoothLinkStatus status = await _linkMonitor.ReadLinkStatusForAsync(id);
+
+            if (_disposed)
+            {
+                return;
+            }
+
+            presenceMap[id] = status == BluetoothLinkStatus.Connected;
+        }
+
+        // Call the pure picker.
+        string? pick = PhonePicker.Pick(_settings.PhoneDeviceId, _settings.RememberedPhoneIds, id => presenceMap.GetValueOrDefault(id, false));
+
         if (_disposed)
         {
             return;
         }
 
-        _settings.PhoneDeviceId = null;
-        _settings.Save();
+        // Act on the result.
+        if (pick is null)
+        {
+            // No phones present: stop watching and go dormant (similar to ClearRememberedPhones but
+            // without clearing the remembered set).
+            _settings.PhoneDeviceId = null;
 
-        _latch.OnPhoneSelectionChanged();
-        _clickGrant = ClickGrant.None;
-        _graceWindow.Cancel();
+            _latch.OnPhoneSelectionChanged();
+            _clickGrant = ClickGrant.None;
+            _graceWindow.Cancel();
 
-        _calls.OnPhoneDeselected();
-        ApplySettingsToHalves();
+            _calls.OnPhoneDeselected();
+            ApplySettingsToHalves();
 
-        _linkMachine.OnPhoneDeselected();
-        _linkMonitor.StopWatching();
+            _linkMachine.OnPhoneDeselected();
+            _linkMonitor.StopWatching();
 
-        Publish();
+            Publish();
+        }
+        else if (!string.Equals(pick, _settings.PhoneDeviceId, StringComparison.Ordinal))
+        {
+            // Picked phone differs from current: switch to it.
+            SetActivePhone(pick);
+        }
+        // else: incumbent kept, nothing to do.
     }
 
     public void SelectOutput(string? deviceId)
@@ -472,9 +612,9 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 
             // The latch clearing is a reported change in its own right, and the pass below cannot be
             // relied on to say so: one that started under ReconcileStall ago returns without
-            // publishing. See SelectPhone, which had the same hole for the same reason.
+            // publishing. See SetActivePhone, which had the same hole for the same reason.
             //
-            // No grant to protect here, unlike SelectPhone's: the setting this method has just turned
+            // No grant to protect here, unlike SetActivePhone's: the setting this method has just turned
             // on is itself what ConnectPermitted reads, so a release by this Publish cannot take the
             // permission away from the pass below.
             Publish();
@@ -507,18 +647,18 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     }
 
     /// <summary>
-    /// Connect now, to the phone already selected. The manual, one-shot override: it clears the
+    /// Connect now, to a phone in the remembered set. The manual, one-shot override: it clears the
     /// suppression latch (whether a deliberate Disconnect or an auto-reconnect-off suppression) and grants
-    /// a connect even with auto-reconnect off - exactly as <see cref="SelectPhone"/> does - but changes
-    /// neither the selected phone, the calls role, nor the auto-reconnect setting.
+    /// a connect even with auto-reconnect off - exactly as <see cref="SetPhoneRemembered"/> does - but
+    /// changes neither the remembered set, the calls role, nor the auto-reconnect setting.
     ///
     /// The grant is one-shot: <see cref="ReleaseClickGrantIfDelivering"/> drops it once a half is
     /// delivering, so after the next drop with auto-reconnect off the app goes dormant again, matching the
-    /// toggle. Nothing to connect to with no phone selected, so that is a no-op.
+    /// toggle. Nothing to connect to with no remembered phones, so that is a no-op.
     /// </summary>
     public void RequestConnect()
     {
-        if (_disposed || _settings.PhoneDeviceId is null)
+        if (_disposed || _settings.RememberedPhoneIds.Count == 0)
         {
             return;
         }
@@ -529,15 +669,16 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         _clickGrant = ClickGrant.Phone;
         _graceWindow.Cancel();
 
-        // Through the reconcile, the one connect path in the class - as SelectPhone does.
-        _ = _reconciler.RunAsync("connect requested", userAsked: true);
+        // Force reconnect to the active phone if set, otherwise pick from the remembered set.
+        // Unlike the resolver (which only switches when needed), RequestConnect is a manual "connect NOW"
+        // command that must reconnect even to the incumbent.
+        string? target = _settings.PhoneDeviceId ?? _settings.RememberedPhoneIds.FirstOrDefault();
+        if (target is not null)
+        {
+            SetActivePhone(target);
+        }
 
-        // Preserve the grant across the repaint, for the reason SelectPhone documents: Refresh releases it
-        // the moment every enabled half looks satisfied, which on a same-phone re-drive is true before the
-        // pass has checked either half.
-        ClickGrant granted = _clickGrant;
-        Publish();
-        _clickGrant = granted;
+        // No need to preserve the grant here - SetActivePhone above already did that dance.
     }
 
     public void Dispose()
@@ -566,6 +707,8 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         _graceWindow.Dispose();
         _resumeTimer?.Dispose();
         _resumeTimer = null;
+        _resolverTick?.Dispose();
+        _resolverTick = null;
 
         // Neither half is IDisposable and both can be holding a scheduler handle at this point - a
         // connect retry, a route retry, a registration retry. These two calls are what release them,
@@ -616,6 +759,10 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
             // when it comes back into range, so releasing it here would cost the user the entry in
             // their handset's own picker - see CallsHalf's missing OnLinkAbsent.
             _music.OnLinkAbsent();
+
+            // The active phone is lost. Run the resolver to switch to another remembered phone if one
+            // is present.
+            _ = ResolveActivePhoneAsync();
         }
 
         Publish();

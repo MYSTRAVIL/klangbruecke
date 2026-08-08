@@ -299,7 +299,7 @@ internal sealed class Reconciler
                     // half that still believes in a connection the sink no longer has is stale, not
                     // ambiguous. Opening a window would answer "the link is up, so the audio profile
                     // was dropped deliberately" and suppress the app three seconds after the click -
-                    // and SelectPhone cancelling the previous window is what made that reachable.
+                    // and SetActivePhone cancelling the previous window is what made that reachable.
                     //
                     // OnSuppressed is the teardown, not a claim about why: the half offers no
                     // "start again" input, and every other route out of Linked in this class ends at

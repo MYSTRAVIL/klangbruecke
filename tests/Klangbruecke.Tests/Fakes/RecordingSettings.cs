@@ -12,7 +12,7 @@ namespace Klangbruecke.Tests.Fakes;
 /// forgot my phone". That is the whole reason <see cref="Settings.Save"/> is virtual.
 ///
 /// <see cref="OnSave"/> is what lets a test assert <em>ordering</em> rather than only that a save
-/// happened: the one property the brief pins about <c>SelectPhone</c> is that the phone id reaches
+/// happened: the one property the brief pins about <c>SetActivePhone</c> is that the phone id reaches
 /// the settings file before anything is connected, because the packaged build has to be able to come
 /// back to it after a reboot even if this attempt fails.
 /// </summary>

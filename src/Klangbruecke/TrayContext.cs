@@ -276,7 +276,7 @@ internal sealed class TrayContext : ApplicationContext
         // stop caring about phones at all - Disconnect is a latch that expires when the phone leaves
         // and returns, which is a different thing.
         var none = new ToolStripMenuItem("None") { Checked = _settings.PhoneDeviceId is null };
-        none.Click += (_, _) => _connection.DeselectPhone();
+        none.Click += (_, _) => _connection.ClearRememberedPhones();
         phoneMenu.DropDownItems.Add(none);
         phoneMenu.DropDownItems.Add(new ToolStripSeparator());
 
@@ -301,7 +301,7 @@ internal sealed class TrayContext : ApplicationContext
                 };
 
                 string id = device.Id;
-                item.Click += (_, _) => _connection.SelectPhone(id);
+                item.Click += (_, _) => _connection.SetPhoneRemembered(id, true);
                 phoneMenu.DropDownItems.Add(item);
             }
         }
