@@ -20,4 +20,10 @@ public sealed class AboutTextTests
     {
         Assert.Throws<ArgumentNullException>(() => AboutText.Build(null!));
     }
+
+    [Fact]
+    public void RepoUrl_is_the_GitHub_repository()
+    {
+        Assert.Equal("https://github.com/MYSTRAVIL/klangbruecke", AboutText.RepoUrl);
+    }
 }

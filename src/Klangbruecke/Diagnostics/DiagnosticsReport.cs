@@ -14,6 +14,12 @@ public static class DiagnosticsReport
         string detail,
         IReadOnlyList<string> recentLogLines)
     {
+        ArgumentNullException.ThrowIfNull(version);
+        ArgumentNullException.ThrowIfNull(os);
+        ArgumentNullException.ThrowIfNull(state);
+        ArgumentNullException.ThrowIfNull(detail);
+        ArgumentNullException.ThrowIfNull(recentLogLines);
+
         var sb = new StringBuilder();
         sb.AppendLine("Klangbruecke diagnostics - review before sharing (includes device names).");
         sb.AppendLine();
