@@ -74,3 +74,30 @@ pushed branch name, and the pending hardware-smoke checklist (left-click menu; t
 connect/disconnect/degrade; auto-pick with two phones — connect whichever is on, and that an incumbent
 isn't dropped when the other appears). The user will smoke-test, then decide merge + release + version
 bump.
+
+## Decisions made without you (headless run, 2026-08-08)
+Full detail + rationale in the ledger: `.superpowers/sdd/2026-08-08-tray-ux-bundle-2/progress.md`.
+- **D1 (Task 7 ordering):** Task 7 removed `SelectPhone`/`DeselectPhone` AND, in the same commit, updated
+  the two TrayContext call sites + the `<see cref>` doc ref — leaving TrayContext calling removed methods
+  would have failed Task 7's zero-warning build gate. Task 9 then did the checkable-submenu redesign. Net:
+  zero `SelectPhone`/`DeselectPhone` references after Task 7.
+- **D2 (Task 7 review, CRITICAL, fixed):** the async resolver was missing the brief-mandated *superseded*
+  discipline and enumerated the live remembered set across the `await`. Fixed with a snapshot + an
+  `_resolveGeneration` token (checked after each await / before acting; bumped at resolve entry and in
+  `SetActivePhone`/`ClearRememberedPhones`).
+- **D3 (Task 7 review, Important, deferred→resolved):** the `SetPhoneRemembered` already-remembered→force-switch
+  asymmetry was deferred to Task 9; Task 9's toggle (`SetPhoneRemembered(id, !Contains(id))`) means clicking a
+  remembered phone REMOVES it, so the force-switch branch is never user-reachable — the final review confirmed
+  no "click-twice" wart. The branch is kept because the re-pick grant tests exercise it.
+- **D4 (final fix wave):** the whole-branch (opus) review caught two real defects every per-task review missed:
+  (1) **CRITICAL** — `SoundPlayer` matched WAV resources by bare suffix, so `"connect.wav"` also matched
+  `"disconnect.wav"` → `.Single()` threw at construction → an **uncatchable startup crash** (the app would never
+  launch); fixed to match `"." + fileName`. (2) **IMPORTANT** — unchecking the *last* remembered phone left the
+  bridge up and let `Migrate` resurrect it on restart; fixed to tear down (delegate to `ClearRememberedPhones`).
+  Fixing (2) required reordering `Selecting_a_different_phone_moves_the_hands_free_role` to switch via
+  add-new-then-remove-old (the realistic multi-remember order) — assertions unchanged. Two regression tests added.
+
+## Outcome (headless run complete)
+Branch **`tray-ux-bundle-2`** pushed to origin (11 commits, `daf8ae0..4be49a5`). Controller-verified at HEAD:
+`dotnet build` 0 warnings / 0 errors; `dotnet test` **4319 passed, 0 failed**. Whole-branch review clean after
+one fix wave. NOT merged, NO release, NO version bump — left to the user after the hardware smoke.
