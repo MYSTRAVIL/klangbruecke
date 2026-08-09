@@ -853,6 +853,27 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Contains(_log.Entries, e => e.Level == LogLevel.Info && e.Message == "Connect requested from the tray.");
     }
 
+    [Fact]
+    public void RequestConnect_actively_attempts_connect_when_the_phone_reads_absent()
+    {
+        using Harness h = new();
+
+        // The phone is selected and being watched, but mark it absent. The reconcile's link read
+        // will report Disconnected, so SetActivePhone's reconcile path sees an absent phone - exactly
+        // the state a paired but currently out-of-range phone reads as. The startup Status was
+        // Connected (harness default), so this is a deliberate absent staging.
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+
+        h.Manager.RequestConnect();
+        h.Marshaller!.Drain();
+
+        // The connect was attempted despite the phone reading absent. This is the new behavior:
+        // Connect Now must actively pull a paired phone up, not just wait for the radio to report
+        // it present. OpenAsync can do that (Windows' own "Connect" uses the same path), so the
+        // attempt proves the active reach-out.
+        Assert.Contains(PhoneId, h.Sink.ConnectCalls);
+    }
+
     // --- auto-pick resolver --------------------------------------------------------------------
 
     /// <summary>

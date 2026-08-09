@@ -697,6 +697,16 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         if (target is not null)
         {
             SetActivePhone(target);
+
+            // Actively reach out - do not just wait for the phone to appear. SetActivePhone's reconcile
+            // only connects a phone the radio already reports present; a deliberate Connect Now must also
+            // pull a paired, in-range but currently-disconnected phone up. AudioPlaybackConnection.OpenAsync
+            // does exactly that (the same thing Windows' own "Connect" does), so drive the halves' connect
+            // turn directly here, bypassing the manager's presence gate. If the phone is genuinely
+            // unreachable OpenAsync fails and the music half's connect backoff handles it - a bounded retry,
+            // not a wedge. The half's State != Off guard makes this a no-op when the reconcile above already
+            // connected a present phone, so there is no double-attempt.
+            _ = ConnectHalvesAsync();
         }
 
         // No need to preserve the grant here - SetActivePhone above already did that dance.
