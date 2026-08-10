@@ -78,6 +78,22 @@ internal sealed class TrayContext : ApplicationContext
     private bool _menuRebuilt;
 
     /// <summary>
+    /// WinForms auto-shows a <see cref="NotifyIcon"/>'s <see cref="ContextMenuStrip"/> only on
+    /// right-click, and does it through this private method - which calls <c>SetForegroundWindow</c>
+    /// first. That foreground call is load-bearing: a menu shown from a left-click without it appears
+    /// unfocused and dismisses on the same click, which reads as "left-click does nothing". So
+    /// left-click invokes the very same method (see the <see cref="NotifyIcon.MouseUp"/> handler),
+    /// taking the identical path as right-click - it raises Opening, and <see cref="OnMenuOpening"/>
+    /// rebuilds and shows as before, now with the foreground correctly set. Cached once; null only if a
+    /// future WinForms renames it, in which case left-click falls back to a direct (foreground-less)
+    /// show rather than crashing.
+    /// </summary>
+    private static readonly System.Reflection.MethodInfo? ShowContextMenuMethod =
+        typeof(NotifyIcon).GetMethod(
+            "ShowContextMenu",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+    /// <summary>
     /// The glyph bucket the tray is currently showing, so <see cref="UpdateIcon"/> repaints only when
     /// it actually changes. Null until the first paint. UI thread only, like everything else here.
     /// </summary>
@@ -112,10 +128,27 @@ internal sealed class TrayContext : ApplicationContext
         _icon.ContextMenuStrip = _menu;
         _menu.Opening += OnMenuOpening;
 
-        // Left-click also opens the menu, via the same rebuild-and-show path. MouseUp rather than
-        // Click, so the menu appears at the click position (Cursor.Position) before the mouse has
-        // moved away.
-        _icon.MouseUp += (_, e) => { if (e.Button == MouseButtons.Left) _ = ShowContextMenuAsync(); };
+        // Left-click opens the menu too, by the exact path right-click uses. Directly calling
+        // _menu.Show() from a left-click skips the foreground activation WinForms does for a
+        // right-click, so the menu opens unfocused and closes on the same click - see
+        // ShowContextMenuMethod. Invoking that private method instead sets the foreground and raises
+        // Opening, which OnMenuOpening rebuilds and shows as usual.
+        _icon.MouseUp += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left)
+            {
+                return;
+            }
+
+            if (ShowContextMenuMethod is not null)
+            {
+                ShowContextMenuMethod.Invoke(_icon, null);
+            }
+            else
+            {
+                _ = ShowContextMenuAsync();
+            }
+        };
 
         // Both, and the second is not a nicety. The tooltip is one line with two writers - these, and
         // every component's own Status - so a component announcement displaces the state sentence and
