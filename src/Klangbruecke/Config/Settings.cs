@@ -27,6 +27,12 @@ public class Settings
     /// <summary>Route call audio through the HFP hands-free transport.</summary>
     public bool EnableCalls { get; set; } = true;
 
+    /// <summary>Phones to auto-connect: whichever is present wins (first-present). See PhonePicker.</summary>
+    public List<string> RememberedPhoneIds { get; set; } = new();
+
+    /// <summary>Play a chime on connect / disconnect / degrade.</summary>
+    public bool EventSounds { get; set; } = true;
+
     [JsonIgnore]
     public static string Directory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Klangbruecke");
@@ -42,7 +48,7 @@ public class Settings
         {
             if (File.Exists(FilePath))
             {
-                return JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new Settings();
+                return Migrate(JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new Settings());
             }
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
@@ -52,7 +58,19 @@ public class Settings
             Log.Warn($"Could not read settings, starting from defaults: {ex.Message}");
         }
 
-        return new Settings();
+        return Migrate(new Settings());
+    }
+
+    // Seed the remembered set from a pre-bundle-2 single selection, so an upgrade keeps auto-connecting
+    // the one phone the user had picked. Idempotent: only fires when nothing is remembered yet.
+    internal static Settings Migrate(Settings settings)
+    {
+        if (settings.RememberedPhoneIds.Count == 0 && settings.PhoneDeviceId is not null)
+        {
+            settings.RememberedPhoneIds.Add(settings.PhoneDeviceId);
+        }
+
+        return settings;
     }
 
     /// <summary>

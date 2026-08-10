@@ -40,6 +40,12 @@ public sealed class FakeLinkMonitor : ILinkMonitor
     /// </summary>
     public BluetoothLinkStatus Status { get; set; } = BluetoothLinkStatus.Disconnected;
 
+    /// <summary>
+    /// Per-device staged presence so resolver tests can say "A present, B absent." Unmapped ids fall
+    /// back to <see cref="Status"/>.
+    /// </summary>
+    public Dictionary<string, BluetoothLinkStatus> StatusById { get; } = new();
+
     public bool DevicePresent { get; private set; }
 
     public event EventHandler? DeviceAppeared;
@@ -88,6 +94,13 @@ public sealed class FakeLinkMonitor : ILinkMonitor
 
     /// <summary>Answers the oldest read still waiting. Throws if none is.</summary>
     public void CompleteRead(BluetoothLinkStatus status) => _pending.Dequeue().SetResult(status);
+
+    /// <summary>
+    /// Read the status of a named device, independent of the watched one. Returns from
+    /// <see cref="StatusById"/> if mapped, otherwise falls back to <see cref="Status"/>.
+    /// </summary>
+    public Task<BluetoothLinkStatus> ReadLinkStatusForAsync(string deviceId) =>
+        Task.FromResult(StatusById.GetValueOrDefault(deviceId, Status));
 
     /// <summary>The watcher saw the phone.</summary>
     public void RaiseAppeared()

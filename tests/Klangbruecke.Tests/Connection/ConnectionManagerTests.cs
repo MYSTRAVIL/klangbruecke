@@ -101,7 +101,7 @@ public sealed class ConnectionManagerTests : IDisposable
 
     /// <summary>
     /// Start is wired from a constructor that Task 17 owns, and a second call would double every
-    /// subscription: two watchers, two reconcile timers, two of every inbound event.
+    /// subscription: two watchers, two reconcile timers, two resolver timers, two of every inbound event.
     /// </summary>
     [Fact]
     public void Start_is_idempotent()
@@ -111,7 +111,7 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Manager.Start();
 
         Assert.Equal(new[] { PhoneId }, h.Link.WatchCalls);
-        Assert.Equal(1, h.Scheduler.PendingCount);
+        Assert.Equal(2, h.Scheduler.PendingCount); // Reconciler + resolver periodic ticks.
     }
 
     [Fact]
@@ -179,7 +179,7 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new(phoneDeviceId: null);
 
         int connectsAtFirstSave = -1;
-        string? idAtFirstSave = "not saved";
+        bool rememberedAtFirstSave = false;
         h.Settings.OnSave = () =>
         {
             if (connectsAtFirstSave >= 0)
@@ -188,12 +188,13 @@ public sealed class ConnectionManagerTests : IDisposable
             }
 
             connectsAtFirstSave = h.Sink.ConnectCalls.Count;
-            idAtFirstSave = h.Settings.PhoneDeviceId;
+            rememberedAtFirstSave = h.Settings.RememberedPhoneIds.Contains(PhoneId);
         };
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain resolver before asserting connects.
 
-        Assert.Equal(PhoneId, idAtFirstSave);
+        Assert.True(rememberedAtFirstSave); // Phone was remembered before connects.
         Assert.Equal(0, connectsAtFirstSave);
 
         Assert.Equal(new[] { PhoneId }, h.Sink.ConnectCalls);
@@ -203,7 +204,8 @@ public sealed class ConnectionManagerTests : IDisposable
 
     /// <summary>
     /// The one release that is neither a Disconnect nor a switch: the role would otherwise sit on a
-    /// handset the user has stopped using and go on offering this PC there.
+    /// handset the user has stopped using and go on offering this PC there. Multi-remember switch:
+    /// add the new phone first (so the set never empties), then remove the old.
     /// </summary>
     [Fact]
     public void Selecting_a_different_phone_moves_the_hands_free_role()
@@ -212,7 +214,15 @@ public sealed class ConnectionManagerTests : IDisposable
         h.ReachConnected();
         h.Calls.Transports = new[] { PhoneTransport, OtherTransport };
 
-        h.Manager.SelectPhone(OtherPhoneId);
+        // OtherPhoneId is not present yet, so adding it to the remembered set keeps the incumbent.
+        h.Link.StatusById[OtherPhoneId] = BluetoothLinkStatus.Disconnected;
+
+        // Multi-remember switch: add the new phone, then drop the old. The set never empties, so the
+        // resolver moves the active phone (and the hands-free role) exactly once - unlike removing the
+        // only remembered phone, which is "turn auto-pick off" and tears down (see the last-phone test).
+        h.Manager.SetPhoneRemembered(OtherPhoneId, true);
+        h.Manager.SetPhoneRemembered(PhoneId, false);
+        h.Marshaller!.Drain(); // Drain resolver before asserting connects.
 
         Assert.Equal(1, h.Calls.DisconnectCount);
         Assert.Equal(1, h.Sink.DisconnectCount);
@@ -231,7 +241,7 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new();
         h.ReachConnected();
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
 
         Assert.Equal(0, h.Calls.DisconnectCount);
         Assert.Equal(0, h.Sink.DisconnectCount);
@@ -248,7 +258,7 @@ public sealed class ConnectionManagerTests : IDisposable
 
         int saves = h.Settings.SaveCount;
 
-        h.Manager.DeselectPhone();
+        h.Manager.ClearRememberedPhones();
 
         Assert.Equal(1, h.Calls.DisconnectCount);
         Assert.Equal(1, h.Sink.DisconnectCount);
@@ -348,7 +358,8 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Scheduler.Advance(Seconds(30));
         Assert.Equal(1, h.Link.ReadCount);
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain resolver before asserting state.
 
         // The pass really did decline - this is the condition the bug needed, not an assumption.
         Assert.Equal(1, h.Link.ReadCount);
@@ -360,7 +371,7 @@ public sealed class ConnectionManagerTests : IDisposable
     /// <summary>
     /// <b>A click must not cost the user the thing it was asking for.</b>
     ///
-    /// <c>SelectPhone</c>'s repaint runs <c>Refresh</c>, which releases the click grant the moment
+    /// <c>SetPhoneRemembered</c>'s repaint runs <c>Refresh</c>, which releases the click grant the moment
     /// every enabled half looks satisfied - and on a same-phone re-pick that is true of both halves'
     /// own beliefs, because neither <c>Configure</c> touches a half that is still on the same phone.
     /// The half's belief can be stale: the hands-free role can go phone-side with nothing telling
@@ -377,7 +388,8 @@ public sealed class ConnectionManagerTests : IDisposable
     public void Re_picking_a_phone_does_not_release_the_role_the_click_asked_for()
     {
         using Harness h = new(phoneDeviceId: null, autoReconnect: false);
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain first resolver before asserting.
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
         Assert.Single(h.Calls.ConnectCalls);
 
@@ -387,7 +399,8 @@ public sealed class ConnectionManagerTests : IDisposable
 
         h.Calls.Registration = RegistrationStatus.NotRegistered;
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain re-pick resolver before asserting.
 
         Assert.Equal(released, h.Calls.DisconnectCount);
 
@@ -410,7 +423,8 @@ public sealed class ConnectionManagerTests : IDisposable
     public void Re_picking_a_phone_does_not_release_the_role_while_the_link_read_is_outstanding()
     {
         using Harness h = new(phoneDeviceId: null, autoReconnect: false);
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain first resolver before setting up deferred read.
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
 
         int released = h.Calls.DisconnectCount;
@@ -418,7 +432,7 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Calls.Registration = RegistrationStatus.NotRegistered;
 
         h.Link.DeferRead = true;
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
         h.Link.CompleteRead(BluetoothLinkStatus.Connected);
 
         Assert.Equal(released, h.Calls.DisconnectCount);
@@ -576,7 +590,8 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         h.Scheduler.Advance(Seconds(1));
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain resolver before advancing scheduler.
 
         // The window would have fired here, read a link that is still up, and called it deliberate.
         h.Scheduler.Advance(Seconds(2));
@@ -599,7 +614,8 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         h.Scheduler.Advance(Seconds(1));
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain resolver before second disconnect.
 
         // A second disconnect, while the first window's original deadline has still not arrived.
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
@@ -625,7 +641,8 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(1, h.Link.ReadCount);
 
         h.Link.DeferRead = false;
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain resolver before completing deferred read.
 
         // The window's read answers at last, with a link that is up - which it would call deliberate.
         h.Link.CompleteRead(BluetoothLinkStatus.Connected);
@@ -768,7 +785,7 @@ public sealed class ConnectionManagerTests : IDisposable
     {
         using Harness h = new(phoneDeviceId: null, autoReconnect: false);
         h.Sink.ConnectResult = false;
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
         Assert.Single(h.Sink.ConnectCalls);
 
         h.Manager.RequestDisconnect();
@@ -794,6 +811,7 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
 
         h.Manager.RequestConnect();
+        h.Marshaller!.Drain(); // Drain resolver before asserting state.
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
     }
 
@@ -808,6 +826,7 @@ public sealed class ConnectionManagerTests : IDisposable
         Assert.Empty(h.Sink.ConnectCalls);
 
         h.Manager.RequestConnect();
+        h.Marshaller!.Drain(); // Drain resolver before asserting connects.
         Assert.Equal(new[] { PhoneId }, h.Sink.ConnectCalls);
     }
 
@@ -832,6 +851,145 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Manager.RequestConnect();
 
         Assert.Contains(_log.Entries, e => e.Level == LogLevel.Info && e.Message == "Connect requested from the tray.");
+    }
+
+    [Fact]
+    public void RequestConnect_actively_attempts_connect_when_the_phone_reads_absent()
+    {
+        using Harness h = new();
+
+        // The phone is selected and being watched, but mark it absent. The reconcile's link read
+        // will report Disconnected, so SetActivePhone's reconcile path sees an absent phone - exactly
+        // the state a paired but currently out-of-range phone reads as. The startup Status was
+        // Connected (harness default), so this is a deliberate absent staging.
+        h.Link.Status = BluetoothLinkStatus.Disconnected;
+
+        h.Manager.RequestConnect();
+        h.Marshaller!.Drain();
+
+        // The connect was attempted despite the phone reading absent. This is the new behavior:
+        // Connect Now must actively pull a paired phone up, not just wait for the radio to report
+        // it present. OpenAsync can do that (Windows' own "Connect" uses the same path), so the
+        // attempt proves the active reach-out.
+        Assert.Contains(PhoneId, h.Sink.ConnectCalls);
+    }
+
+    // --- auto-pick resolver --------------------------------------------------------------------
+
+    /// <summary>
+    /// Two phones remembered, only the second is present. The resolver should make it active and
+    /// connect to it.
+    /// </summary>
+    [Fact]
+    public void Resolver_picks_the_first_present_phone_from_the_remembered_set()
+    {
+        using Harness h = new(phoneDeviceId: null);
+
+        // Set presence BEFORE adding phones to the remembered set, so the resolver sees the right state.
+        h.Link.StatusById[PhoneId] = BluetoothLinkStatus.Disconnected;
+        h.Link.StatusById[OtherPhoneId] = BluetoothLinkStatus.Connected;
+
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Manager.SetPhoneRemembered(OtherPhoneId, true);
+
+        // Drain the resolvers triggered by SetPhoneRemembered. They will have connected to OtherPhoneId.
+        h.Marshaller!.Drain();
+
+        // The resolver already picked OtherPhoneId from the setup above.
+        Assert.Equal(OtherPhoneId, h.Settings.PhoneDeviceId);
+        Assert.Contains(OtherPhoneId, h.Sink.ConnectCalls);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    /// <summary>
+    /// Phone A is active and present, phone B is also present. The resolver should keep A active
+    /// (incumbent kept) and NOT switch to B.
+    /// </summary>
+    [Fact]
+    public void Resolver_keeps_a_present_incumbent_when_another_phone_is_also_present()
+    {
+        using Harness h = new(phoneDeviceId: PhoneId);
+        h.ReachConnected();
+
+        h.Manager.SetPhoneRemembered(OtherPhoneId, true);
+
+        // Drain the resolver triggered by SetPhoneRemembered.
+        h.Marshaller!.Drain();
+
+        // Both present.
+        h.Link.StatusById[PhoneId] = BluetoothLinkStatus.Connected;
+        h.Link.StatusById[OtherPhoneId] = BluetoothLinkStatus.Connected;
+
+        int connectsBefore = h.Sink.ConnectCalls.Count;
+        int disconnectsBefore = h.Sink.DisconnectCount;
+
+        h.Scheduler.Advance(Seconds(30));
+
+        // Still on PhoneId, no switch to OtherPhoneId.
+        Assert.Equal(PhoneId, h.Settings.PhoneDeviceId);
+        Assert.Equal(connectsBefore, h.Sink.ConnectCalls.Count);
+        Assert.Equal(disconnectsBefore, h.Sink.DisconnectCount);
+    }
+
+    /// <summary>
+    /// Phone A is active but now absent, phone B is present. The resolver should switch to B on the
+    /// next resolver tick.
+    /// </summary>
+    [Fact]
+    public void Resolver_switches_to_another_phone_when_the_active_one_becomes_absent()
+    {
+        using Harness h = new(phoneDeviceId: PhoneId);
+        h.ReachConnected();
+
+        h.Manager.SetPhoneRemembered(OtherPhoneId, true);
+
+        // Drain the resolver triggered by SetPhoneRemembered.
+        h.Marshaller!.Drain();
+
+        // PhoneId is now absent, OtherPhoneId is present.
+        h.Link.StatusById[PhoneId] = BluetoothLinkStatus.Disconnected;
+        h.Link.StatusById[OtherPhoneId] = BluetoothLinkStatus.Connected;
+
+        h.Scheduler.Advance(Seconds(30));
+
+        // Switched to OtherPhoneId.
+        Assert.Equal(OtherPhoneId, h.Settings.PhoneDeviceId);
+        Assert.Contains(OtherPhoneId, h.Sink.ConnectCalls);
+    }
+
+    /// <summary>
+    /// ClearRememberedPhones should stop watching and go to Idle state.
+    /// </summary>
+    [Fact]
+    public void ClearRememberedPhones_stops_watching_and_goes_to_Idle()
+    {
+        using Harness h = new(phoneDeviceId: PhoneId);
+        h.ReachConnected();
+
+        h.Manager.ClearRememberedPhones();
+
+        Assert.Null(h.Settings.PhoneDeviceId);
+        Assert.Equal(ConnectionState.Idle, h.Manager.State);
+        Assert.Equal(1, h.Link.StopWatchingCount);
+    }
+
+    /// <summary>
+    /// Unchecking the last remembered phone should tear down exactly like "None" (ClearRememberedPhones).
+    /// Regression: the remove branch called ResolveActivePhoneAsync, which early-returned on an empty set,
+    /// leaving PhoneDeviceId set (bridge up) and Migrate resurrecting it next load.
+    /// </summary>
+    [Fact]
+    public void Removing_the_last_remembered_phone_tears_down_like_None()
+    {
+        using Harness h = new(phoneDeviceId: PhoneId);
+        h.ReachConnected();
+
+        h.Manager.SetPhoneRemembered(PhoneId, false);
+        h.Marshaller!.Drain(); // Drain resolver before asserting.
+
+        Assert.Null(h.Settings.PhoneDeviceId);
+        Assert.Equal(ConnectionState.Idle, h.Manager.State);
+        Assert.Equal(1, h.Link.StopWatchingCount);
     }
 
     // --- the reconcile -------------------------------------------------------------------------
@@ -931,10 +1089,15 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Scheduler.Advance(Seconds(5));
         Assert.Equal(1, h.Link.ReadCount);
 
-        h.Manager.SelectPhone(OtherPhoneId);
-        Assert.Equal(1, h.Link.ReadCount);
+        // Make only OtherPhoneId present so the resolver picks it.
+        h.Link.StatusById[PhoneId] = BluetoothLinkStatus.Disconnected;
+        h.Link.StatusById[OtherPhoneId] = BluetoothLinkStatus.Connected;
+
+        h.Manager.SetPhoneRemembered(OtherPhoneId, true);
+        Assert.Equal(1, h.Link.ReadCount); // Resolver uses ReadLinkStatusForAsync, doesn't increment this.
 
         h.Link.CompleteRead(BluetoothLinkStatus.Connected);
+        h.Marshaller!.Drain(); // Drain resolver that was waiting on the deferred read.
 
         Assert.Equal(new[] { OtherPhoneId }, h.Sink.ConnectCalls);
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
@@ -1175,7 +1338,7 @@ public sealed class ConnectionManagerTests : IDisposable
         // The radio stops answering, and the user re-picks the same phone. The pass that click
         // starts reads Absent - and moves nothing, because the machine was already Absent.
         h.Link.Status = BluetoothLinkStatus.Disconnected;
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
 
         Assert.Equal(0, h.Sink.DisconnectCount);
 
@@ -1408,7 +1571,7 @@ public sealed class ConnectionManagerTests : IDisposable
     {
         using Harness h = new(phoneDeviceId: null, autoReconnect: false);
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
         h.SetEndpointPresent(true);
 
         Assert.Equal(new[] { PhoneId }, h.Sink.ConnectCalls);
@@ -1425,7 +1588,7 @@ public sealed class ConnectionManagerTests : IDisposable
     public void Auto_reconnect_off_after_a_drop_reports_Suppressed_with_its_own_detail()
     {
         using Harness h = new(phoneDeviceId: null, autoReconnect: false);
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
         h.SetEndpointPresent(true);
 
         h.Link.Status = BluetoothLinkStatus.Disconnected;
@@ -1590,7 +1753,7 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new(phoneDeviceId: null, autoReconnect: false);
         h.Sink.ConnectResult = false;
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
         Assert.Single(h.Sink.ConnectCalls);
 
         // Flipped off, on, and off again, because the switch must add its own ask to the phone's
@@ -2324,8 +2487,8 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Link.RaiseAppeared();
         Assert.Equal(ConnectionState.RetryBackoff, h.Manager.State);
 
-        // The reconcile tick plus one retry per half - so the assertion below has something to prove.
-        Assert.Equal(3, h.Scheduler.PendingCount);
+        // The reconcile tick, resolver tick, plus one retry per half - so the assertion below has something to prove.
+        Assert.Equal(4, h.Scheduler.PendingCount);
 
         h.Manager.Dispose();
 
@@ -2481,7 +2644,8 @@ public sealed class ConnectionManagerTests : IDisposable
         // The connection object goes away with no event at all - the across-a-suspend case.
         h.Sink.Disconnect();
 
-        h.Manager.SelectPhone(PhoneId);
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain(); // Drain resolver before asserting connects.
 
         Assert.Equal(2, h.Sink.ConnectCalls.Count);
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
@@ -2601,6 +2765,7 @@ public sealed class ConnectionManagerTests : IDisposable
                 OutputDeviceId = OutputId,
                 AutoReconnect = autoReconnect,
                 EnableCalls = enableCalls,
+                RememberedPhoneIds = phoneDeviceId is not null ? new List<string> { phoneDeviceId } : new List<string>(),
             };
 
             Calls.Transports = new[] { PhoneTransport };
@@ -2639,6 +2804,10 @@ public sealed class ConnectionManagerTests : IDisposable
             };
 
             Manager.Start();
+
+            // Drain the marshaller to complete the resolver's async work that Start() kicked off.
+            // The resolver runs at Start() and posts its continuation; tests expect it completed.
+            Marshaller?.Drain();
         }
 
         public RecordingSettings Settings { get; }

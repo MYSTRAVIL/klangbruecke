@@ -5,6 +5,7 @@ using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
 using Klangbruecke.Connection;
 using Klangbruecke.Diagnostics;
+using Klangbruecke.Feedback;
 using Klangbruecke.Platform;
 
 namespace Klangbruecke;
@@ -33,13 +34,15 @@ namespace Klangbruecke;
 /// stays out of the manager on purpose - see its class comment - which is why the labels are the only
 /// place the flag surfaces at all.
 ///
-/// <b>Seven things reach it: the icon, the glyphs, the presenter, the manager, the settings, the shell,
-/// and the update checker.</b> One of them - the shell - is a seam, used only for the Diagnostics items:
-/// opening a folder, copying text, confirming a dialog, and opening a URL. The icon it writes to, the
-/// glyphs it chooses one from, the presenter that writes to it, the manager it asks, and the settings
-/// are all read-only here - for the ticks beside the menu items and the state sentence. Every write to
-/// those settings goes through the manager, which saves them; a view that wrote them directly would be a
-/// second author of the same file and the manager's own copy would be stale the moment it did.
+/// <b>Eight things reach it: the icon, the glyphs, the presenter, the manager, the settings, the shell,
+/// the update checker, and the sound player.</b> One of them - the shell - is a seam, used only for the
+/// Diagnostics items: opening a folder, copying text, confirming a dialog, and opening a URL. The icon it
+/// writes to, the glyphs it chooses one from, the presenter that writes to it, the manager it asks, the
+/// settings, and the sound player are all read-only here - for the ticks beside the menu items, the state
+/// sentence, and the chimes on connection-state transitions. Every write to those settings goes through
+/// the manager, which saves them; a view that wrote them directly would be a second author of the same file
+/// and the manager's own copy would be stale the moment it did. Left-click and right-click both open the
+/// same menu; right-click fires the Opening event natively, left-click is subscribed in the constructor.
 /// </summary>
 internal sealed class TrayContext : ApplicationContext
 {
@@ -52,15 +55,43 @@ internal sealed class TrayContext : ApplicationContext
     private readonly UpdateChecker _updateChecker;
 
     /// <summary>
+    /// Plays event sounds on connection-state transitions, gated on the user's Sounds toggle.
+    /// </summary>
+    private readonly ISoundPlayer _sound;
+
+    /// <summary>
     /// The user's choices, for the ticks only. <b>Never written here.</b> See the class summary.
     /// </summary>
     private readonly Settings _settings;
+
+    /// <summary>
+    /// The previous connection state, tracked to compute sound-worthy transitions. Updated after
+    /// each StateChanged, outside the EventSounds guard, so toggling sounds on later never replays
+    /// a stale transition.
+    /// </summary>
+    private ConnectionState _lastSoundState;
 
     /// <summary>
     /// Set only across the <c>Show()</c> call in <see cref="OnMenuOpening"/>, to let the Opening
     /// that <c>Show()</c> itself raises through. UI thread only, so no synchronization.
     /// </summary>
     private bool _menuRebuilt;
+
+    /// <summary>
+    /// WinForms auto-shows a <see cref="NotifyIcon"/>'s <see cref="ContextMenuStrip"/> only on
+    /// right-click, and does it through this private method - which calls <c>SetForegroundWindow</c>
+    /// first. That foreground call is load-bearing: a menu shown from a left-click without it appears
+    /// unfocused and dismisses on the same click, which reads as "left-click does nothing". So
+    /// left-click invokes the very same method (see the <see cref="NotifyIcon.MouseUp"/> handler),
+    /// taking the identical path as right-click - it raises Opening, and <see cref="OnMenuOpening"/>
+    /// rebuilds and shows as before, now with the foreground correctly set. Cached once; null only if a
+    /// future WinForms renames it, in which case left-click falls back to a direct (foreground-less)
+    /// show rather than crashing.
+    /// </summary>
+    private static readonly System.Reflection.MethodInfo? ShowContextMenuMethod =
+        typeof(NotifyIcon).GetMethod(
+            "ShowContextMenu",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
 
     /// <summary>
     /// The glyph bucket the tray is currently showing, so <see cref="UpdateIcon"/> repaints only when
@@ -75,7 +106,8 @@ internal sealed class TrayContext : ApplicationContext
         ConnectionManager connection,
         Settings settings,
         IAppShell shell,
-        UpdateChecker updateChecker)
+        UpdateChecker updateChecker,
+        ISoundPlayer sound)
     {
         _icon = icon;
         _icons = icons;
@@ -84,12 +116,39 @@ internal sealed class TrayContext : ApplicationContext
         _settings = settings;
         _shell = shell;
         _updateChecker = updateChecker;
+        _sound = sound;
+
+        // Initialized before the first StateChanged can fire, so the first transition is measured
+        // from the actual startup state rather than a default.
+        _lastSoundState = _connection.State;
 
         // Built here rather than handed in, so the field is non-null by construction and the three
         // places below that use it need no assertion. Attaching it is all NotifyIcon needs.
         _menu = new ContextMenuStrip();
         _icon.ContextMenuStrip = _menu;
         _menu.Opening += OnMenuOpening;
+
+        // Left-click opens the menu too, by the exact path right-click uses. Directly calling
+        // _menu.Show() from a left-click skips the foreground activation WinForms does for a
+        // right-click, so the menu opens unfocused and closes on the same click - see
+        // ShowContextMenuMethod. Invoking that private method instead sets the foreground and raises
+        // Opening, which OnMenuOpening rebuilds and shows as usual.
+        _icon.MouseUp += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left)
+            {
+                return;
+            }
+
+            if (ShowContextMenuMethod is not null)
+            {
+                ShowContextMenuMethod.Invoke(_icon, null);
+            }
+            else
+            {
+                _ = ShowContextMenuAsync();
+            }
+        };
 
         // Both, and the second is not a nicety. The tooltip is one line with two writers - these, and
         // every component's own Status - so a component announcement displaces the state sentence and
@@ -128,11 +187,28 @@ internal sealed class TrayContext : ApplicationContext
     /// The state moved. Both halves of the sentence are re-read from the manager rather than taken
     /// from the event, which carries only the state - a detail read from anywhere else could describe
     /// a different instant, and "Connected" beside "retrying in 8s" is worse than either alone.
+    ///
+    /// Plays a chime on sound-worthy transitions (Connected, Disconnected, Degraded) when the user
+    /// has sounds enabled. The previous-state tracking is outside the guard so toggling sounds on
+    /// later never replays a stale transition.
     /// </summary>
     private void OnConnectionStateChanged(object? sender, ConnectionState state)
     {
         ShowConnectionState();
         UpdateIcon();
+
+        // The event already carries the new state; read it from the parameter rather than
+        // _connection.State so the chime and the icon cannot describe different instants.
+        ConnectionState next = state;
+        if (_settings.EventSounds)
+        {
+            SoundEvent? sound = SoundPolicy.For(_lastSoundState, next);
+            if (sound is { } e)
+            {
+                _sound.Play(e);
+            }
+        }
+        _lastSoundState = next;
     }
 
     /// <summary>
@@ -184,7 +260,16 @@ internal sealed class TrayContext : ApplicationContext
         }
 
         e.Cancel = true;
+        await ShowContextMenuAsync();
+    }
 
+    /// <summary>
+    /// Rebuilds the menu and shows it at the cursor position. Extracted from
+    /// <see cref="OnMenuOpening"/> so both right-click (Opening) and left-click (MouseUp) can
+    /// share the same rebuild-and-show path with its reentrancy guard.
+    /// </summary>
+    private async Task ShowContextMenuAsync()
+    {
         try
         {
             await RebuildMenuAsync();
@@ -255,6 +340,10 @@ internal sealed class TrayContext : ApplicationContext
         autoReconnect.Click += (_, _) => _connection.SetAutoReconnect(!_settings.AutoReconnect);
         _menu.Items.Add(autoReconnect);
 
+        var sounds = new ToolStripMenuItem("Sounds") { Checked = _settings.EventSounds };
+        sounds.Click += (_, _) => _connection.SetEventSounds(!_settings.EventSounds);
+        _menu.Items.Add(sounds);
+
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(BuildDiagnosticsMenu());
         _menu.Items.Add(new ToolStripSeparator());
@@ -275,8 +364,8 @@ internal sealed class TrayContext : ApplicationContext
         // Mirrors the Output submenu's "System default", and it is the only way to tell the app to
         // stop caring about phones at all - Disconnect is a latch that expires when the phone leaves
         // and returns, which is a different thing.
-        var none = new ToolStripMenuItem("None") { Checked = _settings.PhoneDeviceId is null };
-        none.Click += (_, _) => _connection.DeselectPhone();
+        var none = new ToolStripMenuItem("None") { Checked = _settings.RememberedPhoneIds.Count == 0 };
+        none.Click += (_, _) => _connection.ClearRememberedPhones();
         phoneMenu.DropDownItems.Add(none);
         phoneMenu.DropDownItems.Add(new ToolStripSeparator());
 
@@ -291,17 +380,19 @@ internal sealed class TrayContext : ApplicationContext
 
             foreach (PhoneDevice device in devices)
             {
-                // The selected phone, not the connected one. They differ for the whole of every
-                // range exit and every reconnect, and the old reading left the menu with no tick at
-                // all while the tray was reporting "waiting for the phone to appear" - so the one
-                // screen that could have said which phone it was waiting for did not.
-                var item = new ToolStripMenuItem(device.Name)
+                // Checked = remembered (a member of the auto-pick set). The " (connected)" suffix marks
+                // the one that is actually up right now - read from the manager's state, not a live ABI
+                // call on the menu path.
+                bool isConnected = device.Id == _settings.PhoneDeviceId
+                    && _connection.State is ConnectionState.Connected or ConnectionState.Degraded;
+                string label = isConnected ? $"{device.Name} (connected)" : device.Name;
+                var item = new ToolStripMenuItem(label)
                 {
-                    Checked = device.Id == _settings.PhoneDeviceId,
+                    Checked = _settings.RememberedPhoneIds.Contains(device.Id),
                 };
 
                 string id = device.Id;
-                item.Click += (_, _) => _connection.SelectPhone(id);
+                item.Click += (_, _) => _connection.SetPhoneRemembered(id, !_settings.RememberedPhoneIds.Contains(id));
                 phoneMenu.DropDownItems.Add(item);
             }
         }

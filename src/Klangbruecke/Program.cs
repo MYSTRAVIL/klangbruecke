@@ -8,6 +8,7 @@ using Klangbruecke.Bluetooth;
 using Klangbruecke.Config;
 using Klangbruecke.Connection;
 using Klangbruecke.Diagnostics;
+using Klangbruecke.Feedback;
 using Klangbruecke.Platform;
 
 namespace Klangbruecke;
@@ -207,7 +208,10 @@ internal static class Program
         // long as the tray.
         var updateChecker = new UpdateChecker(new GitHubReleaseFeed(new HttpClient()), AppVersion.Current);
 
-        var tray = new TrayContext(icon, trayIcons, status, connection, settings, shell, updateChecker);
+        // Plays event sounds on connection-state transitions when the user has sounds enabled.
+        var sound = new SoundPlayer();
+
+        var tray = new TrayContext(icon, trayIcons, status, connection, settings, shell, updateChecker, sound);
 
         // Only now. Everything that could throw on the way up has run, and from here the icon has an
         // owner whose Dispose hides it. See the note where it was built.

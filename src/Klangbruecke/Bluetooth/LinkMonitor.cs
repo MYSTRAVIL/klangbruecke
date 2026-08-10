@@ -188,6 +188,12 @@ public sealed class LinkMonitor : ILinkMonitor
     public Task<BluetoothLinkStatus> ReadLinkStatusAsync() => ReadLinkStatusAsync(_watchedDeviceId);
 
     /// <summary>
+    /// Read the ACL-link status of a named device, independent of which device is being watched.
+    /// Thin delegate to the static one-shot read below.
+    /// </summary>
+    public Task<BluetoothLinkStatus> ReadLinkStatusForAsync(string deviceId) => ReadLinkStatusAsync(deviceId);
+
+    /// <summary>
     /// One read of one device id, start to finish. Never throws.
     ///
     /// Static and public because that is what makes its failure branches reachable from a test: an
