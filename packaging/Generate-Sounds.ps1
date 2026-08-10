@@ -10,7 +10,7 @@ $assets = Join-Path (Split-Path $PSScriptRoot -Parent) 'src\Klangbruecke\Assets'
 New-Item -ItemType Directory -Force -Path $assets | Out-Null
 
 function Write-Wav([string]$path, [double[]]$freqs, [double]$segMs) {
-    $amp = 0.22; $fade = [int]($rate * 0.015)
+    $amp = 0.18; $fade = [int]($rate * 0.020)
     $samples = New-Object System.Collections.Generic.List[int16]
     foreach ($f in $freqs) {
         $n = [int]($rate * $segMs / 1000.0)
@@ -34,9 +34,9 @@ function Write-Wav([string]$path, [double[]]$freqs, [double]$segMs) {
     Write-Host "wrote $path ($($samples.Count) samples)"
 }
 
-# Warm mid-range tones with a gentle 15 ms attack/release - lower and smoother than the first cut,
-# which read as piercing (660-880 Hz). G4->C5 rising for connect, C5->G4 falling for disconnect, a low
-# E4 for degraded.
-Write-Wav (Join-Path $assets 'connect.wav')    @(392, 523) 140
-Write-Wav (Join-Path $assets 'disconnect.wav') @(523, 392) 140
-Write-Wav (Join-Path $assets 'degraded.wav')   @(330)      220
+# Low, soft tones with a rounded 20 ms attack/release. Two earlier cuts (660-880, then 392-523) still
+# read as piercing, so this drops roughly another octave into a mellow low-chime range: G3->C4 rising
+# for connect, C4->G3 falling for disconnect, a low E3 for degraded.
+Write-Wav (Join-Path $assets 'connect.wav')    @(196, 262) 150
+Write-Wav (Join-Path $assets 'disconnect.wav') @(262, 196) 150
+Write-Wav (Join-Path $assets 'degraded.wav')   @(165)      240
