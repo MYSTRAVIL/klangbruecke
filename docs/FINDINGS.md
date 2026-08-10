@@ -802,3 +802,23 @@ call"**, which would sink it too. Reopen only via a live-call probe; do not assu
 
 **Net:** of the surveyed tray-feature ideas, only **remember-and-auto-pick-phone** (pure app logic, no OS
 dependency) is buildable. The rest are platform ceilings on this Win10 A2DP-sink configuration.
+
+## 18. Connect Now can pull a cold phone: `AudioPlaybackConnection.OpenAsync` initiates from the PC
+
+Validated on hardware 2026-08-10. The connect path used to be purely passive: it waited for the
+`DeviceWatcher`/reconcile to report the phone **present**, then opened the A2DP sink. So with the phone
+paired and in range but not currently connected, the tray's Connect Now cleared suppression and then sat
+on "out of range" — nothing ever attempted a connect. The open question (§ this session) was whether the
+PC can *initiate* a connection or must wait for the phone to reach out.
+
+**It can initiate.** `AudioPlaybackConnection.OpenAsync` (via `AudioSinkService.ConnectAsync`) pulls a
+paired, in-range but disconnected phone up from the PC side — the same thing Windows' own Bluetooth
+"Connect" button does. Confirmed by wiring `ConnectionManager.RequestConnect` to force a connect turn
+(`ConnectHalvesAsync`) regardless of the presence gate, and watching a disconnected phone connect on the
+click.
+
+So the design split is deliberate: the **automatic** reconnect stays presence-gated and passive (it must
+not hammer `OpenAsync` against an away phone every 5–30 s), while the **deliberate** Connect Now actively
+reaches out. An unreachable phone is a bounded failure — `OpenAsync` returns a non-success status and the
+music half's connect backoff handles it — not a wedge. (Contrast §3: if the *pairing* is stale, even
+Windows' own Connect fails, and no app can help.)
