@@ -9,22 +9,16 @@ is `scratchpad/featureprobe` (an unpackaged net8.0-windows10.0.19041.0 console; 
 
 ---
 
-## Item 1 — Media-key play/pause test (do this FIRST — 30 seconds, decides Item 4)
+## Item 1 — Media-key play/pause test — DONE 2026-08-12, "nothing happens" (Item 4 closed)
 
-The quickest, most decisive open thread, so it goes first. Item 4 (control the phone's music from the PC)
-researched to a NO-GO via AVRCP (FINDINGS §19) with one untested sliver: whether Windows forwards the
-system media keys to the phone over its internal AVRCP link. If it does, play/pause/skip *control* is
-partially achievable (metadata stays dead); if not, Item 4 is fully closed.
+Tested live on this machine (music playing on the phone, routed to the PC):
+- `VK_MEDIA_PLAY_PAUSE` (0xB3) via `keybd_event` → phone did **not** pause.
+- `VK_MEDIA_NEXT_TRACK` (0xB0) → phone did **not** skip.
+- Positive control: the same injection path toggled NumLock (`[Console]::NumberLock` False→True), so the
+  injector provably reached Windows — the nulls are real, not a broken test.
 
-**Test (no build needed):** with music playing on the phone and routed to the PC, synthesize
-`VK_MEDIA_PLAY_PAUSE` (0xB3) via `SendInput` / `keybd_event` (a few lines of P/Invoke, or PowerShell
-`Add-Type`), and watch the phone. Then try `VK_MEDIA_NEXT_TRACK` (0xB0) / `VK_MEDIA_PREV_TRACK` (0xB1).
-- **Phone pauses/skips** → Item 4 partially reopens: wire tray items (or menu entries) to inject these
-  keys; now-playing metadata stays unavailable (FINDINGS §19). Record the win and reopen §19.
-- **Nothing happens** → confirmed wall; mark FINDINGS §19 empirically closed and drop Item 4.
-
-Expected ~75% "nothing happens" (no GSMTC session for the keys to target), but it is the one thing desk
-research could not settle.
+**Result: the ~75% predicted outcome.** Windows does not forward system media keys to the phone (no GSMTC
+session to target). FINDINGS §19 marked empirically closed; **Item 4 is fully WONTFIX** (see below).
 
 ## Item 2 — Call narrowband vs wideband indicator
 

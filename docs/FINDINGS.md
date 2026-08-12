@@ -823,7 +823,7 @@ reaches out. An unreachable phone is a bounded failure — `OpenAsync` returns a
 music half's connect backoff handles it — not a wedge. (Contrast §3: if the *pairing* is stale, even
 Windows' own Connect fails, and no app can help.)
 
-## 19. Controlling the phone's music from the PC (AVRCP controller) — researched NO-GO
+## 19. Controlling the phone's music from the PC (AVRCP controller) — NO-GO, empirically closed 2026-08-12
 
 Desk research 2026-08-10 (web + this machine). Goal was: read the phone's now-playing metadata and send
 pause / resume / next / previous to the phone from the PC. It is not buildable on this stack, for a deeper
@@ -844,11 +844,18 @@ reason than §17's GSMTC observation.
 - **Only Phone Link controls phone media**, via a proprietary app-layer protocol over USB / Wi-Fi — not
   Bluetooth AVRCP.
 
-**One sliver left untested:** synthesizing the system media keys (`VK_MEDIA_PLAY_PAUSE` / `NEXT` / `PREV`
-via `SendInput`) *might* be forwarded to the phone by Windows' internal AVRCP integration. Judged ~75%
-likely to fail — there is no GSMTC session for the keys to target — but not empirically closed. A 30-second
-live test settles it: play music on the phone, inject a media key, watch the phone. Now-playing *metadata*
-is a hard NO regardless of that test.
+**The media-key sliver is now empirically closed (2026-08-12).** The last untested idea was that
+synthesizing the system media keys *might* be forwarded to the phone by Windows' internal AVRCP
+integration. Tested live on this machine with music playing on the phone and routed to the PC:
+- Injected `VK_MEDIA_PLAY_PAUSE` (0xB3) via `keybd_event` → **phone did not pause.**
+- Injected `VK_MEDIA_NEXT_TRACK` (0xB0) → **phone did not skip.**
+- **Positive control** (rules out a broken injector): the same `keybd_event` path toggled NumLock
+  `False`→`True`, read back via `[Console]::NumberLock`. So the injection provably reached Windows;
+  the media-key nulls are real, not a test artifact.
 
-**Conclusion: WONTFIX** for now-playing and phone-media control over Bluetooth, unless the media-key test
-surprises. Do not go looking for an AVRCP Controller API — there isn't one.
+This matches the predicted mechanism: Windows exposes **no GSMTC session for the A2DP-source phone**, so
+system media keys have no target that maps to the phone. Windows keeps the keys for local-app media only.
+
+**Conclusion: WONTFIX, fully closed.** Both now-playing metadata *and* transport control of the phone's
+music over Bluetooth are unreachable on this stack. Do not go looking for an AVRCP Controller API or a
+media-key forwarding path — neither exists. Only Phone Link's proprietary USB/Wi-Fi channel can do this.
