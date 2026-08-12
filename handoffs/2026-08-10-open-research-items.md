@@ -9,6 +9,23 @@ is `scratchpad/featureprobe` (an unpackaged net8.0-windows10.0.19041.0 console; 
 
 ---
 
+## Item 1 — Media-key play/pause test (do this FIRST — 30 seconds, decides Item 4)
+
+The quickest, most decisive open thread, so it goes first. Item 4 (control the phone's music from the PC)
+researched to a NO-GO via AVRCP (FINDINGS §19) with one untested sliver: whether Windows forwards the
+system media keys to the phone over its internal AVRCP link. If it does, play/pause/skip *control* is
+partially achievable (metadata stays dead); if not, Item 4 is fully closed.
+
+**Test (no build needed):** with music playing on the phone and routed to the PC, synthesize
+`VK_MEDIA_PLAY_PAUSE` (0xB3) via `SendInput` / `keybd_event` (a few lines of P/Invoke, or PowerShell
+`Add-Type`), and watch the phone. Then try `VK_MEDIA_NEXT_TRACK` (0xB0) / `VK_MEDIA_PREV_TRACK` (0xB1).
+- **Phone pauses/skips** → Item 4 partially reopens: wire tray items (or menu entries) to inject these
+  keys; now-playing metadata stays unavailable (FINDINGS §19). Record the win and reopen §19.
+- **Nothing happens** → confirmed wall; mark FINDINGS §19 empirically closed and drop Item 4.
+
+Expected ~75% "nothing happens" (no GSMTC session for the keys to target), but it is the one thing desk
+research could not settle.
+
 ## Item 2 — Call narrowband vs wideband indicator
 
 **Goal:** surface whether an active cellular call's Bluetooth SCO link is **narrowband (CVSD, 8 kHz)** —
@@ -71,12 +88,9 @@ WinRT property carries it on 19045).
   are connection-management only). Absence across every comparable project ≈ a platform wall.
 - Only Phone Link controls phone media, via a proprietary app-layer protocol over USB/Wi-Fi, not BT AVRCP.
 
-**The one untested sliver (long shot, ~75% expected to fail):** synthesize the system media keys
-(`VK_MEDIA_PLAY_PAUSE` 0xB3 / `VK_MEDIA_NEXT_TRACK` 0xB0 / `VK_MEDIA_PREV_TRACK` 0xB1) via `SendInput` and
-see whether Windows forwards them to the phone over its internal AVRCP link. Needs a live test: music
-playing on the phone → inject a key → does the phone pause/skip? If yes, *control* (not metadata) may be
-partially achievable; if no (likely — there is no GSMTC session for the keys to target), it's fully closed.
-Metadata / now-playing is a hard NO regardless.
+**The one untested sliver is Item 1 above (the media-key play/pause test).** If Windows forwards injected
+media keys to the phone, transport *control* is partially achievable; metadata/now-playing is a hard NO
+regardless. Run that test before writing anything off here.
 
 **Recommendation:** closed as WONTFIX unless the media-key test surprises. Do not spend time on an AVRCP
 Controller API — there isn't one.
