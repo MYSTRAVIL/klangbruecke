@@ -124,9 +124,15 @@ interface with a fake and a contract test, exactly like `IAudioDeviceFactory` /
 - **`MediaSnapshot`** — immutable now-playing state (title, artist, album, artHash, playing,
   positionMs + timestamp, durationMs). Projection unit-tested.
 - **`ArtCache`** — album art keyed by hash; art fetched once per track.
-- **Manifest note (load-bearing).** Opening RFCOMM from the packaged app requires the `bluetooth`
-  device capability in `packaging/AppxManifest.xml`; the SDP service UUID must also be declared. The
-  implementation plan must add these — RFCOMM connect fails silently without them.
+- **Manifest note.** The likely manifest delta is **zero**. `packaging/AppxManifest.xml` already
+  declares the `bluetooth` DeviceCapability (added for music / `AudioPlaybackConnection`), and RFCOMM
+  reuses it — no new capability. The SDP service UUID is declared in **code**
+  (`RfcommServiceId` / `RfcommDeviceService`), not the manifest. No "run in background" capability is
+  needed: this is a full-trust packaged **desktop** app (`Windows.FullTrustApplication` +
+  `runFullTrust`), an ordinary Win32 process Windows never suspends — not a UWP app subject to
+  lifecycle suspension. It already runs headless in the tray 24/7; the companion link and SMTC
+  publisher live in that same process. (Background execution is the *Android* side's concern — the
+  foreground service.) Confirm the exact manifest needs empirically at the coexistence probe.
 - **`ISmtcPublisher` / `SmtcPublisher`** — wraps `SystemMediaTransportControls` obtained via
   `ISystemMediaTransportControlsInterop::GetForWindow` on a hidden message window (we are packaged,
   so this is clean). Pushes `MediaSnapshot` into the session: `DisplayUpdater` MusicProperties, the
