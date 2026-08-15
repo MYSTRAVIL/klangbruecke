@@ -933,3 +933,35 @@ listener, so it must be restarted between client runs. The real companion servic
 **Conclusion: GO.** All Phase 1 assumptions hold on 19045. Proceed to the Phase 2+ feature plans
 (PC `Companion/` module, Android companion app, art+seek, polish). Fold 20.1's interop code and 20.2's
 uncached-discovery requirement into those plans.
+
+## 21. Phase 2 MVP channel — verified end-to-end on hardware (2026-08-12)
+
+The real `Companion/` seams (transport, protocol, snapshot, link, SMTC publisher) + the real Android
+companion app were wired in an integration harness and run against the live phone (Pixel `MYSTRAPIX9`,
+Poweramp as the active `MediaSession`). Everything the MVP promises works:
+
+- **Inbound (phone → PC):** uncached SDP discovery connected to the companion service; real `NowPlaying`
+  frames decoded and folded into a `MediaSnapshot` — e.g. `title="There Is Still Time" artist="Lorn"
+  album="The Maze to Nowhere"`.
+- **SMTC render surface:** `GlobalSystemMediaTransportControlsSessionManager` enumerated **1 session**
+  with our publisher's title/artist — so the session is GSMTC-visible and ModernFlyouts / the native
+  overlay will render it. The `SmtcPublisher` creates its HWND **without** `Show()` and that is fine
+  (resolves the followups.md #5 risk).
+- **Outbound (PC → phone):** a PC-issued `Next`/`Previous` reached the phone — Poweramp changed tracks,
+  **confirmed independently via `adb shell dumpsys media_session`** (not just echoed metadata) — and the
+  new track flowed back and updated the SMTC session live.
+
+**Two facts for the real wiring (Phase 2 C2):**
+- **Marshaling is required.** `RfcommCompanionTransport.FrameReceived` fires on a thread-pool thread;
+  `SmtcPublisher` is UI-thread-affine. The composition root must marshal the transport's
+  `FrameReceived`/`Disconnected` (or wrap the publisher) onto the UI thread before `CompanionLink`
+  touches SMTC. Outbound (`CommandRequested` → `SendAsync`) needs no marshaling (write-gated).
+- **Connect latency:** uncached SDP discovery over BT measured **~14 s** on this hardware (it enumerates
+  each paired device — phone + a game controller). The async connect + backoff absorbs it; the UI must
+  not assume an instant link.
+- **Module isolation:** the `Companion/` compile closure is 14 files — it pulls in `Diagnostics`,
+  `BackoffSchedule`, and `IScheduler` only. It does **not** touch `ConnectionManager`/`MusicHalf`/audio,
+  which is why C2 owns it in the composition root beside the manager, not inside it.
+
+**Conclusion: MVP channel PROVEN.** Remaining Phase 2 work is C2 (wire into the app + tray toggle); then
+Phase 3 (album art + seek) and Phase 4 (polish incl. the setup-screen bugs in `companion-followups.md`).
