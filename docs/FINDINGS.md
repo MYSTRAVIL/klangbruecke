@@ -963,5 +963,15 @@ Poweramp as the active `MediaSession`). Everything the MVP promises works:
   `BackoffSchedule`, and `IScheduler` only. It does **not** touch `ConnectionManager`/`MusicHalf`/audio,
   which is why C2 owns it in the composition root beside the manager, not inside it.
 
-**Conclusion: MVP channel PROVEN.** Remaining Phase 2 work is C2 (wire into the app + tray toggle); then
-Phase 3 (album art + seek) and Phase 4 (polish incl. the setup-screen bugs in `companion-followups.md`).
+**Real-app capstone (C2 done).** After wiring the companion into the shipping app (`PhoneRemote` owned in
+the composition root, `UiMarshalingTransport`, "Phone remote" tray toggle), the **actual Klangbruecke
+build** — run unpackaged with `PhoneRemoteEnabled=true` — connected, published the phone's track as an
+SMTC session, and then: a synthesized **`VK_MEDIA_NEXT` (`keybd_event`) skipped the phone's track**
+(Poweramp "Diamond" → "FARR", Spotify untouched). This is the exact test that did *nothing* in §19 this
+morning. It works now not by forwarding the key over AVRCP, but because the app publishes a local SMTC
+session for the key to land on and bridges it to the phone. **§19's practical NO-GO is reversed for
+transport control** (metadata-over-AVRCP is still moot — we synthesize our own).
+
+**Conclusion: MVP channel PROVEN and wired.** Phase 2 (2A–2C) complete. Remaining: Phase 3 (album art +
+seek) and Phase 4 (polish, incl. the setup-screen bugs in `companion-followups.md`). The feature is not
+yet in a packaged/released build — that is Phase 4.
