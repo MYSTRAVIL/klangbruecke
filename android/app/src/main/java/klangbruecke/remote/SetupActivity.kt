@@ -37,6 +37,10 @@ class SetupActivity : Activity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // Set when the user stops the service from here, so the auto-start below does not immediately
+    // undo their choice on the next resume.
+    private var userStoppedService = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(buildUi())
@@ -44,6 +48,7 @@ class SetupActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        maybeAutoStartService()
         refreshStatus()
     }
 
@@ -100,7 +105,13 @@ class SetupActivity : Activity() {
 
         root.addView(sectionLabel("3. Background service"))
         serviceButton = button("Start remote service") {
-            if (RemoteService.isRunning) stopService() else startService()
+            if (RemoteService.isRunning) {
+                userStoppedService = true
+                stopService()
+            } else {
+                userStoppedService = false
+                startService()
+            }
             // The service flips isRunning shortly after; re-read so the label catches up.
             mainHandler.postDelayed(::refreshStatus, 400)
         }
@@ -173,11 +184,32 @@ class SetupActivity : Activity() {
         startService(intent)
     }
 
+    /** Brings the service up on its own once its grants are in place, unless the user stopped it here. */
+    private fun maybeAutoStartService() {
+        if (!RemoteService.isRunning && !userStoppedService &&
+            isNotificationAccessGranted() && isBluetoothConnectGranted()
+        ) {
+            startService()
+            mainHandler.postDelayed(::refreshStatus, 500) // one-shot: isRunning is true by then, no loop
+        }
+    }
+
     private fun refreshStatus() {
         val notif = isNotificationAccessGranted()
         val bt = isBluetoothConnectGranted()
         val post = isPostNotificationsGranted()
         val running = RemoteService.isRunning
+
+        // The buttons themselves show grant state - a granted requirement flips its button to a done
+        // label and disables it, so "still says Grant / does nothing when tapped" cannot happen.
+        notificationButton.isEnabled = !notif
+        notificationButton.text =
+            if (notif) "✓ Notification access granted" else "Grant notification access"
+
+        val runtimeGranted = bt && post
+        permissionButton.isEnabled = !runtimeGranted
+        permissionButton.text =
+            if (runtimeGranted) "✓ Bluetooth + notifications granted" else "Grant Bluetooth + notifications"
 
         serviceButton.text = if (running) "Stop remote service" else "Start remote service"
 
