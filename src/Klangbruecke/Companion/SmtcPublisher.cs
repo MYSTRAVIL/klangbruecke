@@ -32,6 +32,8 @@ internal sealed class SmtcPublisher : ISmtcPublisher
 
     public event EventHandler<MediaCommand>? CommandRequested;
 
+    public event EventHandler<long>? SeekRequested;
+
     public SmtcPublisher()
     {
         _window = new HiddenMessageWindow();
@@ -107,6 +109,11 @@ internal sealed class SmtcPublisher : ISmtcPublisher
         {
             Log.Error("The SMTC publisher failed to publish a snapshot.", ex);
         }
+    }
+
+    // Fleshed out in Task 7 (the ABI wiring). Stubbed here so the seam and the fake compile after Task 4.
+    public void UpdateTimeline(TimelineState timeline)
+    {
     }
 
     private void OnButtonPressed(
