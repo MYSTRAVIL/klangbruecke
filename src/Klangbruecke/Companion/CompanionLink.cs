@@ -116,9 +116,24 @@ internal sealed class CompanionLink : IDisposable
             var type = (MessageType)frame[0];
             var payload = new ReadOnlyMemory<byte>(frame, 1, frame.Length - 1);
 
-            (MediaSnapshot snapshot, _) = MediaProtocol.DecodeInbound(type, payload, _snapshot);
-            _snapshot = snapshot;
-            _publisher.Publish(_snapshot);
+            switch (type)
+            {
+                case MessageType.NowPlaying:
+                    _snapshot = MediaProtocol.DecodeNowPlaying(payload, _snapshot);
+                    _publisher.Publish(_snapshot);
+                    break;
+
+                case MessageType.PlaybackState:
+                    _snapshot = _snapshot with
+                    {
+                        IsPlaying = MediaProtocol.DecodePlaybackState(payload).IsPlaying,
+                    };
+                    _publisher.Publish(_snapshot);
+                    break;
+
+                // AlbumArt (Task 5) and the seek timeline (Task 6) fold in here next; Hello / Command /
+                // RequestArt are never inbound on the PC side.
+            }
         }
         catch (Exception ex)
         {
