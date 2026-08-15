@@ -8,10 +8,11 @@ namespace Klangbruecke.Tests.Fakes;
 /// is set to - so <c>CompanionLink</c>'s connect / send / receive / reconnect behaviour can be driven
 /// with no <c>StreamSocket</c> underneath it.
 ///
-/// Public, in Fakes, and not <c>file</c>-scoped so later tests (and <c>ConnectionManager</c>'s) can
-/// consume it too.
+/// In Fakes, and not <c>file</c>-scoped so later tests (and <c>ConnectionManager</c>'s) can consume
+/// it too. Internal to match the internal <see cref="ICompanionTransport"/> it implements - it lives
+/// in the test assembly, so internal is visible.
 /// </summary>
-public sealed class FakeCompanionTransport : ICompanionTransport
+internal sealed class FakeCompanionTransport : ICompanionTransport
 {
     /// <summary>Every whole frame handed to <see cref="SendAsync"/>, oldest first.</summary>
     public List<byte[]> Sent { get; } = new();
