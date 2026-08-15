@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The foreground layer of the adaptive launcher icon: the Bluetooth rune in white, centered in the
+  adaptive-icon safe zone (108x108 canvas, glyph kept within the inner ~66). The path is the standard
+  Bluetooth bind-rune, stroked (not filled) with round caps/joins so it reads cleanly at small sizes.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M40.25,40.25 L67.75,67.75 L54,81.5 L54,26.5 L67.75,40.25 L40.25,67.75" />
+</vector>
