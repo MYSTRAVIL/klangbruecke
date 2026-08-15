@@ -16,17 +16,20 @@ object Protocol {
     /** The single supported protocol version, sent in Hello. Must match the phone/PC. */
     const val PROTOCOL_VERSION = 1
 
-    // Message type bytes. Mirror of MessageType in ProtocolMessage.cs.
+    // Message type bytes. Mirror of MessageType in ProtocolMessage.cs. Phone->PC in 0x0x, PC->phone in 0x1x.
     const val TYPE_HELLO: Byte = 0x01
     const val TYPE_NOW_PLAYING: Byte = 0x02
     const val TYPE_PLAYBACK_STATE: Byte = 0x03
+    const val TYPE_ALBUM_ART: Byte = 0x04
     const val TYPE_COMMAND: Byte = 0x10
+    const val TYPE_REQUEST_ART: Byte = 0x11
 
     // Command action strings (CommandPayload.command in the C#). The PC sends these; we consume them.
     const val COMMAND_PLAY = "play"
     const val COMMAND_PAUSE = "pause"
     const val COMMAND_NEXT = "next"
     const val COMMAND_PREVIOUS = "previous"
+    const val COMMAND_SEEK = "seek"
 
     // PlaybackState.status strings. The C# maps status == "playing" -> IsPlaying=true; anything else
     // is treated as paused. We emit exactly these two.
@@ -79,14 +82,17 @@ object Protocol {
         album: String,
         durationMs: Long,
         hasSession: Boolean,
+        artHash: String?,
     ): ByteArray {
-        // Field names + order mirror NowPlayingPayload in ProtocolMessage.cs.
+        // Field names + order mirror NowPlayingPayload in ProtocolMessage.cs. A null artHash goes as JSON
+        // null, which the C# reads as "no art".
         val json = JSONObject()
             .put("title", title)
             .put("artist", artist)
             .put("album", album)
             .put("durationMs", durationMs)
             .put("hasSession", hasSession)
+            .put("artHash", artHash ?: JSONObject.NULL)
         return encodeFrame(TYPE_NOW_PLAYING, json.toString().toByteArray(Charsets.UTF_8))
     }
 
@@ -105,9 +111,32 @@ object Protocol {
         return encodeFrame(TYPE_PLAYBACK_STATE, json.toString().toByteArray(Charsets.UTF_8))
     }
 
+    /**
+     * Binary AlbumArt body: [2-byte big-endian hashLen][hash UTF-8][jpeg]. The exact layout
+     * MediaProtocol.TryReadAlbumArt reads on the PC. Only the body is built here; encodeFrame adds the
+     * outer length prefix + type byte.
+     */
+    fun encodeAlbumArt(hash: String, jpeg: ByteArray): ByteArray {
+        val h = hash.toByteArray(Charsets.UTF_8)
+        val body = ByteArray(2 + h.size + jpeg.size)
+        body[0] = (h.size ushr 8).toByte()
+        body[1] = h.size.toByte()
+        System.arraycopy(h, 0, body, 2, h.size)
+        System.arraycopy(jpeg, 0, body, 2 + h.size, jpeg.size)
+        return encodeFrame(TYPE_ALBUM_ART, body)
+    }
+
     /** Reads the action out of a Command payload (CommandPayload.command in the C#). */
     fun decodeCommand(payload: ByteArray): String =
         JSONObject(String(payload, Charsets.UTF_8)).getString("command")
+
+    /** Reads positionMs out of a seek Command payload (CommandPayload.positionMs in the C#). */
+    fun decodeSeekPositionMs(payload: ByteArray): Long =
+        JSONObject(String(payload, Charsets.UTF_8)).getLong("positionMs")
+
+    /** Reads the requested hash out of a RequestArt payload (RequestArtPayload.artHash in the C#). */
+    fun decodeRequestArt(payload: ByteArray): String =
+        JSONObject(String(payload, Charsets.UTF_8)).getString("artHash")
 
     /**
      * Consumes one whole frame from the front of [buffer] (bytes in [0, length)). Returns null and

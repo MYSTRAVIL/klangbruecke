@@ -170,14 +170,48 @@ class RemoteService : Service() {
     }
 
     private fun handleFrame(frame: Protocol.Frame) {
-        if (frame.type != Protocol.TYPE_COMMAND) return // Phase 2 only receives Commands
+        when (frame.type) {
+            Protocol.TYPE_COMMAND -> handleCommand(frame.payload)
+            Protocol.TYPE_REQUEST_ART -> handleRequestArt(frame.payload)
+        }
+    }
+
+    private fun handleCommand(payload: ByteArray) {
         val action = try {
-            Protocol.decodeCommand(frame.payload)
+            Protocol.decodeCommand(payload)
         } catch (e: Exception) {
             Log.w(TAG, "Malformed Command frame ignored", e)
             return
         }
-        mediaBridge.apply(action)
+        if (action == Protocol.COMMAND_SEEK) {
+            val ms = try {
+                Protocol.decodeSeekPositionMs(payload)
+            } catch (e: Exception) {
+                Log.w(TAG, "Seek without positionMs ignored", e)
+                return
+            }
+            mediaBridge.applySeek(ms)
+        } else {
+            mediaBridge.apply(action)
+        }
+    }
+
+    /** Answers a RequestArt with the current track's JPEG, but only if it still matches the asked hash. */
+    private fun handleRequestArt(payload: ByteArray) {
+        val requested = try {
+            Protocol.decodeRequestArt(payload)
+        } catch (e: Exception) {
+            Log.w(TAG, "Malformed RequestArt ignored", e)
+            return
+        }
+        val art = mediaBridge.currentArt() ?: return
+        if (art.first != requested) return // the PC asked for a track we have since moved past
+        val output = clientOut ?: return
+        try {
+            sendFrame(output, Protocol.encodeAlbumArt(art.first, art.second))
+        } catch (e: IOException) {
+            Log.i(TAG, "RequestArt reply failed (peer gone?)", e)
+        }
     }
 
     /** Fired on the main Looper by MediaBridge when the session changes. Pushes a fresh snapshot. */
@@ -200,11 +234,19 @@ class RemoteService : Service() {
                 snapshot.album,
                 snapshot.durationMs,
                 snapshot.hasSession,
+                snapshot.artHash,
             ),
         )
         val status = if (snapshot.isPlaying) Protocol.STATUS_PLAYING else Protocol.STATUS_PAUSED
-        // position/timestamp/speed are Phase 3 concerns; send inert values so the frame stays valid.
-        sendFrame(output, Protocol.encodePlaybackState(status, 0L, 0L, 1.0))
+        sendFrame(
+            output,
+            Protocol.encodePlaybackState(
+                status,
+                snapshot.positionMs,
+                snapshot.timestampMs,
+                snapshot.speed,
+            ),
+        )
     }
 
     private fun sendFrame(output: OutputStream, frame: ByteArray) {

@@ -8,6 +8,7 @@ import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -23,7 +24,11 @@ import android.util.Log
  */
 class MediaBridge(context: Context) {
 
-    /** An immutable read of the active session. Album/duration are carried now; only text + isPlaying are used in Phase 2. */
+    /**
+     * An immutable read of the active session. [positionMs] is the *live* position interpolated to the
+     * moment of the read, with [timestampMs] the elapsed-realtime clock it was taken at, so the PC can
+     * re-base its own advancing seek bar from it. [artHash] keys the album art the PC fetches lazily.
+     */
     data class Snapshot(
         val title: String,
         val artist: String,
@@ -31,6 +36,10 @@ class MediaBridge(context: Context) {
         val durationMs: Long,
         val isPlaying: Boolean,
         val hasSession: Boolean,
+        val artHash: String? = null,
+        val positionMs: Long = 0L,
+        val timestampMs: Long = 0L,
+        val speed: Double = 1.0,
     ) {
         companion object {
             val EMPTY = Snapshot("", "", "", 0L, isPlaying = false, hasSession = false)
@@ -48,12 +57,18 @@ class MediaBridge(context: Context) {
 
     private var controller: MediaController? = null
 
+    // The current track's art, computed once per metadata change (event-driven) and held until the PC
+    // asks for it. Null when the track has no art.
+    private var artHash: String? = null
+    private var artJpeg: ByteArray? = null
+
     private val controllerCallback = object : MediaController.Callback() {
         override fun onPlaybackStateChanged(state: PlaybackState?) {
             onChanged?.invoke()
         }
 
         override fun onMetadataChanged(metadata: MediaMetadata?) {
+            refreshArt(metadata)
             onChanged?.invoke()
         }
 
@@ -96,7 +111,32 @@ class MediaBridge(context: Context) {
         val album = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty()
         val duration = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
         val isPlaying = state?.state == PlaybackState.STATE_PLAYING
-        return Snapshot(title, artist, album, duration, isPlaying, hasSession = true)
+        val speed = state?.playbackSpeed?.toDouble() ?: 1.0
+        val now = SystemClock.elapsedRealtime()
+        val position = livePosition(state, now, isPlaying, speed)
+        return Snapshot(
+            title, artist, album, duration, isPlaying, hasSession = true,
+            artHash = artHash, positionMs = position, timestampMs = now, speed = speed,
+        )
+    }
+
+    /**
+     * Interpolates the framework's last-reported position up to [now] so the PC gets a live value to
+     * re-base its seek bar from. A paused track reports its frozen position as-is; this is a read, not a
+     * timer - it runs only when we build a snapshot, so it adds no wakeups.
+     */
+    private fun livePosition(state: PlaybackState?, now: Long, isPlaying: Boolean, speed: Double): Long {
+        state ?: return 0L
+        if (!isPlaying) return state.position
+        val elapsed = now - state.lastPositionUpdateTime
+        return state.position + (elapsed * speed).toLong()
+    }
+
+    /** The current track's (hash, jpeg), or null if there is no art. Answers a RequestArt. */
+    fun currentArt(): Pair<String, ByteArray>? {
+        val h = artHash ?: return null
+        val j = artJpeg ?: return null
+        return h to j
     }
 
     /** Applies a transport command (one of Protocol.COMMAND_*) to the active session. No-op if none. */
@@ -109,6 +149,21 @@ class MediaBridge(context: Context) {
             Protocol.COMMAND_PREVIOUS -> controls.skipToPrevious()
             else -> Log.w(TAG, "Ignoring unknown command action: $action")
         }
+    }
+
+    /** Seeks the active session to [positionMs] (the PC's Protocol.COMMAND_SEEK). No-op if none. */
+    fun applySeek(positionMs: Long) {
+        controller?.transportControls?.seekTo(positionMs)
+    }
+
+    /** Recomputes the cached art for the current metadata. Tries album art, then art, then display icon. */
+    private fun refreshArt(metadata: MediaMetadata?) {
+        val bitmap = metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+            ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+        val encoded = AlbumArtCodec.encode(bitmap)
+        artHash = encoded?.first
+        artJpeg = encoded?.second
     }
 
     private fun safeActiveSessions(): List<MediaController> =
@@ -126,11 +181,15 @@ class MediaBridge(context: Context) {
         unbind()
         controller = next
         controller?.registerCallback(controllerCallback, mainHandler)
+        // A freshly-bound controller already has metadata; compute its art so the first snapshot carries it.
+        refreshArt(controller?.metadata)
     }
 
     private fun unbind() {
         controller?.unregisterCallback(controllerCallback)
         controller = null
+        artHash = null
+        artJpeg = null
     }
 
     private companion object {
