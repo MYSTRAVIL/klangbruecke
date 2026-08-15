@@ -25,3 +25,11 @@ artifacts/
 
 # Handoff continuation logs (JSON envelopes from headless spawns)
 handoffs/logs/
+
+# Android companion app (Gradle)
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/.idea/
+android/.kotlin/
