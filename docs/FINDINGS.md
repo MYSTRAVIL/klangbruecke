@@ -975,3 +975,48 @@ transport control** (metadata-over-AVRCP is still moot — we synthesize our own
 **Conclusion: MVP channel PROVEN and wired.** Phase 2 (2A–2C) complete. Remaining: Phase 3 (album art +
 seek) and Phase 4 (polish, incl. the setup-screen bugs in `companion-followups.md`). The feature is not
 yet in a packaged/released build — that is Phase 4.
+
+## 22. Phase 3 (album art + seek) — verified on hardware; the seek unknown resolved (2026-08-15)
+
+Album art and the seek bar were built (PC `Companion/` + Android), packaged (MSIX **0.3.2.0**, APK), and
+installed on this machine. Confirmed live in ModernFlyouts against the phone: **the seek bar renders,
+advances, and scrubs; the cover renders.** The §20.1 / followups #4 open question is closed.
+
+- **The seek scrubber needs a LIVE, ADVANCING position — the §20.1 hypothesis was right.** A static
+  position surfaced no scrubber; an advancing one does. The phone must stay silent (power), so the
+  **advance is done PC-side**: `CompanionLink` re-bases from the phone's one-shot `PlaybackState`
+  position on play/pause/seek, then a 1 s `IScheduler` tick pushes an interpolated position
+  (`base + elapsed × speed`) into the SMTC timeline. Phone streams nothing; the bar still moves.
+- **What makes ModernFlyouts draw the scrubber:** `SystemMediaTransportControls.UpdateTimelineProperties`
+  with `StartTime=0`, `EndTime=duration`, `Position`, `MaxSeekTime=duration`, **plus**
+  `PlaybackStatus=Playing` and a non-zero `PlaybackRate`. A **zero/absent duration → no scrubber
+  geometry** (this is what the static Phase-1 probe lacked). Guard `UpdateTimeline` on `duration > 0`.
+- **Scrub-to-seek:** `PlaybackPositionChangeRequested` fires on a thread-pool thread; raise it as an
+  event, marshal, and send a `Command{command:"seek", positionMs}` — the phone applies
+  `transportControls.seekTo`.
+- **Album art renders** via `DisplayUpdater.Thumbnail = RandomAccessStreamReference.CreateFromStream(...)`
+  over an `InMemoryRandomAccessStream` written from the ~400 px JPEG. Lazy path proven: `artHash` on
+  `NowPlaying` → `RequestArt` on cache-miss → binary `AlbumArt` frame `[2-byte hashLen][hash][JPEG]`.
+- **Cover-art gotcha (cost a release):** do **not** gate the SMTC thumbnail on `artHash` alone. Art is
+  fetched lazily, so a track's *first* publish carries the hash but **no bytes**; if the thumbnail key is
+  the hash, the later publish that finally has the JPEG matches the key and is skipped — the cover never
+  appears. Key on *what is actually displayed* (hash-with-bytes), so the bytes-arriving publish repaints.
+- **Binary frames ride the existing framing untouched:** the length-prefixed read loop drains an
+  `AlbumArt` blob the same as any JSON frame; a ~30 KB JPEG over RFCOMM under live A2DP was fine (cf. §20.3).
+
+**Phase 4 items confirmed on hardware this session:**
+- **Multiple active sessions is real** (followups #3): the phone had Spotify **and** Poweramp active at
+  once; `getActiveSessions()[0]` picked arbitrarily. Fixed — `MediaBridge` now prefers the `PLAYING`
+  session, falls back to index 0, and re-picks when the bound session pauses.
+- **Setup-screen bugs are real** (followups #1/#2): permissions were granted on-device (verified via
+  `settings get secure enabled_notification_listeners` + `dumpsys package … granted=true`) yet the grant
+  **buttons never changed** and the Bluetooth button silently no-op'd when already granted. Fixed — the
+  buttons flip to a disabled "✓ granted" state, and the service **auto-starts** once its grants are in
+  place (respecting a manual stop).
+- **Always-on service:** a `BootReceiver` (BOOT_COMPLETED + MY_PACKAGE_REPLACED) restarts `RemoteService`
+  after a reboot/update, so the PC connects whenever in range without opening the app. A *force-stop*
+  (incl. `adb install -r`) still needs one launch — Android delivers no broadcasts to a stopped app.
+
+**Conclusion: Phase 3 done and installed.** Album art + live seek verified on hardware; the PC-side
+interpolation tick is the mechanism that made the scrubber appear. Remaining Phase 4: reboot/reconnect
+hardening (the historically fragile path — test explicitly) and attaching the APK to a GitHub release.
