@@ -5,6 +5,7 @@ using System.Reflection;
 using Klangbruecke.App;
 using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
+using Klangbruecke.Companion;
 using Klangbruecke.Config;
 using Klangbruecke.Connection;
 using Klangbruecke.Diagnostics;
@@ -211,13 +212,30 @@ internal static class Program
         // Plays event sounds on connection-state transitions when the user has sounds enabled.
         var sound = new SoundPlayer();
 
-        var tray = new TrayContext(icon, trayIcons, status, connection, settings, shell, updateChecker, sound);
+        // The opt-in phone media remote. Owned here, beside the manager rather than inside it - it
+        // shares none of the manager's four state machines and brings its own off-thread callbacks,
+        // so it stays out of the one lock-free class the app most needs to keep pristine (FINDINGS §21).
+        // Built dormant; ApplySetting below starts it only if the user has turned it on. It borrows the
+        // dispatcher and scheduler, so it is disposed after the message loop and before those are.
+        var phoneRemote = new PhoneRemote(ui, scheduler, settings);
+
+        var tray = new TrayContext(
+            icon, trayIcons, status, connection, settings, shell, updateChecker, sound, phoneRemote);
 
         // Only now. Everything that could throw on the way up has run, and from here the icon has an
         // owner whose Dispose hides it. See the note where it was built.
         icon.Visible = true;
 
+        // After the tray exists, because a first connect is a ~14 s uncached SDP discovery and its
+        // eventual SMTC session should land on a tray that is already up. Fire-and-forget inside.
+        phoneRemote.ApplySetting();
+
         Application.Run(tray);
+
+        // After the loop, on this same UI thread, and before the dispatcher/scheduler `using`s above
+        // unwind - the companion borrows both. Disposing it here stops its read loop and tears down the
+        // SMTC session while there is still a thread and the seams it depends on are still alive.
+        phoneRemote.Dispose();
     }
 
     /// <summary>

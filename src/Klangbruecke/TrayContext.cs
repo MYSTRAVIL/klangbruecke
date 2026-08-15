@@ -2,6 +2,7 @@ using System.ComponentModel;
 using Klangbruecke.App;
 using Klangbruecke.Audio;
 using Klangbruecke.Bluetooth;
+using Klangbruecke.Companion;
 using Klangbruecke.Config;
 using Klangbruecke.Connection;
 using Klangbruecke.Diagnostics;
@@ -53,6 +54,13 @@ internal sealed class TrayContext : ApplicationContext
     private readonly ConnectionManager _connection;
     private readonly IAppShell _shell;
     private readonly UpdateChecker _updateChecker;
+
+    /// <summary>
+    /// The opt-in phone media remote. The view only reads <see cref="Settings.PhoneRemoteEnabled"/> for
+    /// the tick and calls <see cref="PhoneRemote.SetEnabled"/> on the click - the remote owns its own
+    /// lifecycle, kept out of <see cref="ConnectionManager"/> on purpose (see the composition root).
+    /// </summary>
+    private readonly PhoneRemote _phoneRemote;
 
     /// <summary>
     /// Plays event sounds on connection-state transitions, gated on the user's Sounds toggle.
@@ -107,7 +115,8 @@ internal sealed class TrayContext : ApplicationContext
         Settings settings,
         IAppShell shell,
         UpdateChecker updateChecker,
-        ISoundPlayer sound)
+        ISoundPlayer sound,
+        PhoneRemote phoneRemote)
     {
         _icon = icon;
         _icons = icons;
@@ -117,6 +126,7 @@ internal sealed class TrayContext : ApplicationContext
         _shell = shell;
         _updateChecker = updateChecker;
         _sound = sound;
+        _phoneRemote = phoneRemote;
 
         // Initialized before the first StateChanged can fire, so the first transition is measured
         // from the actual startup state rather than a default.
@@ -343,6 +353,13 @@ internal sealed class TrayContext : ApplicationContext
         var sounds = new ToolStripMenuItem("Sounds") { Checked = _settings.EventSounds };
         sounds.Click += (_, _) => _connection.SetEventSounds(!_settings.EventSounds);
         _menu.Items.Add(sounds);
+
+        // Opt-in phone media remote. The tick reads the setting; the click hands off to PhoneRemote,
+        // which persists the choice and starts/stops the companion live. Unlike the items above it does
+        // not route through ConnectionManager - the remote is owned beside the manager, not by it.
+        var phoneRemote = new ToolStripMenuItem("Phone remote") { Checked = _settings.PhoneRemoteEnabled };
+        phoneRemote.Click += (_, _) => _phoneRemote.SetEnabled(!_settings.PhoneRemoteEnabled);
+        _menu.Items.Add(phoneRemote);
 
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(BuildDiagnosticsMenu());

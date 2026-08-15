@@ -33,6 +33,13 @@ public class Settings
     /// <summary>Play a chime on connect / disconnect / degrade.</summary>
     public bool EventSounds { get; set; } = true;
 
+    /// <summary>
+    /// Opt-in: run the phone media remote (companion app + SMTC). Off by default so the core
+    /// no-phone-app experience is untouched for anyone who does not install the companion. See
+    /// <see cref="Klangbruecke.Companion.PhoneRemote"/>.
+    /// </summary>
+    public bool PhoneRemoteEnabled { get; set; }
+
     [JsonIgnore]
     public static string Directory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Klangbruecke");
