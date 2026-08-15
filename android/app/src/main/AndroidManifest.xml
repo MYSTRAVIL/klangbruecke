@@ -19,6 +19,10 @@
     <!-- Ongoing notification visibility on Android 13+. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Start the always-on remote service on boot, so the PC can connect whenever it is in range
+         without the user opening the app. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <uses-feature
         android:name="android.hardware.bluetooth"
         android:required="true" />
@@ -43,6 +47,17 @@
             android:name=".RemoteService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Restarts the always-on service after a reboot or an app update. BOOT_COMPLETED is an
+             allowed background foreground-service-start exemption. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name=".KlangbrueckeNotificationListener"
