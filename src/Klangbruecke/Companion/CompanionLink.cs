@@ -171,6 +171,7 @@ internal sealed class CompanionLink : IDisposable
         }
         else
         {
+            Log.Info($"Requesting album art for {hash}.");
             _ = SendAsync(MediaProtocol.EncodeRequestArt(hash), "RequestArt");
         }
     }
@@ -184,6 +185,7 @@ internal sealed class CompanionLink : IDisposable
         }
 
         _artCache.Put(hash, jpeg);
+        Log.Info($"Album art received: {jpeg.Length} bytes for {hash}.");
 
         // Only republish if this is the art for the track showing now; a late reply for a track we have
         // since moved past is cached for later but not shown over the current one.

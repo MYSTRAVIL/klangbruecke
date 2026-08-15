@@ -32,10 +32,12 @@ internal sealed class SmtcPublisher : ISmtcPublisher
     private SystemMediaTransportControls? _smtc;
     private bool _disposed;
 
-    // The art hash currently on the thumbnail. Rebuilding a RandomAccessStreamReference on every publish
-    // (which includes every seek tick) would be wasteful and can flicker, so the thumbnail is only
-    // rebuilt when the track's art actually changes. Null means "no thumbnail set".
-    private string? _publishedArtHash;
+    // The art hash whose bytes are currently on the thumbnail; null means no thumbnail is shown. Art is
+    // fetched lazily, so a track's first publish carries its hash but no bytes yet - keying on the hash
+    // alone would then skip the later publish that finally has the bytes (the cover would never appear).
+    // Keying on "what is actually displayed" rebuilds exactly when the shown image should change and
+    // skips otherwise (a play/pause must not rebuild the stream).
+    private string? _thumbnailKey;
 
     public event EventHandler<MediaCommand>? CommandRequested;
 
@@ -91,7 +93,7 @@ internal sealed class SmtcPublisher : ISmtcPublisher
                 SystemMediaTransportControlsDisplayUpdater cleared = smtc.DisplayUpdater;
                 cleared.ClearAll();
                 cleared.Update();
-                _publishedArtHash = null; // next session rebuilds its thumbnail from scratch
+                _thumbnailKey = null; // next session rebuilds its thumbnail from scratch
                 return;
             }
 
@@ -112,12 +114,23 @@ internal sealed class SmtcPublisher : ISmtcPublisher
                 updater.MusicProperties.AlbumTitle = snapshot.Album;
             }
 
-            // Only touch the thumbnail when the track's art actually changes - a seek tick republishes the
-            // same snapshot every second and must not rebuild the image each time.
-            if (snapshot.ArtHash != _publishedArtHash)
+            // Show the current track's art once its bytes have arrived. desiredKey is the hash we would
+            // display now (null until the bytes are in hand); rebuild only when that changes.
+            string? desiredKey = snapshot.Art is { Length: > 0 } ? snapshot.ArtHash : null;
+            if (desiredKey != _thumbnailKey)
             {
-                _publishedArtHash = snapshot.ArtHash;
-                updater.Thumbnail = snapshot.Art is { Length: > 0 } bytes ? ThumbnailFromBytes(bytes) : null;
+                if (snapshot.Art is { Length: > 0 } artBytes)
+                {
+                    updater.Thumbnail = ThumbnailFromBytes(artBytes);
+                    Log.Info($"SMTC thumbnail set ({artBytes.Length} bytes) for art {snapshot.ArtHash}.");
+                }
+                else
+                {
+                    updater.Thumbnail = null;
+                }
+
+                // Assigned only after a successful build, so a throw does not poison the key and skip a retry.
+                _thumbnailKey = desiredKey;
             }
 
             updater.Update();
