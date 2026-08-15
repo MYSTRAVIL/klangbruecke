@@ -41,6 +41,15 @@ internal sealed class CompanionLink : IDisposable
     private MediaSnapshot _snapshot = MediaSnapshot.Empty;
     private bool _disposed;
 
+    // The advancing-seek-bar clock. On each PlaybackState we re-base to the phone's live position and,
+    // while playing, a periodic tick pushes an interpolated position so the bar moves without the phone
+    // ever streaming one. All touched only on the UI thread (marshaled inbound + UI-thread scheduler).
+    private const int TickSeconds = 1;
+    private IDisposable? _tick;
+    private long _basePositionMs;
+    private DateTimeOffset _baseAt;
+    private double _speed;
+
     public CompanionLink(
         ICompanionTransport transport,
         ISmtcPublisher publisher,
@@ -58,6 +67,7 @@ internal sealed class CompanionLink : IDisposable
         _transport.FrameReceived += OnFrameReceived;
         _transport.Disconnected += OnDisconnected;
         _publisher.CommandRequested += OnCommandRequested;
+        _publisher.SeekRequested += OnSeekRequested;
     }
 
     /// <summary>Connects for the first time. Failure is not fatal - it backs off and tries again.</summary>
@@ -184,12 +194,52 @@ internal sealed class CompanionLink : IDisposable
         }
     }
 
-    // Task 6 replaces this stub with the timeline/interpolation logic. For now it preserves the Phase 2
-    // behaviour: fold the play flag (leaving the text) and publish.
+    /// <summary>
+    /// A PlaybackState carries the play flag (folded into the snapshot, so the title stands) and the
+    /// timeline. We re-base the local clock from the phone's live position, push it once immediately,
+    /// and while playing arm the tick that keeps the bar advancing; a pause pushes the frozen position
+    /// once and disarms the tick.
+    /// </summary>
     private void OnPlaybackState(PlaybackUpdate update)
     {
         _snapshot = _snapshot with { IsPlaying = update.IsPlaying };
         _publisher.Publish(_snapshot);
+
+        _basePositionMs = update.PositionMs;
+        _baseAt = _scheduler.Now;
+        _speed = update.Speed;
+        PushTimeline();
+
+        if (update.IsPlaying)
+        {
+            ArmTick();
+        }
+        else
+        {
+            DisarmTick();
+        }
+    }
+
+    private void PushTimeline()
+    {
+        long pos = TimelineMath.PositionAt(_basePositionMs, _scheduler.Now - _baseAt, _speed, _snapshot.DurationMs);
+        _publisher.UpdateTimeline(new TimelineState(pos, _snapshot.DurationMs, _snapshot.IsPlaying, _speed));
+    }
+
+    private void ArmTick()
+    {
+        if (_tick is not null)
+        {
+            return; // already advancing
+        }
+
+        _tick = _scheduler.SchedulePeriodic(TimeSpan.FromSeconds(TickSeconds), PushTimeline);
+    }
+
+    private void DisarmTick()
+    {
+        _tick?.Dispose();
+        _tick = null;
     }
 
     private void OnCommandRequested(object? sender, MediaCommand command)
@@ -197,8 +247,14 @@ internal sealed class CompanionLink : IDisposable
         // SendAsync catches everything, so there is no faulted task left for no one to observe.
         => _ = SendAsync(MediaProtocol.EncodeCommand(command), "command");
 
+    private void OnSeekRequested(object? sender, long positionMs)
+        => _ = SendAsync(MediaProtocol.EncodeSeek(positionMs), "seek");
+
     private void OnDisconnected(object? sender, EventArgs e)
     {
+        // Stop the seek-bar clock: the phone is gone, so there is no position left to advance.
+        DisarmTick();
+
         try
         {
             // Clear the surface before anything else: an SMTC session left showing the last track
@@ -270,8 +326,10 @@ internal sealed class CompanionLink : IDisposable
         _transport.FrameReceived -= OnFrameReceived;
         _transport.Disconnected -= OnDisconnected;
         _publisher.CommandRequested -= OnCommandRequested;
+        _publisher.SeekRequested -= OnSeekRequested;
 
         CancelReconnect();
+        DisarmTick();
 
         _cts.Cancel();
         _cts.Dispose();

@@ -88,6 +88,86 @@ public sealed class CompanionLinkTests
         Assert.DoesNotContain(t.Sent, f => f[4] == (byte)MessageType.RequestArt);
     }
 
+    private const string PlayingAt30 =
+        "{\"status\":\"playing\",\"positionMs\":30000,\"timestampMs\":0,\"speed\":1.0}";
+
+    [Fact]
+    public async Task PlaybackState_PushesTimelineImmediately()
+    {
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, NewScheduler());
+        await link.StartAsync();
+        t.Raise(FrameOf(MessageType.NowPlaying, NowPlayingH1));
+        t.Raise(FrameOf(MessageType.PlaybackState, PlayingAt30));
+        Assert.Equal(30000, p.Timelines.Last().PositionMs);
+        Assert.Equal(200000, p.Timelines.Last().DurationMs);
+    }
+
+    [Fact]
+    public async Task WhilePlaying_TickAdvancesTheSeekBar()
+    {
+        var scheduler = NewScheduler();
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, scheduler);
+        await link.StartAsync();
+        t.Raise(FrameOf(MessageType.NowPlaying, NowPlayingH1));
+        t.Raise(FrameOf(MessageType.PlaybackState, PlayingAt30));
+
+        scheduler.Advance(TimeSpan.FromSeconds(1));
+        Assert.Equal(31000, p.Timelines.Last().PositionMs);
+        scheduler.Advance(TimeSpan.FromSeconds(1));
+        Assert.Equal(32000, p.Timelines.Last().PositionMs);
+    }
+
+    [Fact]
+    public async Task Paused_StopsAdvancing()
+    {
+        var scheduler = NewScheduler();
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, scheduler);
+        await link.StartAsync();
+        t.Raise(FrameOf(MessageType.NowPlaying, NowPlayingH1));
+        t.Raise(FrameOf(MessageType.PlaybackState, "{\"status\":\"paused\",\"positionMs\":45000,\"timestampMs\":0,\"speed\":0.0}"));
+        int count = p.Timelines.Count;
+        scheduler.Advance(TimeSpan.FromSeconds(5));
+        Assert.Equal(count, p.Timelines.Count); // no tick while paused
+        Assert.Equal(45000, p.Timelines.Last().PositionMs);
+    }
+
+    [Fact]
+    public async Task SeekRequested_SendsSeekCommandWithPosition()
+    {
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, NewScheduler());
+        await link.StartAsync();
+        p.RaiseSeek(90000);
+        byte[]? seek = t.Sent.LastOrDefault(f => f[4] == (byte)MessageType.Command);
+        Assert.NotNull(seek);
+        string json = Encoding.UTF8.GetString(seek!, 5, seek!.Length - 5);
+        Assert.Contains("\"command\":\"seek\"", json);
+        Assert.Contains("\"positionMs\":90000", json);
+    }
+
+    [Fact]
+    public async Task Disconnect_DisarmsTheTick()
+    {
+        var scheduler = NewScheduler();
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, scheduler);
+        await link.StartAsync();
+        t.Raise(FrameOf(MessageType.NowPlaying, NowPlayingH1));
+        t.Raise(FrameOf(MessageType.PlaybackState, "{\"status\":\"playing\",\"positionMs\":0,\"timestampMs\":0,\"speed\":1.0}"));
+        t.RaiseDisconnected();
+        int count = p.Timelines.Count;
+        scheduler.Advance(TimeSpan.FromSeconds(5));
+        Assert.Equal(count, p.Timelines.Count); // tick stopped when the link dropped
+    }
+
     [Fact]
     public async Task OnConnect_SendsHello()
     {
