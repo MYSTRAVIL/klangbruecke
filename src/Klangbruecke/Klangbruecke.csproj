@@ -10,6 +10,10 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- The SMTC publisher calls the ISystemMediaTransportControlsInterop vtable directly with
+         function pointers (FINDINGS 20.1): .NET 5+ removed the managed projection that would let a
+         cast reach GetForWindow, so the one place in this app that needs unsafe is SmtcInterop. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Klangbruecke</RootNamespace>
     <AssemblyName>Klangbruecke</AssemblyName>
     <!-- Must match Identity Version in packaging/AppxManifest.xml - the startup banner logs this one
