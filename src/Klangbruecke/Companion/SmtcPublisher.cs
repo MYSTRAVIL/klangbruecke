@@ -1,7 +1,9 @@
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.Windows.Forms;
 using Klangbruecke.Diagnostics;
 using Windows.Media;
+using Windows.Storage.Streams;
 using WinRT;
 
 namespace Klangbruecke.Companion;
@@ -30,6 +32,11 @@ internal sealed class SmtcPublisher : ISmtcPublisher
     private SystemMediaTransportControls? _smtc;
     private bool _disposed;
 
+    // The art hash currently on the thumbnail. Rebuilding a RandomAccessStreamReference on every publish
+    // (which includes every seek tick) would be wasteful and can flicker, so the thumbnail is only
+    // rebuilt when the track's art actually changes. Null means "no thumbnail set".
+    private string? _publishedArtHash;
+
     public event EventHandler<MediaCommand>? CommandRequested;
 
     public event EventHandler<long>? SeekRequested;
@@ -45,6 +52,7 @@ internal sealed class SmtcPublisher : ISmtcPublisher
             IntPtr hwnd = _window.Handle;
             _smtc = SmtcInterop.GetForWindow(hwnd);
             _smtc.ButtonPressed += OnButtonPressed;
+            _smtc.PlaybackPositionChangeRequested += OnPositionChangeRequested;
             Log.Info($"SMTC publisher bound to a hidden HWND (0x{hwnd.ToInt64():X}).");
         }
         catch (Exception ex)
@@ -83,6 +91,7 @@ internal sealed class SmtcPublisher : ISmtcPublisher
                 SystemMediaTransportControlsDisplayUpdater cleared = smtc.DisplayUpdater;
                 cleared.ClearAll();
                 cleared.Update();
+                _publishedArtHash = null; // next session rebuilds its thumbnail from scratch
                 return;
             }
 
@@ -103,6 +112,14 @@ internal sealed class SmtcPublisher : ISmtcPublisher
                 updater.MusicProperties.AlbumTitle = snapshot.Album;
             }
 
+            // Only touch the thumbnail when the track's art actually changes - a seek tick republishes the
+            // same snapshot every second and must not rebuild the image each time.
+            if (snapshot.ArtHash != _publishedArtHash)
+            {
+                _publishedArtHash = snapshot.ArtHash;
+                updater.Thumbnail = snapshot.Art is { Length: > 0 } bytes ? ThumbnailFromBytes(bytes) : null;
+            }
+
             updater.Update();
         }
         catch (Exception ex)
@@ -111,9 +128,49 @@ internal sealed class SmtcPublisher : ISmtcPublisher
         }
     }
 
-    // Fleshed out in Task 7 (the ABI wiring). Stubbed here so the seam and the fake compile after Task 4.
     public void UpdateTimeline(TimelineState timeline)
     {
+        SystemMediaTransportControls? smtc = _smtc;
+        if (smtc is null || _disposed || timeline.DurationMs <= 0)
+        {
+            // No duration -> no scrubber geometry. The Phase 1 static probe lacked exactly this, which is
+            // why it never surfaced a bar (FINDINGS §20.1). Skipping is correct: a track with no length
+            // has no seek bar.
+            return;
+        }
+
+        try
+        {
+            long pos = Math.Clamp(timeline.PositionMs, 0, timeline.DurationMs);
+            smtc.UpdateTimelineProperties(new SystemMediaTransportControlsTimelineProperties
+            {
+                StartTime = TimeSpan.Zero,
+                MinSeekTime = TimeSpan.Zero,
+                Position = TimeSpan.FromMilliseconds(pos),
+                MaxSeekTime = TimeSpan.FromMilliseconds(timeline.DurationMs),
+                EndTime = TimeSpan.FromMilliseconds(timeline.DurationMs),
+            });
+
+            // A non-zero rate while playing is what lets ModernFlyouts interpolate between our pushes; 0
+            // while paused freezes the bar where it is.
+            smtc.PlaybackRate = timeline.IsPlaying ? (timeline.Speed <= 0 ? 1.0 : timeline.Speed) : 0.0;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("The SMTC publisher failed to update the timeline.", ex);
+        }
+    }
+
+    /// <summary>
+    /// Builds a thumbnail reference from raw JPEG bytes. The write targets an in-memory stream, so the
+    /// StoreAsync completes synchronously and blocking on it here is a few microseconds, not I/O.
+    /// </summary>
+    private static RandomAccessStreamReference ThumbnailFromBytes(byte[] jpeg)
+    {
+        var stream = new InMemoryRandomAccessStream();
+        stream.WriteAsync(jpeg.AsBuffer()).AsTask().GetAwaiter().GetResult();
+        stream.Seek(0);
+        return RandomAccessStreamReference.CreateFromStream(stream);
     }
 
     private void OnButtonPressed(
@@ -147,6 +204,21 @@ internal sealed class SmtcPublisher : ISmtcPublisher
         }
     }
 
+    private void OnPositionChangeRequested(
+        SystemMediaTransportControls sender,
+        PlaybackPositionChangeRequestedEventArgs args)
+    {
+        // Fires on a thread-pool thread, like OnButtonPressed: raise the event only; the link marshals.
+        try
+        {
+            SeekRequested?.Invoke(this, (long)args.RequestedPlaybackPosition.TotalMilliseconds);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("An SMTC SeekRequested handler threw.", ex);
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed)
@@ -160,6 +232,9 @@ internal sealed class SmtcPublisher : ISmtcPublisher
         if (smtc is not null)
         {
             Teardown.Quietly(() => smtc.ButtonPressed -= OnButtonPressed, "unhook the SMTC button handler");
+            Teardown.Quietly(
+                () => smtc.PlaybackPositionChangeRequested -= OnPositionChangeRequested,
+                "unhook the SMTC seek handler");
             Teardown.Quietly(
                 () =>
                 {
