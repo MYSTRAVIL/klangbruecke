@@ -856,6 +856,80 @@ integration. Tested live on this machine with music playing on the phone and rou
 This matches the predicted mechanism: Windows exposes **no GSMTC session for the A2DP-source phone**, so
 system media keys have no target that maps to the phone. Windows keeps the keys for local-app media only.
 
-**Conclusion: WONTFIX, fully closed.** Both now-playing metadata *and* transport control of the phone's
-music over Bluetooth are unreachable on this stack. Do not go looking for an AVRCP Controller API or a
-media-key forwarding path — neither exists. Only Phone Link's proprietary USB/Wi-Fi channel can do this.
+**Conclusion: WONTFIX *for the pure-Bluetooth, PC-side-only route*.** Both now-playing metadata *and*
+transport control of the phone's music are unreachable *that way* on this stack. Do not go looking for an
+AVRCP Controller API or a media-key forwarding path — neither exists.
+
+**But the feature itself is NOT dead** — it is reachable with a phone-side companion app + our own
+protocol (the Phone Link / KDE Connect route). See the design at
+`docs/superpowers/specs/2026-08-12-phone-media-remote-design.md` and the empirical gate results in §20
+below, which reverse the practical implication here: by publishing our *own* SMTC session we get
+now-playing render **and** media-key control after all — via a different door than AVRCP.
+
+## 20. Phone media remote — Phase 1 gate results (empirical, 19045, 2026-08-12)
+
+Three throwaway spikes exercised on this machine (Pixel `MYSTRAPIX9`, already bonded for audio) to gate
+the phone-media-remote design *before* writing feature code. **All three cleared.** Verdict: **GO.**
+
+### 20.1 SMTC render + control path — VALIDATED (even unpackaged)
+
+A plain .NET 8 WinForms process published a `SystemMediaTransportControls` session bound to a hidden
+HWND via `ISystemMediaTransportControlsInterop::GetForWindow`, and it rendered correctly in both the
+native Windows media overlay and **ModernFlyouts** (title/artist/cover). Confirmed live:
+- **Renders:** the dummy session showed in the flyout with metadata + art. ✓
+- **Control comes back:** the keyboard Play/Pause media key AND the flyout's transport buttons fired our
+  `ButtonPressed` handler (`Pause`, `Next`, `Previous` all logged). ✓ — **this is media-key control of
+  the phone, obtained by giving Windows a local session to target (cf. §19).**
+- **Seek:** NOT yet confirmed. A static probe frozen at 0:30 did not surface a working scrubber /
+  `PlaybackPositionChangeRequested`. Not a failure — validate with a *live, advancing* position when the
+  real `SmtcPublisher` feeds actual phone playback (Phase 3).
+
+Two .NET 8 interop traps solved (reusable for the real `SmtcPublisher`):
+- Built-in WinRT interop was removed in .NET 5+, so `Marshal.GetObjectForIUnknown` + a `[ComImport]`
+  interface throws `InvalidCastException`. Call the interop vtable directly via
+  `delegate* unmanaged[Stdcall]` function pointers (`AllowUnsafeBlocks=true`).
+- `GetForWindow`'s `riid` must be **`IID_IInspectable`** (`AF86E2E0-...`), NOT
+  `typeof(SystemMediaTransportControls).GUID` (CsWinRT leaves that a CLR-computed GUID → `E_NOINTERFACE`);
+  then `MarshalInspectable<SystemMediaTransportControls>.FromAbi(ptr)` QIs to the real interface.
+
+Note: this works **unpackaged**, which is stronger than the shipping app needs (it is packaged). So
+package identity is not a blocker for the render path either.
+
+### 20.2 Windows SDP cache gotcha — LOAD-BEARING for the real client
+
+Windows caches a bonded device's SDP service records at pair time and does **not** auto-refresh when the
+phone adds a new RFCOMM service later. Result: a service advertised *post-pairing* (our companion) is
+**invisible** to `DeviceInformation.FindAllAsync(RfcommDeviceService.GetDeviceSelector(uuid))` — it
+returned 0 even though `logcat` showed the phone listening on our UUID.
+
+**Fix (do this in the real `CompanionLink`, do NOT re-pair):** enumerate paired devices via
+`BluetoothDevice.GetDeviceSelectorFromPairingState(true)`, then per device call
+`BluetoothDevice.GetRfcommServicesForIdAsync(RfcommServiceId.FromUuid(uuid), BluetoothCacheMode.Uncached)`.
+The **`Uncached`** mode forces a live SDP inquiry and finds the new service. Re-pairing would also work
+but would disturb the audio setup and risk the stale-IRK bug (§3) — avoid it.
+
+### 20.3 RFCOMM coexistence with A2DP + HFP — PASS (the hard gate)
+
+A minimal Android RFCOMM echo server (`listenUsingRfcommWithServiceRecord`, phone = server) + a .NET
+`StreamSocket` client (PC = client) round-tripped a payload while audio was live:
+
+| Condition | Round-trips | Mismatches | Round-trip latency | Audio (user-observed) |
+| --- | --- | --- | --- | --- |
+| Idle / bring-up | 20/20 | 0 | 12–43 ms | — |
+| **Music (A2DP), ~60 s** | 300/300 | 0 | 12–66 ms | **clean, no stutter** |
+| **Live call (HFP), ~60 s** | 300/300 | 0 | up to ~220 ms (spiky) | **clean, mic fine** |
+
+- RFCOMM does **not** disturb either audio profile. Music and call audio both stayed clean under
+  continuous RFCOMM load.
+- Under an active call, RFCOMM latency rises and gets spiky because the **SCO voice link takes radio
+  priority** and RFCOMM queues behind it — the correct precedence. RFCOMM degrades gracefully; data
+  integrity held at 100% (0 mismatches) throughout.
+- Since the Wi-Fi fallback was ruled out, this PASS is what keeps the RFCOMM transport decision alive.
+
+**Spike caveat:** the throwaway Android app accepts exactly one connection then `server.close()`s its
+listener, so it must be restarted between client runs. The real companion service must **loop-accept**
+(re-listen after each disconnect).
+
+**Conclusion: GO.** All Phase 1 assumptions hold on 19045. Proceed to the Phase 2+ feature plans
+(PC `Companion/` module, Android companion app, art+seek, polish). Fold 20.1's interop code and 20.2's
+uncached-discovery requirement into those plans.
