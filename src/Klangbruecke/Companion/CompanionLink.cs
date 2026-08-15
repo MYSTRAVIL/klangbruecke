@@ -35,6 +35,7 @@ internal sealed class CompanionLink : IDisposable
 
     private readonly BackoffSchedule _connectBackoff = new();
     private readonly CancellationTokenSource _cts = new();
+    private readonly ArtCache _artCache = new();
 
     private IDisposable? _reconnect;
     private MediaSnapshot _snapshot = MediaSnapshot.Empty;
@@ -120,25 +121,75 @@ internal sealed class CompanionLink : IDisposable
             {
                 case MessageType.NowPlaying:
                     _snapshot = MediaProtocol.DecodeNowPlaying(payload, _snapshot);
+                    ResolveArt();
                     _publisher.Publish(_snapshot);
                     break;
 
                 case MessageType.PlaybackState:
-                    _snapshot = _snapshot with
-                    {
-                        IsPlaying = MediaProtocol.DecodePlaybackState(payload).IsPlaying,
-                    };
-                    _publisher.Publish(_snapshot);
+                    OnPlaybackState(MediaProtocol.DecodePlaybackState(payload));
                     break;
 
-                // AlbumArt (Task 5) and the seek timeline (Task 6) fold in here next; Hello / Command /
-                // RequestArt are never inbound on the PC side.
+                case MessageType.AlbumArt:
+                    OnAlbumArt(payload);
+                    break;
+
+                // Hello / Command / RequestArt are never inbound on the PC side; nothing to fold.
             }
         }
         catch (Exception ex)
         {
             Log.Error("The companion link failed to handle an inbound frame.", ex);
         }
+    }
+
+    /// <summary>
+    /// After a NowPlaying, attach cached art if we hold it, else ask the phone for it exactly once. A
+    /// track with no artHash simply has no image; only a cache miss sends a RequestArt, so art is
+    /// fetched once per track and never re-pushed for one the PC already has.
+    /// </summary>
+    private void ResolveArt()
+    {
+        string? hash = _snapshot.ArtHash;
+        if (string.IsNullOrEmpty(hash))
+        {
+            return;
+        }
+
+        if (_artCache.TryGet(hash, out byte[] jpeg))
+        {
+            _snapshot = _snapshot with { Art = jpeg };
+        }
+        else
+        {
+            _ = SendAsync(MediaProtocol.EncodeRequestArt(hash), "RequestArt");
+        }
+    }
+
+    private void OnAlbumArt(ReadOnlyMemory<byte> payload)
+    {
+        if (!MediaProtocol.TryReadAlbumArt(payload, out string hash, out byte[] jpeg))
+        {
+            Log.Warn("Dropped a malformed AlbumArt frame.");
+            return;
+        }
+
+        _artCache.Put(hash, jpeg);
+
+        // Only republish if this is the art for the track showing now; a late reply for a track we have
+        // since moved past is cached for later but not shown over the current one.
+        if (hash == _snapshot.ArtHash)
+        {
+            _snapshot = _snapshot with { Art = jpeg };
+            _publisher.Publish(_snapshot);
+        }
+    }
+
+    // Task 6 replaces this stub with the timeline/interpolation logic. For now it preserves the Phase 2
+    // behaviour: fold the play flag (leaving the text) and publish.
+    private void OnPlaybackState(PlaybackUpdate update)
+    {
+        _snapshot = _snapshot with { IsPlaying = update.IsPlaying };
+        _publisher.Publish(_snapshot);
     }
 
     private void OnCommandRequested(object? sender, MediaCommand command)

@@ -21,6 +21,73 @@ public sealed class CompanionLinkTests
         return frame;
     }
 
+    /// <summary>An AlbumArt frame as the transport delivers one: [type][2-byte BE hashLen][hash][jpeg], no length prefix.</summary>
+    private static byte[] AlbumArtFrameOf(string hash, byte[] jpeg)
+    {
+        byte[] h = Encoding.UTF8.GetBytes(hash);
+        var frame = new byte[1 + 2 + h.Length + jpeg.Length];
+        frame[0] = (byte)MessageType.AlbumArt;
+        frame[1] = (byte)(h.Length >> 8);
+        frame[2] = (byte)h.Length;
+        h.CopyTo(frame, 3);
+        jpeg.CopyTo(frame, 3 + h.Length);
+        return frame;
+    }
+
+    private const string NowPlayingH1 =
+        "{\"title\":\"T\",\"artist\":\"A\",\"album\":\"\",\"durationMs\":200000,\"hasSession\":true,\"artHash\":\"h1\"}";
+
+    [Fact]
+    public async Task NowPlayingWithNewArtHash_RequestsArt()
+    {
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, NewScheduler());
+        await link.StartAsync();
+        t.Raise(FrameOf(MessageType.NowPlaying, NowPlayingH1));
+        Assert.Contains(t.Sent, f => f[4] == (byte)MessageType.RequestArt);
+    }
+
+    [Fact]
+    public async Task AlbumArtFrame_AttachesBytesToSnapshotAndRepublishes()
+    {
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, NewScheduler());
+        await link.StartAsync();
+        t.Raise(FrameOf(MessageType.NowPlaying, NowPlayingH1));
+        t.Raise(AlbumArtFrameOf("h1", new byte[] { 9, 8, 7 }));
+        Assert.Equal(new byte[] { 9, 8, 7 }, p.Published.Last().Art);
+    }
+
+    [Fact]
+    public async Task ArtHashAlreadyCached_DoesNotRequestAgain_AndServesFromCache()
+    {
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, NewScheduler());
+        await link.StartAsync();
+        t.Raise(FrameOf(MessageType.NowPlaying, NowPlayingH1));
+        t.Raise(AlbumArtFrameOf("h1", new byte[] { 1 }));
+        int before = t.Sent.Count(f => f[4] == (byte)MessageType.RequestArt);
+
+        // Same track again (e.g. a metadata refresh): art is cached, no second request, served from cache.
+        t.Raise(FrameOf(MessageType.NowPlaying, NowPlayingH1));
+        Assert.Equal(before, t.Sent.Count(f => f[4] == (byte)MessageType.RequestArt));
+        Assert.Equal(new byte[] { 1 }, p.Published.Last().Art);
+    }
+
+    [Fact]
+    public async Task NowPlayingWithoutArtHash_DoesNotRequestArt()
+    {
+        var t = new FakeCompanionTransport { NextConnectResult = true };
+        var p = new FakeSmtcPublisher();
+        using var link = new CompanionLink(t, p, NewScheduler());
+        await link.StartAsync();
+        t.Raise(FrameOf(MessageType.NowPlaying, "{\"title\":\"T\",\"artist\":\"A\",\"album\":\"\",\"durationMs\":0,\"hasSession\":true}"));
+        Assert.DoesNotContain(t.Sent, f => f[4] == (byte)MessageType.RequestArt);
+    }
+
     [Fact]
     public async Task OnConnect_SendsHello()
     {
