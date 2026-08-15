@@ -64,6 +64,9 @@ class MediaBridge(context: Context) {
 
     private val controllerCallback = object : MediaController.Callback() {
         override fun onPlaybackStateChanged(state: PlaybackState?) {
+            // This session pausing may mean another active app is now the one playing - re-pick, so
+            // the PC follows whatever is actually playing rather than staying stuck on a paused app.
+            bindToBest(safeActiveSessions())
             onChanged?.invoke()
         }
 
@@ -75,14 +78,14 @@ class MediaBridge(context: Context) {
         override fun onSessionDestroyed() {
             // The app we were watching went away. Fall back to whatever is active now.
             unbind()
-            bindToFirst(safeActiveSessions())
+            bindToBest(safeActiveSessions())
             onChanged?.invoke()
         }
     }
 
     private val sessionsChangedListener =
         MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
-            bindToFirst(controllers)
+            bindToBest(controllers)
             onChanged?.invoke()
         }
 
@@ -93,7 +96,7 @@ class MediaBridge(context: Context) {
             listenerComponent,
             mainHandler,
         )
-        bindToFirst(safeActiveSessions())
+        bindToBest(safeActiveSessions())
     }
 
     fun stop() {
@@ -175,14 +178,25 @@ class MediaBridge(context: Context) {
             emptyList()
         }
 
-    private fun bindToFirst(controllers: List<MediaController>?) {
-        val next = controllers?.firstOrNull()
+    private fun bindToBest(controllers: List<MediaController>?) {
+        val next = pickBest(controllers)
         if (next?.sessionToken == controller?.sessionToken) return
         unbind()
         controller = next
         controller?.registerCallback(controllerCallback, mainHandler)
         // A freshly-bound controller already has metadata; compute its art so the first snapshot carries it.
         refreshArt(controller?.metadata)
+    }
+
+    /**
+     * Prefer the session that is actually PLAYING, falling back to the framework's first (most-recent).
+     * With two active apps - the test phone had Spotify and Poweramp both active - <c>getActiveSessions()[0]</c>
+     * is whichever the framework ordered first, which need not be the one playing.
+     */
+    private fun pickBest(controllers: List<MediaController>?): MediaController? {
+        if (controllers.isNullOrEmpty()) return null
+        return controllers.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+            ?: controllers.first()
     }
 
     private fun unbind() {
