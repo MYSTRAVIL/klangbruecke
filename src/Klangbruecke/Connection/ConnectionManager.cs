@@ -211,6 +211,19 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     /// <summary>The short phrase after the name. Never null, never empty.</summary>
     public string Detail { get; private set; } = string.Empty;
 
+    /// <summary>
+    /// The music connection is open but not routing, and the phone is in the room - the "waiting for
+    /// phone audio" condition. What <see cref="SinkWedgeWatchdog"/> watches: held far past a slow
+    /// endpoint arrival, a phantom sink endpoint is the likely cause (docs/FINDINGS.md §23).
+    ///
+    /// A cheap read of two machines, deliberately not the 152-282 ms endpoint enumeration - the watchdog
+    /// does that itself, off-thread, only after this has held long enough to be worth the cost. Read on
+    /// the UI thread, like every other access to these machines; the watchdog's tick shares this app's
+    /// one UI scheduler, so there is no cross-thread read here to guard.
+    /// </summary>
+    public bool MusicWaitingForEndpoint =>
+        _music.State == MusicState.Linked && _linkMachine.State == LinkState.Present;
+
     /// <summary>Raised on the UI thread, once per change of <see cref="State"/>.</summary>
     public event EventHandler<ConnectionState>? StateChanged;
 

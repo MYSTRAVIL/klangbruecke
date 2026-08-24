@@ -205,6 +205,15 @@ internal static class Program
 
         var shell = new AppShell();
 
+        // The stale-endpoint wedge recovery (docs/FINDINGS.md §23). Owned here beside the manager rather
+        // than inside it, for the same reason as PhoneRemote (§21): it brings an off-thread endpoint probe
+        // and its own timer, and ConnectionManager is the one lock-free class the app most needs to keep
+        // pristine. It reads only the manager's cheap MusicWaitingForEndpoint; `devices` is its probe (the
+        // factory implements ISinkEndpointStateProbe) and `shell` its restarter. Started after the tray so
+        // ConnectionManager.Start has run; disposed beside PhoneRemote, before the scheduler it borrows.
+        var wedgeWatchdog = new SinkWedgeWatchdog(
+            scheduler, ui, () => connection.MusicWaitingForEndpoint, devices, shell, settings);
+
         // One long-lived HttpClient for the process, the recommended lifetime. Not disposed - it lives as
         // long as the tray.
         var updateChecker = new UpdateChecker(new GitHubReleaseFeed(new HttpClient()), AppVersion.Current);
@@ -230,12 +239,17 @@ internal static class Program
         // eventual SMTC session should land on a tray that is already up. Fire-and-forget inside.
         phoneRemote.ApplySetting();
 
+        // Its periodic check does nothing until the "waiting for phone audio" condition has held for
+        // minutes, so starting it here costs nothing and needs the message loop the next line begins.
+        wedgeWatchdog.Start();
+
         Application.Run(tray);
 
         // After the loop, on this same UI thread, and before the dispatcher/scheduler `using`s above
-        // unwind - the companion borrows both. Disposing it here stops its read loop and tears down the
-        // SMTC session while there is still a thread and the seams it depends on are still alive.
+        // unwind - both borrow them. Disposing here stops the companion's read loop and the watchdog's
+        // timer while there is still a thread and the seams they depend on are alive.
         phoneRemote.Dispose();
+        wedgeWatchdog.Dispose();
     }
 
     /// <summary>

@@ -365,6 +365,14 @@ internal sealed class TrayContext : ApplicationContext
         _menu.Items.Add(BuildDiagnosticsMenu());
         _menu.Items.Add(new ToolStripSeparator());
 
+        // The manual half of the stale-endpoint recovery (docs/FINDINGS.md §23): a full relaunch, which
+        // clears a wedge that the tray's own Disconnect/Connect cannot - that reconnect stays in-process
+        // and the phantom endpoint survives it. Wired straight to the shell, like Exit, because it is a
+        // process verb rather than a connection one; the automatic watchdog calls the same IAppShell.Restart.
+        var restart = new ToolStripMenuItem("Restart Klangbruecke");
+        restart.Click += (_, _) => _shell.Restart();
+        _menu.Items.Add(restart);
+
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => ExitThread();
         _menu.Items.Add(exit);

@@ -1,3 +1,4 @@
+using Klangbruecke.Diagnostics;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
@@ -11,8 +12,13 @@ namespace Klangbruecke.Audio;
 /// with what comes back - is tested against fakes of the interfaces above instead, which is the
 /// entire reason this class exists as a separate object.
 /// </summary>
-public sealed class WasapiDeviceFactory : IAudioDeviceFactory
+public sealed class WasapiDeviceFactory : IAudioDeviceFactory, ISinkEndpointStateProbe
 {
+    /// <summary>
+    /// <see cref="ISinkEndpointStateProbe.Probe"/>, so the same object Program.Main already builds is
+    /// the watchdog's probe. Just forwards to the static read below.
+    /// </summary>
+    public SinkEndpointCondition Probe() => GetSinkCaptureEndpointCondition();
     public ICaptureSource? CreateSinkCapture()
     {
         MMDevice? device = FindSinkCaptureEndpoint();
@@ -102,6 +108,65 @@ public sealed class WasapiDeviceFactory : IAudioDeviceFactory
 
         return found;
     }
+
+    /// <summary>
+    /// The sink capture endpoint's current condition, enumerating <see cref="DeviceState.All"/> rather
+    /// than <see cref="DeviceState.Active"/> so the states <see cref="IsSinkCaptureEndpointPresent"/>
+    /// collapses to "absent" - a call's <c>Unplugged</c> and the wedge's <c>NotPresent</c> - are told
+    /// apart. See <see cref="SinkEndpointCondition"/> for why the watchdog needs the difference.
+    ///
+    /// Never throws, like <see cref="IsSinkCaptureEndpointPresent"/>: it is read from the watchdog's
+    /// tick, and an escaping COM failure there would kill the one loop meant to recover the app. A read
+    /// that cannot answer returns <see cref="SinkEndpointCondition.Absent"/>, which the watchdog does not
+    /// act on - the safe direction, since a false "phantom" would restart the app for nothing.
+    /// </summary>
+    public static SinkEndpointCondition GetSinkCaptureEndpointCondition()
+    {
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+
+            SinkEndpointCondition found = SinkEndpointCondition.Absent;
+            foreach (MMDevice device in enumerator.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.All))
+            {
+                using (device)
+                {
+                    string name;
+                    try
+                    {
+                        name = device.FriendlyName;
+                    }
+                    catch (Exception)
+                    {
+                        // Reading FriendlyName throws COMException 0xE000020B on some endpoints; skip
+                        // that one rather than abandon the scan and miss the sink endpoint further down.
+                        continue;
+                    }
+
+                    if (name.Contains("A2DP", StringComparison.OrdinalIgnoreCase)
+                        || name.Contains("SNK", StringComparison.OrdinalIgnoreCase))
+                    {
+                        found = MapCondition(device.State);
+                    }
+                }
+            }
+
+            return found;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Reading the A2DP sink capture endpoint condition failed: {ex.Message}");
+            return SinkEndpointCondition.Absent;
+        }
+    }
+
+    private static SinkEndpointCondition MapCondition(DeviceState state) => state switch
+    {
+        DeviceState.Active => SinkEndpointCondition.Active,
+        DeviceState.Unplugged => SinkEndpointCondition.Unplugged,
+        DeviceState.NotPresent => SinkEndpointCondition.Phantom,
+        _ => SinkEndpointCondition.Other,
+    };
 
     private static MMDevice? GetOutputDeviceOrDefault(string? deviceId)
     {

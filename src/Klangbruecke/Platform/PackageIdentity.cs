@@ -48,6 +48,12 @@ public static class PackageIdentity
     [DllImport("kernel32.dll", ExactSpelling = true)]
     private static extern int GetCurrentPackageFullName(ref uint packageFullNameLength, IntPtr packageFullName);
 
+    // This one does ask for the string back - the AUMID is how a relaunch reactivates this exact
+    // packaged app (see AppShell.Restart) - so CharSet.Unicode and a real buffer, unlike the probe
+    // above. ExactSpelling for the same appmodel.h reason: one Unicode entry point, no A/W pair.
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetCurrentApplicationUserModelId(ref uint applicationUserModelIdLength, [Out] char[]? applicationUserModelId);
+
     /// <summary>
     /// Raw result of the identity probe, 15700 (APPMODEL_ERROR_NO_PACKAGE) when unpackaged.
     ///
@@ -68,6 +74,63 @@ public static class PackageIdentity
     /// side, not the expensive one. The documented return set is closed, so this should never fire.
     /// </summary>
     public static bool IsPackaged => ProbeResult is ErrorSuccess or ErrorInsufficientBuffer;
+
+    /// <summary>
+    /// This packaged app's Application User Model ID (e.g. <c>Klangbruecke_xxxx!Klangbruecke</c>), or
+    /// <c>null</c> when unpackaged or if the lookup fails.
+    ///
+    /// The AUMID is how a relaunch reactivates <em>this exact</em> packaged app with identity intact -
+    /// <c>Start-Process shell:AppsFolder\&lt;AUMID&gt;</c> - which <see cref="AppShell.Restart"/> needs
+    /// because <c>CoreApplication.RequestRestartAsync</c> is unusable for a windowless tray app (measured
+    /// <c>NotInForeground</c> even from the tray menu; docs/FINDINGS.md §23).
+    ///
+    /// <b>A method, deliberately not a static-initialiser field like <see cref="ProbeResult"/>.</b>
+    /// Restart is rare, and computing this at type load would put a second P/Invoke on the path that
+    /// initialises <see cref="IsPackaged"/> - the one value in this class that must never throw at
+    /// type-init, because a <c>TypeInitializationException</c> there is cached and rethrown from every
+    /// later read, uncatchably, in an app with no window. Kept off that path entirely; it never runs
+    /// until something asks to relaunch. Never throws regardless: a failed lookup is a null the caller
+    /// falls back from, not a crash on the way out.
+    /// </summary>
+    public static string? CurrentAppUserModelId()
+    {
+        try
+        {
+            uint length = 0;
+
+            // First call sizes the buffer: a null buffer returns ERROR_INSUFFICIENT_BUFFER with the
+            // required length (in characters, including the null terminator) when there is an
+            // application, and APPMODEL_ERROR_NO_APPLICATION (15703) when there is not.
+            if (GetCurrentApplicationUserModelId(ref length, null) != ErrorInsufficientBuffer || length == 0)
+            {
+                return null;
+            }
+
+            var buffer = new char[length];
+            if (GetCurrentApplicationUserModelId(ref length, buffer) != ErrorSuccess)
+            {
+                return null;
+            }
+
+            // length counts the null terminator; trim at it rather than trusting the whole span.
+            int nul = Array.IndexOf(buffer, '\0');
+            return new string(buffer, 0, nul >= 0 ? nul : buffer.Length);
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                Log.Error("Looking up the application user model id failed; a packaged relaunch will fall back.", ex);
+            }
+            catch (Exception)
+            {
+                // Same reason as Probe's nested guard: Log.Current is settable, so the handler itself
+                // could throw, and this method's never-throw promise has to hold anyway.
+            }
+
+            return null;
+        }
+    }
 
     private static int Probe()
     {

@@ -40,6 +40,15 @@ public class Settings
     /// </summary>
     public bool PhoneRemoteEnabled { get; set; }
 
+    /// <summary>
+    /// When the automatic wedge recovery last relaunched the app. Persisted because the rate limit it
+    /// feeds has to survive the very restart it is counting - an in-memory tally would reset to zero on
+    /// every relaunch and never bound a loop. Pruned to the trailing window on each write. See
+    /// <see cref="Klangbruecke.Connection.RestartBudget"/> and
+    /// <see cref="Klangbruecke.Connection.SinkWedgeWatchdog"/>.
+    /// </summary>
+    public List<DateTimeOffset> RecentAutoRestarts { get; set; } = new();
+
     [JsonIgnore]
     public static string Directory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Klangbruecke");

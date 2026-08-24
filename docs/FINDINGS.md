@@ -1020,3 +1020,83 @@ advances, and scrubs; the cover renders.** The §20.1 / followups #4 open questi
 **Conclusion: Phase 3 done and installed.** Album art + live seek verified on hardware; the PC-side
 interpolation tick is the mechanism that made the scrubber appear. Remaining Phase 4: reboot/reconnect
 hardening (the historically fragile path — test explicitly) and attaching the APK to a GitHub release.
+
+## 23. The stale-endpoint wedge, and the automatic restart that recovers it (2026-08-24)
+
+Observed live after days of clean use: the phone connected, the app said **"Connected — waiting for
+phone audio"**, and no music played. Not the §3 pairing bug — the radio link was genuinely up
+(`BTHENUM ... IsConnected=True`) — and not the app's logic. The tray's own Disconnect/Connect did **not**
+fix it. A **full relaunch of the process did**, immediately.
+
+### What the wedge is
+
+The A2DP capture stopped with `0x88890004` (`AUDCLNT_E_DEVICE_INVALIDATED`, the §13 teardown — a call,
+a link blip, the phone briefly dropping the stream). Normally the endpoint comes back and the
+`EndpointMonitor` restarts the route. This time Windows left the `Line (… A2DP SNK)` endpoint a
+**device-tree phantom** — `Get-PnpDevice`: `Present=False, Problem=CM_PROB_PHANTOM` — while
+`AudioPlaybackConnection` went on reporting `Opened`. The music half sat in `Linked` forever.
+
+**The load-bearing fact: an in-process reconnect cannot clear it.** The tray's Disconnect/Connect
+disposes the `AudioPlaybackConnection` and opens a fresh one — the log shows it reach `Opened` again —
+but the phantom endpoint survives, so no live endpoint materialises and no audio routes. Only exiting the
+process releases whatever pins it. Measured on this machine: reconnect failed, process restart worked.
+
+### The measurements that make an automatic detector safe
+
+The hard part is that "connected, waiting for phone audio" is also what a paused phone and a live call
+look like from the connection state alone. The discriminator is the endpoint's **actual** MMDevAPI
+device state, not its mere absence (which the Active-only `SinkCaptureEndpointPresent` collapses to
+`false` for all three). Measured here:
+
+| Condition | A2DP SNK endpoint state |
+|---|---|
+| Connected, **idle or paused** (music not streaming) | `Active` — stays present; the half is `Up`, not `Linked` (contradicts the code's old assumption that "Linked = normal when not streaming") |
+| **Live call** | `Unplugged` (matches §14) |
+| **Wedge** | `NotPresent` / phantom |
+
+So being stuck in `Linked` (`MusicWaitingForEndpoint`) is genuinely anomalous, and the three states are
+distinct. `WasapiDeviceFactory.GetSinkCaptureEndpointCondition` reads `DeviceState.All` and returns
+`Active` / `Unplugged` / `Phantom`; the watchdog acts on `Phantom` **only** — a call (`Unplugged`) and
+idle (`Active`) never trigger it.
+
+### The restart mechanism: AUMID activation, not RequestRestartAsync
+
+`CoreApplication.RequestRestartAsync` is the documented way to restart a packaged app **and it does not
+work for this one** — it needs the foreground, and a windowless tray app never has it. Measured:
+`NotInForeground` **even when called from the tray menu**. Do not use it here.
+
+What works, verified end-to-end on the packaged build (1.0.2.0): reactivate the app by its **AUMID** via
+`Start-Process shell:AppsFolder\<AUMID>`, which has no foreground requirement and comes up **with package
+identity** (music half enabled — `RegisterApp IsRegistered=True`, route restored). Two traps it must
+respect, both handled in `AppShell.Restart`:
+
+- **Package identity.** A raw `Environment.ProcessPath` relaunch would come up unpackaged and silently
+  disable the music half (§8). The AUMID activation preserves identity; the AUMID is read at runtime from
+  `GetCurrentApplicationUserModelId` (`PackageIdentity.CurrentAppUserModelId`).
+- **The single-instance mutex (`Program.Main`).** Launch the new instance while the old still holds the
+  mutex and it sees `isNew == false` and quits. So a detached helper **waits on the old process id**
+  (`Wait-Process`) before it activates, and the old process calls `Application.Exit` — no timing race.
+
+### The watchdog
+
+`SinkWedgeWatchdog`, owned in the composition root **beside** `ConnectionManager`, not inside it (§21's
+principle — it brings an off-thread probe and its own timer). Every minute it checks
+`ConnectionManager.MusicWaitingForEndpoint`; once that has held past **3 minutes** (comfortably past the
+74 s a legitimate slow endpoint arrival took, §13) it runs the endpoint-condition probe off the UI
+thread. On `Phantom`, within the `RestartBudget` (max **3 per hour**, persisted in `settings.json` so it
+survives the restart it counts), it calls `IAppShell.Restart`. Anything else is logged and left alone.
+
+**Safe failure mode by construction.** If the inference that the wedge presents as `Phantom` is ever
+wrong on some machine, the probe returns a different state and the watchdog does **nothing** — it never
+false-fires (never restarts mid-call), it logs the actual state for ground truth, and the manual tray
+**Restart Klangbruecke** item is always there.
+
+### Status: mechanism verified, trigger awaits a real wedge
+
+Verified on hardware: the AUMID restart (new PID, identity preserved, music+calls recovered) and the
+manual tray item. Unit-tested: the budget, and the watchdog's decision logic (probe timing, phantom →
+restart, unplugged/active → no restart, recovered-during-probe, budget-exhausted). **Not** yet verified:
+the trigger firing against a real wedge — it cannot be reproduced on demand (one occurrence in days). The
+conservative window, the phantom-only action, the rate limit and the logging are what make shipping it
+before that reproduction defensible. If a wedge recurs, the log will carry the endpoint's real state at
+the moment, which either confirms `Phantom` or names the state to fix the probe to.
