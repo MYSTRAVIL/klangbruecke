@@ -1100,3 +1100,62 @@ the trigger firing against a real wedge — it cannot be reproduced on demand (o
 conservative window, the phantom-only action, the rate limit and the logging are what make shipping it
 before that reproduction defensible. If a wedge recurs, the log will carry the endpoint's real state at
 the moment, which either confirms `Phantom` or names the state to fix the probe to.
+
+## 24. The link-up drop was misclassified as deliberate, and the reconnect probe that fixes it (2026-09-01)
+
+Observed live. Music was playing; the A2DP stream dropped mid-song after an RF blip
+(`BTHUSB` event 12, "improper ACL data packet ... discarded"). The tray went grey, said **"The phone
+dropped the audio connection."**, and stayed there. Auto-reconnect was on and did nothing; reconnecting
+from the phone did nothing either. Twenty-seven minutes later the OS still read the link as up
+(`BTHENUM ... IsConnected=True`) and the `Line (... A2DP SNK)` endpoint as healthy
+(`Present=True, CM_PROB_NONE`) - not the §3 pairing bug and not the §23 phantom wedge. The tray's
+**Connect Now** recovered it instantly.
+
+### The bug
+
+The 3 s grace window (`GraceWindow`) classified the drop. Its rule was binary: after the window, if the
+Bluetooth link is still up, the audio profile was dropped **deliberately** - suppress, and stay dormant
+until the phone leaves and returns. The reasoning was "reconnecting would fight the user" - the user
+moving audio to the phone's own speaker, or a call taking the profile, both close A2DP with the ACL link
+up (§13).
+
+The trap: **an involuntary RF drop closes A2DP with the ACL link up too, and it is byte-for-byte
+identical.** `AudioPlaybackConnectionState` is only `Opened`/`Closed` and its `StateChanged` carries no
+reason or HRESULT, so nothing in the closed connection distinguishes a deliberate move from a glitch.
+The involuntary drop was read as deliberate, `SuppressionLatch` latched `Deliberate`, and that reason
+only clears on a leave-and-return - which a plain phone-side reconnect does not satisfy, because the
+link never actually left.
+
+### The fix: decide by outcome, not by guess
+
+Reconnect once before believing it was deliberate. `GraceWindow`'s Connected branch now calls
+`ConnectionManager.OnAudioDroppedWithLinkUp` instead of suppressing directly. The first link-up close of
+an episode is reconnected - stand the stale `Linked` half down (`MusicHalf.OnSuppressed`, "the teardown,
+not a claim about why", the same primitive the reconcile's `userAsked` branch uses) and re-open. Then:
+
+- **Glitch:** the reconnect holds, music plays on, nothing for the user to do.
+- **Deliberate move:** the phone re-drops what we just re-offered. A second link-up close within
+  `AudioDropReprobeWindow` (20 s) is that re-drop, and *now* it suppresses. The fight is bounded to one
+  reconnect.
+
+The re-drop is the whole discriminator. The 20 s window is timestamped from the probe
+(`_audioDropProbedAt`) and cleared when an episode ends - a suppression, or the link going `Absent`
+(`Refresh`), so a leave-and-return inside the window is a fresh probe rather than a false re-drop.
+Auto-reconnect off still suppresses immediately: `ConnectPermitted` is false, so the user's standing
+"do not reconnect" is honoured and an involuntary drop is dormancy under it, exactly as a deliberate one
+is.
+
+### Status: fix verified in the suite, one assumption awaits hardware
+
+Unit-tested end to end (`ConnectionManagerTests`): first drop reconnects, re-drop within the window
+suppresses, a second independent drop past the window reconnects again, auto-reconnect-off suppresses
+without a probe, and the supersession/stacking invariants the grace window already had.
+
+**Not yet verified on hardware:** what a phone actually does when the PC re-offers A2DP after the user
+deliberately moved audio to the phone speaker. If the phone re-drops it fast (the expected case, and
+what modern Android should do when its active output is the handset), the re-drop discriminator catches
+it and the cost is one brief bounce. If instead the phone *accepts and routes media back to the PC* and
+the user does not correct it, the app has quietly overridden a deliberate choice - the one residual
+risk, judged low because (a) it needs the phone to auto-route on a sink-initiated connect, which the
+active-output selection normally prevents, and (b) it self-corrects the moment the user re-selects the
+phone. The reconnect log line and the "reconnecting" status carry the ground truth if it recurs.

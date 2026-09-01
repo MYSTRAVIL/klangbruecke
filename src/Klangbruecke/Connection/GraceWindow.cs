@@ -138,11 +138,13 @@ internal sealed class GraceWindow
 
         if (status == BluetoothLinkStatus.Connected)
         {
-            // The ACL link is alive and only the audio profile went, which is what the phone dropping
-            // this PC looks like. Reconnecting would fight the user, once every backoff step, for as
-            // long as they left the phone in the room.
-            Log.Info("The audio connection closed with the Bluetooth link still up: treating it as deliberate.");
-            _coordinator.SuppressDeliberately("The phone dropped the audio connection.");
+            // The ACL link is alive and only the audio profile went. That is what a deliberate move
+            // (the phone speaker, a call) looks like - and it is also what an involuntary RF drop
+            // looks like, byte for byte, because AudioPlaybackConnectionState carries no reason. The
+            // manager decides between them by outcome, not by guess: reconnect once, and treat the
+            // stream re-dropping as the deliberate signal. See docs/FINDINGS.md §24.
+            Log.Info("The audio connection closed with the Bluetooth link still up.");
+            _coordinator.OnAudioDroppedWithLinkUp("The phone dropped the audio connection.");
         }
         else
         {

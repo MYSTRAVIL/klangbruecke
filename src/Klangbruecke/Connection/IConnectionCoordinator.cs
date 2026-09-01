@@ -27,8 +27,13 @@ internal interface IConnectionCoordinator
     /// <summary>Recompute the reported state and announce it if it moved.</summary>
     void Publish();
 
-    /// <summary>Latch a deliberate suppression and tear both halves down. Used by the grace window's Connected branch.</summary>
-    void SuppressDeliberately(string status);
+    /// <summary>
+    /// The audio profile closed with the Bluetooth link still up. Ambiguous by construction - a
+    /// deliberate move (phone speaker, a call) and an involuntary RF drop are identical at the closed
+    /// connection - so the manager reconnects once and only suppresses if it re-drops. Used by the
+    /// grace window's Connected branch. See docs/FINDINGS.md §24.
+    /// </summary>
+    void OnAudioDroppedWithLinkUp(string status);
 
     /// <summary>Raise the manager's own status announcement (always Info).</summary>
     void Report(string message);

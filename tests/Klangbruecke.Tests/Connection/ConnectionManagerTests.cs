@@ -444,11 +444,13 @@ public sealed class ConnectionManagerTests : IDisposable
     // --- the grace window ----------------------------------------------------------------------
 
     /// <summary>
-    /// The ACL link is alive and only the audio profile went, which is what the phone dropping this
-    /// PC looks like. Reconnecting would fight the user.
+    /// The ACL link is alive and only the audio profile went - which is what a deliberate move looks
+    /// like and, byte for byte, what an involuntary RF drop looks like. The first such drop of an
+    /// episode is reconnected once rather than suppressed: a glitch heals with nothing for the user to
+    /// do, and a deliberate move is caught by its re-drop (the test below).
     /// </summary>
     [Fact]
-    public void Connection_closed_with_the_link_still_up_suppresses_after_the_grace_window()
+    public void Connection_closed_with_the_link_still_up_reconnects_once_before_suppressing()
     {
         using Harness h = new();
         h.ReachRouting();
@@ -456,10 +458,91 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         h.Scheduler.Advance(Grace);
 
+        // Not suppressed: reconnected. The stale Linked half was stood down - one disconnect - and a
+        // fresh connect opened over the same phone.
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
+        Assert.Equal(1, h.Sink.DisconnectCount);
+        Assert.True(h.Router.IsRunning);
+
+        // The calls half is untouched: an A2DP drop is not an HFP event.
+        Assert.Equal(0, h.Calls.DisconnectCount);
+    }
+
+    /// <summary>
+    /// The reconnect re-offered the profile and the phone dropped it again at once - which a glitch
+    /// does not do. That re-drop is the deliberate signal, and now the app goes dormant with the
+    /// wording that names how the dormancy ends.
+    /// </summary>
+    [Fact]
+    public void A_reconnect_that_re_drops_within_the_window_is_treated_as_deliberate()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        // First drop: reconnected.
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        // Re-drop, hard on its heels: deliberate.
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+
         Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
         Assert.Equal("disconnected until the phone leaves and returns", h.Manager.Detail);
-        Assert.Equal(1, h.Sink.DisconnectCount);
-        Assert.Equal(1, h.Calls.DisconnectCount);
+        Assert.Equal("The phone dropped the audio connection.", h.Status[^1].Text);
+    }
+
+    /// <summary>
+    /// Two glitches far enough apart are two episodes, and each earns its own reconnect. The re-drop
+    /// window is what tells a deliberate re-drop from an unrelated second drop minutes later.
+    /// </summary>
+    [Fact]
+    public void A_second_independent_drop_after_the_window_reconnects_again()
+    {
+        using Harness h = new();
+        h.ReachRouting();
+
+        // First glitch: reconnected.
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+
+        // Well past the re-drop window, so the next drop is a new episode, not the phone re-dropping.
+        h.Scheduler.Advance(Seconds(21));
+
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+
+        Assert.Equal(3, h.Sink.ConnectCalls.Count);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+    }
+
+    /// <summary>
+    /// Auto-reconnect off is the user's standing "do not reconnect on your own", and an involuntary
+    /// drop is dormancy under it exactly as a deliberate one is. No probe - straight to suppressed.
+    /// </summary>
+    [Fact]
+    public void Audio_drop_with_auto_reconnect_off_is_suppressed_without_a_probe()
+    {
+        using Harness h = new(phoneDeviceId: null, autoReconnect: false);
+
+        // The one-shot grant connects it; then the grant is spent, so a drop is dormancy.
+        h.Manager.SetPhoneRemembered(PhoneId, true);
+        h.Marshaller!.Drain();
+        h.SetEndpointPresent(true);
+        Assert.True(h.Router.IsRunning);
+
+        int connectsBefore = h.Sink.ConnectCalls.Count;
+
+        // The link is up (harness default), so this is the ambiguous case - but permission is withheld.
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+
+        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+        Assert.Equal(connectsBefore, h.Sink.ConnectCalls.Count);
     }
 
     [Fact]
@@ -538,10 +621,10 @@ public sealed class ConnectionManagerTests : IDisposable
     /// first window's link read is still outstanding arms a second window on top of it. The late
     /// answer must decide nothing.
     ///
-    /// This is the worst read in the class to be stale on. It is the one that separates a deliberate
-    /// disconnect from a range exit, and getting it wrong does not merely mislabel: recording an
-    /// absence that never happened arms the very expiry that undoes the suppression the user asked
-    /// for, one reconcile tick later.
+    /// This is the worst read in the class to be stale on. It is the one that separates an
+    /// audio-profile drop from a range exit, and getting it wrong does not merely mislabel: a stale
+    /// "out of range" would tear the reconnected half down and record an absence the next poll reads
+    /// as a leave-and-return.
     /// </summary>
     [Fact]
     public void A_grace_window_that_was_superseded_does_not_decide()
@@ -555,25 +638,25 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Scheduler.Advance(Grace);
         Assert.Equal(1, h.Link.ReadCount);
 
-        // Window two asks again, and the link is up: the phone dropped the audio profile.
+        // Window two asks again, and the link is up: the first drop of the episode, so it reconnects.
         h.Link.DeferRead = false;
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         h.Scheduler.Advance(Grace);
-        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
-        Assert.Equal("The phone dropped the audio connection.", h.Status[^1].Text);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
 
-        // And now window one answers, with the opposite verdict.
+        // And now window one answers, with the opposite verdict. Superseded, it must not act - a stale
+        // "out of range" here would tear the reconnected half down.
         h.Link.CompleteRead(BluetoothLinkStatus.Disconnected);
 
-        Assert.Equal("The phone dropped the audio connection.", h.Status[^1].Text);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
 
-        // The damage a stale "out of range" does is not immediate: it records an absence, and the
-        // next Connected poll then reads that as the phone having left and returned, which expires
-        // the deliberate suppression and reconnects the phone the user just disconnected.
+        // And nothing it left behind expires the reconnection later.
         h.Scheduler.Advance(Seconds(95));
 
-        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
-        Assert.Single(h.Sink.ConnectCalls);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
     }
 
     /// <summary>
@@ -621,7 +704,10 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         h.Scheduler.Advance(Grace);
 
-        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+        // The window fired and reached a decision - the first drop of the episode reconnects, and its
+        // status only comes from a window that actually fired.
+        Assert.Equal("The phone dropped the audio; reconnecting.", h.Status[^1].Text);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
     }
 
     /// <summary>
@@ -1065,8 +1151,10 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Scheduler.Advance(Seconds(30));
         Assert.Equal(ConnectionState.Connected, h.Manager.State);
 
+        // The window it opened fires three seconds on: this first drop of the episode reconnects.
         h.Scheduler.Advance(Grace);
-        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
     }
 
     /// <summary>
@@ -1942,8 +2030,9 @@ public sealed class ConnectionManagerTests : IDisposable
             },
             h => h.Link.CompleteRead(BluetoothLinkStatus.Connected),
 
-            // The link was up, so the phone dropped the audio profile deliberately.
-            h => Assert.Equal(ConnectionState.Suppressed, h.Manager.State));
+            // The link was up: the first drop of the episode, so the manager reconnects rather than
+            // suppresses. What this test pins is that its continuation ran on the starting context.
+            h => Assert.Equal(ConnectionState.Connected, h.Manager.State));
     }
 
     /// <summary>Seam await 3: <c>MusicHalf</c>'s connect, which awaits a radio round trip.</summary>
@@ -2239,10 +2328,10 @@ public sealed class ConnectionManagerTests : IDisposable
     }
 
     /// <summary>
-    /// Three ways the audio can stop and three different things for the user to do about them. The
-    /// reported state is <c>Suppressed</c> for two of them and <c>Discovering</c> for the third, which
-    /// is not enough on its own: "the phone dropped the audio connection" is something to fix on the
-    /// handset, and "out of range" is something to fix by walking back.
+    /// The ways the audio can stop and the different things for the user to do about each. A tray
+    /// Disconnect, a first drop the app reconnects through, the re-drop that names it deliberate, and
+    /// a range exit - each carries its own words, because "fix it on the handset" and "walk back into
+    /// range" are not the same instruction.
     /// </summary>
     [Fact]
     public void Status_names_what_ended_the_connection()
@@ -2250,16 +2339,29 @@ public sealed class ConnectionManagerTests : IDisposable
         using Harness h = new();
         h.ReachRouting();
 
+        // 1. A tray Disconnect.
         h.Manager.RequestDisconnect();
         Assert.Equal("Disconnected.", h.Status[^1].Text);
 
+        // Back into range and reconnected.
         h.Link.RaiseRemoved();
         h.Link.RaiseAppeared();
+
+        // 2. The audio profile dropped with the link up: reconnect first, and say so.
+        h.Sink.PublishState(AudioSinkConnectionState.Closed);
+        h.Scheduler.Advance(Grace);
+        Assert.Equal("The phone dropped the audio; reconnecting.", h.Status[^1].Text);
+
+        // 3. The reconnect re-dropped: deliberate, and named as such.
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         h.Scheduler.Advance(Grace);
         Assert.Equal("The phone dropped the audio connection.", h.Status[^1].Text);
 
+        // Back into range and reconnected again.
+        h.Link.RaiseRemoved();
         h.Link.RaiseAppeared();
+
+        // 4. The phone left the room mid-stream.
         h.Link.Status = BluetoothLinkStatus.Disconnected;
         h.Sink.PublishState(AudioSinkConnectionState.Closed);
         h.Scheduler.Advance(Grace);
@@ -2671,8 +2773,11 @@ public sealed class ConnectionManagerTests : IDisposable
         h.Scheduler.Advance(Seconds(30));
         Assert.Single(h.Sink.ConnectCalls);
 
+        // The window fired three seconds later - it did not reconnect in-pass the way the userAsked
+        // carve-out does - and its verdict on this first drop is a reconnect.
         h.Scheduler.Advance(Grace);
-        Assert.Equal(ConnectionState.Suppressed, h.Manager.State);
+        Assert.Equal(2, h.Sink.ConnectCalls.Count);
+        Assert.Equal(ConnectionState.Connected, h.Manager.State);
     }
 
     /// <summary>

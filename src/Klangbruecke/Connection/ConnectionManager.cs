@@ -59,6 +59,18 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     /// </summary>
     private static readonly TimeSpan ResumeSettle = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// How soon after a reconnect probe a fresh audio drop still counts as the same episode.
+    ///
+    /// A link-up close is ambiguous - a deliberate move and an RF glitch are identical at the closed
+    /// connection (<c>AudioPlaybackConnectionState</c> carries no reason). <see cref="OnAudioDroppedWithLinkUp"/>
+    /// resolves it by outcome: reconnect once, and if the stream drops again this soon the phone is
+    /// re-dropping what we just re-offered - the one signal that names a deliberate move. Longer than
+    /// the 3 s grace window and a route's own settle so a real re-drop lands inside it; short enough
+    /// that two independent glitches minutes apart each earn their own probe. See docs/FINDINGS.md §24.
+    /// </summary>
+    private static readonly TimeSpan AudioDropReprobeWindow = TimeSpan.FromSeconds(20);
+
     private readonly Settings _settings;
     private readonly IAudioSinkService _sink;
     private readonly ICallTransportService _callTransport;
@@ -89,6 +101,15 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
 
     private IDisposable? _resumeTimer;
     private IDisposable? _resolverTick;
+
+    /// <summary>
+    /// When the last reconnect probe fired, or null when no probe is outstanding. Set by
+    /// <see cref="OnAudioDroppedWithLinkUp"/> when it reconnects rather than suppresses, and cleared
+    /// whenever an episode ends - a suppression, or the link going <see cref="LinkState.Absent"/>
+    /// (<see cref="Refresh"/>). A fresh link-up close within <see cref="AudioDropReprobeWindow"/> of
+    /// this is the phone re-dropping the reconnect, which is the deliberate signal.
+    /// </summary>
+    private DateTimeOffset? _audioDropProbedAt;
 
     /// <summary>
     /// Supersession token for <see cref="ResolveActivePhoneAsync"/>. Bumped by explicit intent-setting
@@ -928,8 +949,58 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
         }
     }
 
+    /// <summary>
+    /// The audio profile closed with the Bluetooth link still up, three seconds ago and still. The
+    /// grace window has ruled out a range exit; what is left is a deliberate move (the phone speaker,
+    /// a call) or an involuntary RF drop, and nothing in the closed connection tells them apart.
+    ///
+    /// So the manager decides by outcome instead of by guess. The first such drop of an episode is
+    /// reconnected once - stand the stale <see cref="MusicState.Linked"/> half down and re-open, the
+    /// same teardown-then-connect the reconcile's <c>userAsked</c> branch uses. A glitch reconnects
+    /// and plays on; a deliberate move re-drops what we re-offered, and a second link-up close inside
+    /// <see cref="AudioDropReprobeWindow"/> is that re-drop - now it is suppressed. The fight is
+    /// bounded to a single reconnect, and a genuine glitch heals without the user touching anything.
+    /// </summary>
+    private void OnAudioDroppedWithLinkUp(string status)
+    {
+        // Auto-reconnect off, or a click grant already spent: the user's standing answer is "do not
+        // reconnect on your own", and an involuntary drop is dormancy under it exactly as a deliberate
+        // one is. Suppress, as before - and SuppressDeliberately clears the probe timestamp, so this
+        // is also where a spent episode is forgotten.
+        if (!ConnectPermitted)
+        {
+            SuppressDeliberately(status);
+            return;
+        }
+
+        // A link-up close hard on the heels of a probe: the phone re-dropped what we just re-offered.
+        // That is the deliberate move showing itself, and it is the whole discriminator. Suppress, and
+        // do not probe again.
+        if (_audioDropProbedAt is { } probedAt && _scheduler.Now - probedAt < AudioDropReprobeWindow)
+        {
+            SuppressDeliberately(status);
+            return;
+        }
+
+        // First drop of the episode, and a reconnect is permitted. Treat it as an involuntary glitch
+        // and reconnect once. The half is Linked over a dead (Closed) connection; OnSuppressed is the
+        // teardown - not a claim about why (Reconciler says the same) - and ConnectHalvesAsync re-opens
+        // from Off. If the phone refuses, the music half's own connect backoff handles it; if it
+        // re-drops, the branch above catches it next time.
+        _audioDropProbedAt = _scheduler.Now;
+        Log.Info("Audio dropped with the link still up; reconnecting once before treating it as deliberate.");
+        Report("The phone dropped the audio; reconnecting.");
+
+        _music.OnSuppressed();
+        _ = ConnectHalvesAsync();
+    }
+
     private void SuppressDeliberately(string status)
     {
+        // The episode is over: whatever probe was outstanding no longer has a re-drop to catch, and a
+        // stale timestamp would misread the next episode's first drop as a re-drop.
+        _audioDropProbedAt = null;
+
         _latch.SuppressDeliberate();
         _clickGrant = ClickGrant.None;
 
@@ -1238,6 +1309,15 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
             _everConnected = true;
         }
 
+        // The phone left the room: whatever reconnect probe was outstanding belongs to an episode that
+        // is now over, and its next return is a fresh one. The re-drop window would expire this on its
+        // own, but a leave-and-return can happen inside it - and there the honest answer is a fresh
+        // probe, not a re-drop. One place, on the state every transition passes through.
+        if (snapshot.Link == LinkState.Absent)
+        {
+            _audioDropProbedAt = null;
+        }
+
         // The fast reconnect probe reads the same snapshot the projection does: poll quickly only
         // once the app has connected at least once and is now waiting out of range (Absent) for a
         // reconnect it is permitted to make. Idempotent - this runs on every Refresh but arms or
@@ -1317,6 +1397,6 @@ public sealed class ConnectionManager : IDisposable, IConnectionCoordinator
     void IConnectionCoordinator.RefreshEndpointLevel() => RefreshEndpointLevel();
     void IConnectionCoordinator.EnforceConnectPermission() => EnforceConnectPermission();
     void IConnectionCoordinator.Publish() => Publish();
-    void IConnectionCoordinator.SuppressDeliberately(string status) => SuppressDeliberately(status);
+    void IConnectionCoordinator.OnAudioDroppedWithLinkUp(string status) => OnAudioDroppedWithLinkUp(status);
     void IConnectionCoordinator.Report(string message) => Report(message);
 }
