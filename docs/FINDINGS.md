@@ -1145,17 +1145,14 @@ Auto-reconnect off still suppresses immediately: `ConnectPermitted` is false, so
 "do not reconnect" is honoured and an involuntary drop is dormancy under it, exactly as a deliberate one
 is.
 
-### Status: fix verified in the suite, one assumption awaits hardware
+### Status: verified in the suite and on hardware
 
 Unit-tested end to end (`ConnectionManagerTests`): first drop reconnects, re-drop within the window
 suppresses, a second independent drop past the window reconnects again, auto-reconnect-off suppresses
 without a probe, and the supersession/stacking invariants the grace window already had.
 
-**Not yet verified on hardware:** what a phone actually does when the PC re-offers A2DP after the user
-deliberately moved audio to the phone speaker. If the phone re-drops it fast (the expected case, and
-what modern Android should do when its active output is the handset), the re-drop discriminator catches
-it and the cost is one brief bounce. If instead the phone *accepts and routes media back to the PC* and
-the user does not correct it, the app has quietly overridden a deliberate choice - the one residual
-risk, judged low because (a) it needs the phone to auto-route on a sink-initiated connect, which the
-active-output selection normally prevents, and (b) it self-corrects the moment the user re-selects the
-phone. The reconnect log line and the "reconnecting" status carry the ground truth if it recurs.
+**Hardware-verified (2026-09-01, build 1.0.4.0, MYSTRAPIX9):** the load-bearing assumption held.
+Deliberately switching the phone's audio output to its own speaker did **not** pull audio back to the
+PC - the phone does not accept-and-route the sink-initiated re-offer while its active output is the
+handset, so the re-drop discriminator fires and the fix never fights a deliberate move. The residual
+"silent override" case reasoned about here was not reachable on this phone. Merged to `main`.
