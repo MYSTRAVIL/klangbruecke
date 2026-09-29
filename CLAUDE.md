@@ -34,6 +34,16 @@ Never trust a UI "connected" indicator — verify with `Get-PnpDevice`.
 - Tray-first. The app must run headless in the tray and auto-start. A window that must stay open is
   the exact failure of the app this replaces.
 
+## Git: what goes where
+
+- `origin` is the private source repo: commit and push everything there, including `memory/`,
+  `handoffs/`, `docs/superpowers/`, `docs/HANDOFF.md` and `STATUS.md` when present.
+- `github` is the public repo. Never push `main` or any working branch to it. Only the `public`
+  branch (worktree `../klangbruecke-public`) goes there, as `git push github public:main`, and only
+  when the user asks. It is a snapshot of `main` without those maintainer paths; the steps are in
+  `memory/reference_public_release.md` when present.
+- Public files (README, this file, `docs/FINDINGS.md`) must not link to maintainer paths.
+
 ## Testing
 
 The two halves are independent and should be tested independently:

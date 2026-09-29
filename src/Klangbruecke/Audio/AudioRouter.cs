@@ -344,14 +344,11 @@ public sealed class AudioRouter : IAudioRouter
     /// defaults to true, so its Read pads with zeroes and never returns 0 - but that is a default on
     /// a different class, not a property of this one, and it is not what makes this safe.
     ///
-    /// Posting through the dispatcher removes it in both configurations. With no
-    /// SynchronizationContext the event arrives on the play thread, ControlUiDispatcher sees
-    /// InvokeRequired and defers to the UI thread, and the play thread runs to completion - so the
-    /// later Join finds a thread that has already exited. With one installed - and a Control
-    /// constructor does install it, so TrayContext has one today - the event already arrives on the
-    /// UI thread, Post runs inline, and the Join is on a different thread and returns at once. It
-    /// also keeps teardown on the one thread that already serialises Start, Stop and Dispose, so no
-    /// new concurrency domain appears.
+    /// The production adapters deliberately construct NAudio without a synchronization context so
+    /// their stopped events stay on the worker that owns the thread-affine MMCSS registration.
+    /// ControlUiDispatcher sees InvokeRequired and defers teardown to the UI thread; the worker then
+    /// runs to completion, so the later Join finds a thread that has already exited. Keeping the post
+    /// here also serialises Start, Stop and Dispose on the one thread that already owns route state.
     ///
     /// The capture half does not have the same hazard - WasapiCapture nulls its thread field before
     /// raising, so Dispose finds nothing to join - but it is routed the same way rather than relying

@@ -88,6 +88,12 @@ Cut a GitHub release (build, sign, push the commit, upload the `.msix` + `.cer` 
   `Get-PnpDevice -Class AudioEndpoint | Where-Object FriendlyName -like '*A2DP*'`. A stale pairing
   (the IRK trap) presents exactly like an app failure — look at `BTHUSB` events 35 / 16 / 24 in the
   System log first. See `docs/FINDINGS.md` §3.
+- **Music cuts out when a game goes fullscreen, or on screenshot overlays** (ShareX, Snipping Tool),
+  and the phone briefly switches to its own speaker. This comes from Windows, not Klangbruecke. The
+  automatic Focus Assist rules disconnect the phone's hands-free link each time they turn on or off,
+  and music skips while it reconnects. Fix: Settings → System → Focus assist → Automatic rules, turn
+  off **When I'm playing a game** and **When I'm using an app in full screen mode**. See
+  `docs/FINDINGS.md` §26.
 - **Force a reconnect.** Diagnostics won't help if the app is deliberately dormant — use
   **Connect Now** to override a Disconnect or a switched-off auto-reconnect for one attempt.
 - **Reset configuration.** Delete `%LOCALAPPDATA%\Klangbruecke\settings.json` and restart; the app

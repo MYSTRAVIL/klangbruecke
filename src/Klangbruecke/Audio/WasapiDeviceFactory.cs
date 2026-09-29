@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using Klangbruecke.Diagnostics;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -203,25 +205,137 @@ public sealed class WasapiDeviceFactory : IAudioDeviceFactory, ISinkEndpointStat
 }
 
 /// <summary>
+/// One worker-thread registration with the Windows Multimedia Class Scheduler Service.
+///
+/// Registration and reversion are thread-affine. The NAudio adapters below therefore construct their
+/// workers without a synchronization context: stopped events stay on the worker that registered, so
+/// that worker can revert before it exits. <see cref="AudioRouter"/> already marshals teardown itself.
+/// </summary>
+internal sealed class MmcssThreadRegistration
+{
+    private const string TaskName = "Pro Audio";
+
+    private readonly string _worker;
+    private IntPtr _handle;
+    private int _managedThreadId;
+    private bool _attempted;
+
+    public MmcssThreadRegistration(string worker) => _worker = worker;
+
+    public void EnsureRegistered()
+    {
+        if (_attempted)
+        {
+            return;
+        }
+
+        _attempted = true;
+        uint taskIndex = 0;
+        _handle = NativeMethods.AvSetMmThreadCharacteristics(TaskName, ref taskIndex);
+
+        if (_handle == IntPtr.Zero)
+        {
+            int error = Marshal.GetLastWin32Error();
+            Log.Warn($"Registering the {_worker} worker with MMCSS failed: "
+                     + new Win32Exception(error).Message);
+            return;
+        }
+
+        _managedThreadId = Environment.CurrentManagedThreadId;
+        Log.Info($"{_worker} worker registered with MMCSS task '{TaskName}'.");
+    }
+
+    public void Revert()
+    {
+        IntPtr handle = _handle;
+        if (handle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _handle = IntPtr.Zero;
+
+        if (Environment.CurrentManagedThreadId != _managedThreadId)
+        {
+            Log.Warn($"The {_worker} worker's MMCSS registration could not be reverted on its "
+                     + "own thread; Windows will release it when the thread exits.");
+            return;
+        }
+
+        if (!NativeMethods.AvRevertMmThreadCharacteristics(handle))
+        {
+            int error = Marshal.GetLastWin32Error();
+            Log.Warn($"Reverting the {_worker} worker's MMCSS registration failed: "
+                     + new Win32Exception(error).Message);
+        }
+    }
+
+    private static class NativeMethods
+    {
+        [DllImport(
+            "avrt.dll",
+            EntryPoint = "AvSetMmThreadCharacteristicsW",
+            CharSet = CharSet.Unicode,
+            SetLastError = true)]
+        public static extern IntPtr AvSetMmThreadCharacteristics(string taskName, ref uint taskIndex);
+
+        [DllImport("avrt.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool AvRevertMmThreadCharacteristics(IntPtr avrtHandle);
+    }
+}
+
+internal static class AudioWorkerFactory
+{
+    /// <summary>
+    /// NAudio 2 captures the current synchronization context in both WASAPI constructors. Clearing it
+    /// only for construction keeps stopped callbacks on their worker threads, where their thread-affine
+    /// MMCSS registrations can be reverted. The caller's context is restored even if construction fails.
+    /// </summary>
+    public static T Create<T>(Func<T> factory)
+    {
+        SynchronizationContext? previous = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(null);
+
+        try
+        {
+            return factory();
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+        }
+    }
+}
+
+/// <summary>
 /// <see cref="WasapiCapture"/> behind <see cref="ICaptureSource"/>.
 ///
-/// The re-raises pass <c>this</c> because that is what an event raised by this object should say,
-/// and for no other reason. Nothing downstream reads it: the router closes over the endpoint when it
-/// subscribes rather than trusting the sender, precisely so that this line cannot quietly disable
-/// teardown. See <see cref="ICaptureSource"/>.
+/// NAudio 2 does not register its capture thread with MMCSS. The first data callback runs on that
+/// thread, so it registers before handing the packet to the router. The stopped callback runs on the
+/// same thread and reverts the registration before forwarding the event.
 /// </summary>
 internal sealed class WasapiCaptureSource : ICaptureSource
 {
     private readonly MMDevice _device;
     private readonly WasapiCapture _capture;
+    private readonly MmcssThreadRegistration _mmcss = new("A2DP capture");
 
     public WasapiCaptureSource(MMDevice device)
     {
         _device = device;
-        _capture = new WasapiCapture(device);
+        _capture = AudioWorkerFactory.Create(() => new WasapiCapture(device));
 
-        _capture.DataAvailable += (_, e) => DataAvailable?.Invoke(this, e);
-        _capture.RecordingStopped += (_, e) => RecordingStopped?.Invoke(this, e);
+        _capture.DataAvailable += (_, e) =>
+        {
+            _mmcss.EnsureRegistered();
+            DataAvailable?.Invoke(this, e);
+        };
+        _capture.RecordingStopped += (_, e) =>
+        {
+            _mmcss.Revert();
+            RecordingStopped?.Invoke(this, e);
+        };
     }
 
     public WaveFormat WaveFormat => _capture.WaveFormat;
@@ -248,30 +362,56 @@ internal sealed class WasapiCaptureSource : ICaptureSource
 }
 
 /// <summary>
+/// Registers the NAudio render worker with MMCSS on its first source read.
+///
+/// WasapiOut performs that read on the play thread before starting the audio client, so the thread is
+/// scheduled as time-sensitive for the complete live stream. No audio buffer is allocated or copied
+/// here; every read passes straight through to the router's existing provider.
+/// </summary>
+internal sealed class MmcssWaveProvider : IWaveProvider
+{
+    private readonly IWaveProvider _source;
+    private readonly MmcssThreadRegistration _mmcss;
+
+    public MmcssWaveProvider(IWaveProvider source, MmcssThreadRegistration mmcss)
+    {
+        _source = source;
+        _mmcss = mmcss;
+    }
+
+    public WaveFormat WaveFormat => _source.WaveFormat;
+
+    public int Read(byte[] buffer, int offset, int count)
+    {
+        _mmcss.EnsureRegistered();
+        return _source.Read(buffer, offset, count);
+    }
+}
+
+/// <summary>
 /// <see cref="WasapiOut"/> behind <see cref="IRenderSink"/>.
 ///
-/// The constructor arguments are the measured ones, not defaults: shared mode so WASAPI does the
-/// format conversion itself (see <see cref="AudioFormatBridge"/>), event sync, 50 ms of latency.
-///
-/// Constructing <see cref="WasapiOut"/> here rather than in the router moves one thing that matters:
-/// it captures <c>SynchronizationContext.Current</c> in its constructor, and that decides which
-/// thread it raises <see cref="PlaybackStopped"/> on. It is still constructed on whichever thread
-/// called <c>Start</c> - the UI thread in this app - so the captured context is the same one as
-/// before. Do not move this construction onto a threadpool thread.
-///
-/// The sender note on <see cref="WasapiCaptureSource"/> applies here too.
+/// Shared mode keeps WASAPI's format conversion (see <see cref="AudioFormatBridge"/>); event sync and
+/// 50 ms of latency are the measured settings. The source wrapper adds the MMCSS registration that
+/// NAudio 2's render worker lacks.
 /// </summary>
 internal sealed class WasapiRenderSink : IRenderSink
 {
     private readonly MMDevice _device;
     private readonly WasapiOut _output;
+    private readonly MmcssThreadRegistration _mmcss = new("audio render");
 
     public WasapiRenderSink(MMDevice device)
     {
         _device = device;
-        _output = new WasapiOut(device, AudioClientShareMode.Shared, useEventSync: true, latency: 50);
+        _output = AudioWorkerFactory.Create(
+            () => new WasapiOut(device, AudioClientShareMode.Shared, useEventSync: true, latency: 50));
 
-        _output.PlaybackStopped += (_, e) => PlaybackStopped?.Invoke(this, e);
+        _output.PlaybackStopped += (_, e) =>
+        {
+            _mmcss.Revert();
+            PlaybackStopped?.Invoke(this, e);
+        };
     }
 
     /// <summary>
@@ -285,7 +425,7 @@ internal sealed class WasapiRenderSink : IRenderSink
 
     public event EventHandler<StoppedEventArgs>? PlaybackStopped;
 
-    public void Init(IWaveProvider source) => _output.Init(source);
+    public void Init(IWaveProvider source) => _output.Init(new MmcssWaveProvider(source, _mmcss));
 
     public void Play() => _output.Play();
 

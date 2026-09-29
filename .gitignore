@@ -33,3 +33,11 @@ android/build/
 android/local.properties
 android/.idea/
 android/.kotlin/
+
+# Maintainer-only paths: tracked on the private source repo, never published here.
+/memory/
+/handoffs/
+/overnight/
+/docs/superpowers/
+/docs/HANDOFF.md
+/STATUS.md

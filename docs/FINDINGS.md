@@ -1156,3 +1156,85 @@ Deliberately switching the phone's audio output to its own speaker did **not** p
 PC - the phone does not accept-and-route the sink-initiated re-offer while its active output is the
 handset, so the re-drop discriminator fires and the fix never fights a deliberate move. The residual
 "silent override" case reasoned about here was not reachable on this phone. Merged to `main`.
+
+## 25. Fullscreen transitions can starve NAudio 2's WASAPI workers (2026-09-20)
+
+Observed in build 1.0.4 while phone audio was playing: switching between fullscreen and windowed
+applications caused short audio cuts. The phone sometimes showed its handset output briefly before
+returning to Klangbruecke.
+
+The connection did not close during the reported cuts. The app log had no A2DP state change, capture
+or render stop, or route teardown. The sink endpoint remained active, and the System log had no
+`BTHUSB` 12, 16, 24, or 35 event. Fullscreen changes did churn three NVIDIA HDMI endpoints, but the
+connection manager's probe found no A2DP state change and left the route alone.
+
+NAudio 2.2.1 runs the `WasapiCapture` and `WasapiOut` loops on ordinary .NET threads without
+registering them with the Windows Multimedia Class Scheduler Service (MMCSS). This was confirmed by
+decompiling the installed package. Fullscreen foreground changes can create enough scheduling pressure
+to delay those threads even though the Bluetooth connection and both WASAPI endpoints remain open.
+NAudio issue [#613](https://github.com/naudio/NAudio/issues/613) reports the same buffered audio skip
+under scheduling pressure. NAudio 3 adds a `Pro Audio` MMCSS registration, but version 3.1.0 targets
+`net9.0`; NuGet rejects it for Klangbruecke's required `net8.0-windows10.0.19041.0` target.
+
+### Fix in build 1.0.5.0
+
+The NAudio 2 adapters now register the real capture and render worker threads with
+[`AvSetMmThreadCharacteristicsW("Pro Audio")`](https://learn.microsoft.com/windows/win32/api/avrt/nf-avrt-avsetmmthreadcharacteristicsw).
+Capture registers in its first `DataAvailable` callback. Render uses a pass-through `IWaveProvider`
+that registers in its first `Read`, before `WasapiOut` starts the audio client. The wrapper neither
+allocates nor copies an audio buffer.
+
+MMCSS registration is thread-affine. Both NAudio objects are therefore constructed while
+`SynchronizationContext.Current` is temporarily null. Their stopped callbacks stay on the worker
+threads, revert the registrations with `AvRevertMmThreadCharacteristics`, then let `AudioRouter` post
+the existing teardown to the UI dispatcher.
+
+### Status: mechanism verified on hardware; audible regression test pending
+
+Build 1.0.5.0 was packaged, signed, installed, and connected to `MYSTRAPIX9`. Its live log confirms
+that both workers registered under the `Pro Audio` task. Process inspection showed exactly two
+threads at base/current priority 24 (`TimeCritical`), matching the capture and render workers. An
+automated smoke test alternated eight times between a fullscreen Paint window and a windowed
+application; the route stayed open and both workers retained priority 24. A listening test with the
+applications that originally triggered the fault remains necessary because neither the process nor
+Windows reports a brief audible gap while the route stays open.
+
+**Superseded by §26.** MMCSS was not the cause. The cuts continued on 1.0.5.0 and were traced to
+Focus Assist tearing down the HFP link.
+
+## 26. Automatic Focus Assist tears down the HFP link, and A2DP stutters with it (2026-09-23)
+
+The §25 symptom survived build 1.0.5.0: short cuts on fullscreen transitions and on ShareX's
+Win+Shift+S overlay, and the phone briefly showing its own speaker before returning to the PC.
+
+**Cause.** The automatic Focus Assist rules "When I'm playing a game" and "When I'm using an app in
+full screen mode" were on. Each time one engaged or released (`SHQueryUserNotificationState` 5 -> 2
+and back), `BTAGService` dropped and rebuilt the hands-free service-level connection. A `BTHPORT`
+ETW trace shows the PC sending RFCOMM `DISC` on the HFP DLCI within about 15 ms of the state change,
+then `SABM`, `AT+BRSF` and the full SLC handshake again when the state returns. The phone sees a
+hands-free device leave and rejoin, which is the output-picker flicker, and A2DP skips 200 to 1200 ms
+on each edge. No app log line, no `BTHUSB` event, and no endpoint change marks any of this.
+
+**Isolated, one variable at a time** (ShareX or a borderless window spanning all three monitors,
+3 cycles each):
+
+| Condition | HFP DISC/SABM | A2DP gaps |
+|---|---|---|
+| Rules on, calls enabled | every edge | every edge |
+| Rules on, calls disabled in the app | every edge | shorter, still present |
+| Rules on, `PreferRemoteAudioPolicy=1` | every edge | every edge |
+| Rules on at "Priority only" (calls allowed) | not traced | every edge |
+| **Rules off** | **none** | **none** |
+
+Ruled out along the way: GPU P-state switches (P0 throughout), DPC starvation, MMCSS priority, a
+window merely covering the primary monitor (only fullscreen-detected windows engage the rule), and
+`GDI` screen capture. Monitor power-off through `SC_MONITORPOWER` and an 8-minute `DisplayWatch`
+hold produced no HFP churn.
+
+**Fix.** A machine setting, not code. Both automatic rules are turned off. Klangbruecke cannot stop
+`BTAGService` from doing this. Disabling the calls half does not help either: the service drops the
+SLC with no app registered for the role.
+
+**Open.** The report that the screen-off script makes the phone switch output back to the PC after
+about 5 minutes was not reproduced. That run showed no HFP or A2DP event during the hold or on wake.
+Retest it with the rules off before looking further.
